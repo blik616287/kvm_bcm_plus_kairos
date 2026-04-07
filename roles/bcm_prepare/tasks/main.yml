@@ -1,0 +1,217 @@
+---
+# bcm_prepare — Download BCM ISO, patch rootfs for auto-install, remaster ISO.
+# Runs on localhost. Produces build/bcm-autoinstall.iso.
+
+- name: Create build and dist directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+  loop:
+    - "{{ build_dir }}"
+    - "{{ dist_dir }}"
+
+# ---- Download ISO ----
+
+- name: Check if BCM ISO exists
+  ansible.builtin.stat:
+    path: "{{ dist_dir }}/{{ iso_filename }}"
+  register: iso_stat
+
+- name: Download BCM ISO from JFrog
+  ansible.builtin.shell: |
+    curl --fail --location --progress-bar \
+      -H "Authorization: Bearer {{ jfrog_token }}" \
+      -o "{{ dist_dir }}/{{ iso_filename }}" \
+      "https://{{ jfrog_instance }}/artifactory/{{ jfrog_repo }}/{{ iso_filename }}"
+  when: not iso_stat.stat.exists
+
+# ---- Remaster ISO ----
+
+- name: Check if remastered ISO exists
+  ansible.builtin.stat:
+    path: "{{ build_dir }}/bcm-autoinstall.iso"
+  register: remastered_stat
+
+- name: Patch and remaster BCM ISO
+  when: not remastered_stat.stat.exists
+  block:
+    - name: Create work directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: bcm-prep-
+      register: work_dir
+
+    - name: Mount BCM ISO
+      ansible.builtin.mount:
+        path: "{{ work_dir.path }}/iso"
+        src: "{{ dist_dir }}/{{ iso_filename }}"
+        fstype: iso9660
+        opts: loop,ro
+        state: mounted
+      become: true
+
+    - name: Extract kernel
+      ansible.builtin.copy:
+        src: "{{ work_dir.path }}/iso/boot/kernel"
+        dest: "{{ build_dir }}/.bcm-kernel"
+        mode: "0644"
+        remote_src: true
+      become: true
+
+    - name: Extract rootfs
+      ansible.builtin.shell: |
+        mkdir -p {{ work_dir.path }}/rootfs
+        cd {{ work_dir.path }}/rootfs
+        gunzip -dc {{ work_dir.path }}/iso/boot/rootfs.cgz | cpio -iumd 2>/dev/null
+      become: true
+
+    - name: Unmount ISO after extraction
+      ansible.builtin.mount:
+        path: "{{ work_dir.path }}/iso"
+        state: unmounted
+      become: true
+
+    - name: Copy build-config.xml template into rootfs
+      ansible.builtin.copy:
+        src: build-config.xml.tpl
+        dest: "{{ work_dir.path }}/rootfs/cm/build-config.xml.tpl"
+        mode: "0644"
+      become: true
+
+    - name: Install jinja2 and pyyaml into rootfs
+      ansible.builtin.shell: |
+        chroot {{ work_dir.path }}/rootfs pip3 install --break-system-packages jinja2 pyyaml 2>/dev/null || \
+        pip3 install --target {{ work_dir.path }}/rootfs/usr/lib/python3/dist-packages jinja2 pyyaml
+      become: true
+
+    - name: Patch build-config.xml hostname
+      ansible.builtin.replace:
+        path: "{{ work_dir.path }}/rootfs/cm/build-config.xml"
+        regexp: '<hostname>bcm11-headnode</hostname>'
+        replace: '<hostname>{{ bcm_hostname }}</hostname>'
+      become: true
+
+    - name: Patch build-config.xml timezone
+      ansible.builtin.replace:
+        path: "{{ work_dir.path }}/rootfs/cm/build-config.xml"
+        regexp: '<timezone>America/Los_Angeles</timezone>'
+        replace: '<timezone>{{ bcm_timezone }}</timezone>'
+      become: true
+
+    - name: Render auto-install script into rootfs
+      ansible.builtin.template:
+        src: bcm-autoinstall.sh.j2
+        dest: "{{ work_dir.path }}/rootfs/usr/local/bin/bcm-autoinstall.sh"
+        mode: "0755"
+      become: true
+
+    - name: Copy auto-install systemd unit into rootfs
+      ansible.builtin.copy:
+        src: bcm-autoinstall.service
+        dest: "{{ work_dir.path }}/rootfs/usr/lib/systemd/system/bcm-autoinstall.service"
+        mode: "0644"
+      become: true
+
+    - name: Enable auto-install, disable interactive installers and getty
+      ansible.builtin.shell: |
+        cd {{ work_dir.path }}/rootfs
+        mkdir -p etc/systemd/system/multi-user.target.wants
+        ln -sf /usr/lib/systemd/system/bcm-autoinstall.service \
+            etc/systemd/system/multi-user.target.wants/bcm-autoinstall.service
+        rm -f etc/systemd/system/multi-user.target.wants/bright-installer-text.service
+        rm -f etc/systemd/system/graphical.target.wants/bright-installer-graphical.service
+        ln -sf /dev/null etc/systemd/system/getty@tty1.service
+        ln -sf /dev/null etc/systemd/system/serial-getty@ttyS0.service
+      become: true
+
+    - name: Repack rootfs.cgz
+      ansible.builtin.shell: |
+        cd {{ work_dir.path }}/rootfs
+        find . | cpio -o -H newc 2>/dev/null | gzip --fast > {{ build_dir }}/.bcm-rootfs-auto.cgz
+      become: true
+
+    # ---- Remaster ISO ----
+
+    - name: Extract original ISO contents via 7z
+      ansible.builtin.shell: |
+        mkdir -p {{ work_dir.path }}/iso-work
+        cd {{ work_dir.path }}/iso-work
+        7z x -y {{ dist_dir }}/{{ iso_filename }} >/dev/null
+      become: true
+
+    - name: Replace rootfs with patched version
+      ansible.builtin.copy:
+        src: "{{ build_dir }}/.bcm-rootfs-auto.cgz"
+        dest: "{{ work_dir.path }}/iso-work/boot/rootfs.cgz"
+        remote_src: true
+        mode: "0644"
+      become: true
+
+    - name: Patch GRUB config for unattended auto-install
+      ansible.builtin.shell: |
+        for GRUB in {{ work_dir.path }}/iso-work/grub/grub.cfg {{ work_dir.path }}/iso-work/boot/grub/grub.cfg; do
+          [ -f "$GRUB" ] || continue
+          sed -i 's/set timeout=.*/set timeout=0/' "$GRUB"
+          sed -i 's/set timeout_style=.*/set timeout_style=hidden/' "$GRUB"
+          sed -i 's/set default=.*/set default=1/' "$GRUB"
+          sed -i 's|systemd.unit=multi-user.target|systemd.unit=multi-user.target net.ifnames=0 biosdevname=0 console=ttyS0,115200 console=tty0|' "$GRUB"
+        done
+      become: true
+
+    - name: Patch isolinux config for unattended auto-install
+      ansible.builtin.shell: |
+        CFG="{{ work_dir.path }}/iso-work/isolinux/isolinux.cfg"
+        if [ -f "$CFG" ]; then
+          sed -i '/LABEL Boot from harddrive/,/^$/d' "$CFG"
+          sed -i '/chain.c32/d' "$CFG"
+          sed -i '/APPEND hd0/d' "$CFG"
+          sed -i 's/^TIMEOUT .*/TIMEOUT 1/' "$CFG"
+          sed -i 's/^PROMPT .*/PROMPT 0/' "$CFG"
+          sed -i '/LABEL Start Base Command Manager Text Installer/a MENU DEFAULT' "$CFG"
+          sed -i 's|systemd.unit=multi-user.target|systemd.unit=multi-user.target net.ifnames=0 biosdevname=0 console=ttyS0,115200 console=tty0|' "$CFG"
+        fi
+      become: true
+
+    - name: Extract MBR from original ISO
+      ansible.builtin.shell: |
+        dd if={{ dist_dir }}/{{ iso_filename }} bs=432 count=1 of={{ work_dir.path }}/mbr.bin 2>/dev/null
+      become: true
+
+    - name: Rebuild ISO with xorriso
+      ansible.builtin.shell: |
+        xorriso -as mkisofs \
+          -o {{ build_dir }}/bcm-autoinstall.iso \
+          -V "BCMINSTALLERHEAD" \
+          -J -R \
+          -isohybrid-mbr {{ work_dir.path }}/mbr.bin \
+          -b isolinux/isolinux.bin \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+          -eltorito-alt-boot \
+          -e efi.img \
+            -no-emul-boot \
+            -isohybrid-gpt-basdat \
+          {{ work_dir.path }}/iso-work 2>&1
+      become: true
+
+    - name: Clean up work directory
+      ansible.builtin.file:
+        path: "{{ work_dir.path }}"
+        state: absent
+      become: true
+
+- name: Verify remastered ISO exists
+  ansible.builtin.stat:
+    path: "{{ build_dir }}/bcm-autoinstall.iso"
+  register: final_iso
+  failed_when: not final_iso.stat.exists
+
+# ---- Create config drive (FAT image with password, always regenerated) ----
+
+- name: Create BCM config drive
+  ansible.builtin.shell: |
+    dd if=/dev/zero of={{ build_dir }}/.bcm-init.img bs=1M count=4 2>/dev/null
+    mkfs.vfat -n BCMCONFIG {{ build_dir }}/.bcm-init.img >/dev/null 2>&1
+    TMPPASS=$(mktemp)
+    echo -n "{{ bcm_password }}" > "$TMPPASS"
+    mcopy -i {{ build_dir }}/.bcm-init.img "$TMPPASS" ::password.txt
+    rm -f "$TMPPASS"

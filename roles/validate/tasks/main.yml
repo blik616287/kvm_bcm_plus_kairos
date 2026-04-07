@@ -1,0 +1,27 @@
+---
+# validate — Run comprehensive validation on Kairos node via BCM jump host.
+
+- name: Set BCM connection facts
+  ansible.builtin.set_fact:
+    ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    bcm_ssh_port: "{{ bcm_ssh_port }}"
+
+- name: Render validate script
+  ansible.builtin.template:
+    src: validate.sh.j2
+    dest: "{{ build_dir }}/validate.sh"
+    mode: "0755"
+
+- name: Run validation
+  ansible.builtin.shell: "{{ build_dir }}/validate.sh 2>&1 | tee {{ build_dir }}/validate.log"
+  register: validate_result
+  failed_when: false
+
+- name: Print validation results
+  ansible.builtin.debug:
+    msg: "{{ validate_result.stdout_lines }}"
+
+- name: Validation failed
+  ansible.builtin.fail:
+    msg: "Validation had failures — check build/validate.log"
+  when: validate_result.rc != 0

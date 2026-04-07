@@ -1,0 +1,108 @@
+#cloud-config
+install:
+  auto: true
+  poweroff: true
+stylus:
+  site:
+    paletteEndpoint: {{ palette_endpoint }}
+    edgeHostToken: {{ palette_token }}
+    projectUid: {{ palette_project_uid }}
+users:
+  - name: kairos
+    shell: /bin/bash
+    groups: [sudo, admin, adm, systemd-journal]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+stages:
+  boot:
+    - name: "Set kairos user password"
+      users:
+        kairos:
+          passwd: kairos
+    - name: "Enable SSH password auth + disable fail2ban"
+      files:
+        - path: /etc/ssh/sshd_config.d/99-kairos-test.conf
+          content: |
+            PasswordAuthentication yes
+            PermitRootLogin yes
+          permissions: 0644
+      commands:
+        - systemctl restart sshd || systemctl restart ssh || true
+        - systemctl disable --now fail2ban 2>/dev/null || true
+{% if bcm_ssh_key_content is defined and bcm_ssh_key_content | length > 0 %}
+    - name: "Install BCM SSH key"
+      files:
+        - path: /var/lib/bcm/bcm-key
+          content: |
+{{ bcm_ssh_key_content | indent(12, first=true) }}
+          permissions: 0600
+          owner: 0
+          group: 0
+    - name: "BCM integration: set NOSYNC + start cmd"
+      commands:
+        - |
+          for i in $(seq 1 60); do
+            ip -4 addr show eth0 2>/dev/null | grep -q "inet " && \
+              ping -c1 -W2 {{ bcm_internal_ip }} >/dev/null 2>&1 && break
+            sleep 5
+          done || true
+          ping -c1 -W2 {{ bcm_internal_ip }} >/dev/null 2>&1 || exit 0
+          NODE_MAC=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}' | xargs -I{} ip link show {} 2>/dev/null | awk '/ether/{print $2}')
+          export NODE_NAME=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 -o LogLevel=ERROR -i /var/lib/bcm/bcm-key \
+              root@{{ bcm_internal_ip }} \
+              "echo -e 'device\nlist' | cmsh 2>/dev/null | grep -i '${NODE_MAC}' | awk '{print \$2}'" \
+              2>/dev/null | grep -oE '^[a-zA-Z0-9_-]+$' | tail -1)
+          [ -z "${NODE_NAME}" ] && export NODE_NAME=$(hostname)
+          hostnamectl set-hostname "${NODE_NAME}" 2>/dev/null || hostname "${NODE_NAME}" 2>/dev/null || true
+          printf '#cloud-config\nstylus:\n  site:\n    name: %s\n' "${NODE_NAME}" > /oem/91_palette_name.yaml
+          BCM_ROOT_PUBKEY=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 -i /var/lib/bcm/bcm-key \
+              root@{{ bcm_internal_ip }} 'cat /root/.ssh/id_ecdsa.pub' 2>/dev/null)
+          if [ -n "${BCM_ROOT_PUBKEY}" ]; then
+            mkdir -p /root/.ssh
+            grep -qF "${BCM_ROOT_PUBKEY}" /root/.ssh/authorized_keys 2>/dev/null || \
+              echo "${BCM_ROOT_PUBKEY}" >> /root/.ssh/authorized_keys
+            chmod 600 /root/.ssh/authorized_keys
+          fi
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 -i /var/lib/bcm/bcm-key \
+              root@{{ bcm_internal_ip }} \
+              "echo -e 'device\nuse ${NODE_NAME}\nset installmode NOSYNC\ncommit' | cmsh" \
+              >/dev/null 2>&1 || true
+          mkdir -p /var/lib/cm/rootfs
+          for attempt in $(seq 1 60); do
+            mount -t nfs -o ro,nolock,vers=3 {{ bcm_internal_ip }}:/cm/images/default-image /var/lib/cm/rootfs 2>/dev/null && break
+            sleep 10
+          done
+          mountpoint -q /var/lib/cm/rootfs || exit 0
+          mkdir -p /var/lib/cm/cmd-etc
+          cp -a /var/lib/cm/rootfs/cm/local/apps/cmd/etc/. /var/lib/cm/cmd-etc/ 2>/dev/null || true
+          sed -i "s/Master = master/Master = {{ bcm_internal_ip }}/" /var/lib/cm/cmd-etc/cmd.conf
+          NODE_MAC=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}' | xargs -I{} ip link show {} 2>/dev/null | awk '/ether/{print $2}' | tr ':' '-')
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -i /var/lib/bcm/bcm-key \
+              root@{{ bcm_internal_ip }}:/cm/node-installer/certificates/${NODE_MAC}/cert \
+              /var/lib/cm/cmd-etc/cert.pem 2>/dev/null || true
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -i /var/lib/bcm/bcm-key \
+              root@{{ bcm_internal_ip }}:/cm/node-installer/certificates/${NODE_MAC}/key \
+              /var/lib/cm/cmd-etc/cert.key 2>/dev/null || true
+          nohup unshare --mount --fork /bin/bash -c "
+            mount --bind /var/lib/cm/cmd-etc /var/lib/cm/rootfs/cm/local/apps/cmd/etc
+            mount -t proc proc /var/lib/cm/rootfs/proc 2>/dev/null || true
+            mount -t sysfs sysfs /var/lib/cm/rootfs/sys 2>/dev/null || true
+            mount -t tmpfs tmpfs /var/lib/cm/rootfs/tmp 2>/dev/null || true
+            mount -t tmpfs tmpfs /var/lib/cm/rootfs/var/run 2>/dev/null || true
+            mount -t tmpfs tmpfs /var/lib/cm/rootfs/var/spool/cmd 2>/dev/null || true
+            cp /etc/resolv.conf /var/lib/cm/rootfs/tmp/resolv.conf 2>/dev/null || true
+            mount --bind /var/lib/cm/rootfs/tmp/resolv.conf /var/lib/cm/rootfs/etc/resolv.conf 2>/dev/null || true
+            echo ${NODE_NAME} > /var/lib/cm/rootfs/tmp/hostname 2>/dev/null || true
+            mount --bind /var/lib/cm/rootfs/tmp/hostname /var/lib/cm/rootfs/etc/hostname 2>/dev/null || true
+            exec chroot /var/lib/cm/rootfs /bin/bash -c '
+              export HOSTNAME=\$(cat /etc/hostname)
+              /cm/local/apps/cmd/sbin/cmd -s -n
+            '
+          " </dev/null >/dev/null 2>&1 &
+          disown
+{% endif %}

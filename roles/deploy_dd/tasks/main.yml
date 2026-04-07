@@ -1,0 +1,33 @@
+---
+# deploy_dd — Upload raw image to BCM, configure installer + kairos category.
+# Runs on localhost, SSHes to BCM via port-forwarded SSH.
+
+- name: Set BCM connection facts
+  ansible.builtin.set_fact:
+    ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    bcm_ssh_port: "{{ bcm_ssh_port }}"
+
+- name: Verify raw disk image exists
+  ansible.builtin.stat:
+    path: "{{ build_dir }}/kairos-disk.raw"
+  register: raw_image
+  failed_when: not raw_image.stat.exists
+
+- name: Render install-kairos.sh from template
+  ansible.builtin.template:
+    src: install-kairos.sh.j2
+    dest: "{{ build_dir }}/install-kairos.sh"
+    mode: "0755"
+
+- name: Render deploy-dd.sh from template
+  ansible.builtin.template:
+    src: deploy-dd.sh.j2
+    dest: "{{ build_dir }}/deploy-dd.sh"
+    mode: "0755"
+
+- name: Run deploy-dd script
+  ansible.builtin.shell: "{{ build_dir }}/deploy-dd.sh"
+  environment:
+    PATH: "{{ ansible_facts['env']['PATH'] }}"
+  async: 3600
+  poll: 15

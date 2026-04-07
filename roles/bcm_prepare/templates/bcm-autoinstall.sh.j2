@@ -1,0 +1,175 @@
+#!/bin/bash
+# BCM Fully Automated Head Node Install — rendered by Ansible
+# KVM variant: two separate networks (internal socket + external NAT)
+export DEBIAN_FRONTEND=noninteractive
+LOG="/var/log/bcm-auto-install.log"
+exec </dev/null >>/dev/console 2>&1
+exec > >(tee -a "$LOG" | tee /dev/ttyS0 >/dev/console) 2>&1
+
+systemctl stop serial-getty@ttyS0.service 2>/dev/null || true
+systemctl stop getty@tty1.service 2>/dev/null || true
+clear >/dev/console 2>/dev/null || true
+
+echo ""
+echo "=========================================="
+echo " BCM Automated Installation (KVM)"
+echo " $(date)"
+echo "=========================================="
+
+# ---- Network Configuration ----
+# KVM topology: eth0 = internal provisioning (socket network), eth1 = external NAT
+# No CIDATA drive — configure network directly from Ansible-injected variables.
+
+echo "[..] Configuring network..."
+for iface in eth0 eth1; do
+    ip link set "$iface" up 2>/dev/null || true
+done
+
+# eth0: internal provisioning network (static)
+ip addr add {{ bcm_internal_ip }}/{{ bcm_internal_netmask }} dev eth0 2>/dev/null || true
+
+# eth1: external NAT (DHCP from QEMU user-mode)
+dhclient eth1 2>/dev/null &
+sleep 3
+
+# Set DNS for name resolution during install
+echo "nameserver {{ bcm_external_dns }}" > /etc/resolv.conf
+
+ETH0_IP=$(ip -4 addr show eth0 2>/dev/null | grep -oP 'inet \K[0-9.]+' || true)
+ETH1_IP=$(ip -4 addr show eth1 2>/dev/null | grep -oP 'inet \K[0-9.]+' || true)
+echo "[OK] eth0=${ETH0_IP:-none} (internal) eth1=${ETH1_IP:-none} (external)"
+
+# ---- Render build-config.xml ----
+# KVM uses fixed two-network topology: internalnet + externalnet
+echo "[..] Rendering build-config.xml..."
+if [ -f /cm/build-config.xml.tpl ]; then
+    python3 << 'PYRENDER'
+from jinja2 import Template
+
+networks = [
+    {
+        'name': 'internalnet', 'type': 'internal',
+        'base': '{{ bcm_internal_cidr.split("/")[0] }}',
+        'maskbits': '{{ bcm_internal_netmask }}',
+        'domain': 'eth.cluster',
+        'dyn_start': '{{ bcm_internal_ip.rsplit(".", 1)[0] }}.16',
+        'dyn_end': '{{ bcm_internal_ip.rsplit(".", 1)[0] }}.200',
+    },
+    {
+        'name': 'externalnet', 'type': 'external',
+        'base': '10.0.2.0',
+        'maskbits': '24',
+        'domain': 'brightcomputing.com',
+        'gateway': '{{ bcm_external_gateway }}',
+    },
+]
+
+interfaces = [
+    {'name': 'eth0', 'network': 'internalnet', 'ip': '{{ bcm_internal_ip }}', 'provisioning': True},
+    {'name': 'eth1', 'network': 'externalnet', 'ip': '10.0.2.15'},
+]
+
+with open('/cm/build-config.xml.tpl') as f:
+    tpl = Template(f.read())
+
+result = tpl.render(
+    networks=networks,
+    interfaces=interfaces,
+    hostname='{{ bcm_hostname }}',
+    timezone='{{ bcm_timezone }}',
+    slave_ip='{{ bcm_internal_ip.rsplit(".", 1)[0] }}.1',
+)
+
+with open('/cm/build-config.xml', 'w') as f:
+    f.write(result)
+
+print(f"[OK] Rendered build-config.xml: {len(networks)} networks, {len(interfaces)} interfaces")
+for n in networks:
+    print(f"  {n['name']}: base={n['base']}/{n['maskbits']}")
+PYRENDER
+else
+    echo "[INFO] No template — using default build-config.xml"
+    # Patch hostname and timezone in default config
+    sed -i 's|<hostname>.*</hostname>|<hostname>{{ bcm_hostname }}</hostname>|' /cm/build-config.xml 2>/dev/null || true
+    sed -i 's|<timezone>.*</timezone>|<timezone>{{ bcm_timezone }}</timezone>|' /cm/build-config.xml 2>/dev/null || true
+fi
+
+PASS="{{ bcm_password }}"
+
+echo "[..] Waiting for installer environment..."
+TRIES=0
+while [ ! -f /var/www/htdocs/content/masterdisklayouts/master-one-big-partition.xml ] && [ "$TRIES" -lt 60 ]; do
+    sleep 2; (( TRIES++ ))
+done
+[ ! -f /var/www/htdocs/content/masterdisklayouts/master-one-big-partition.xml ] && { echo "[FAIL] Installer env not ready"; exit 1; }
+echo "[OK] Installer environment ready"
+
+echo "[..] Mounting installation media..."
+mkdir -p /mnt/cdrom
+ISODEVICE=""
+for dev in /dev/sr0 /dev/sr1 /dev/cdrom /dev/dvd; do
+    if [ -b "$dev" ] && mount -o ro "$dev" /mnt/cdrom 2>/dev/null; then
+        ISODEVICE="$dev"; echo "[OK] ISO from $dev"; break
+    fi
+done
+if [ -z "$ISODEVICE" ]; then
+    LABEL_DEV=$(findfs LABEL=BCMINSTALLERHEAD 2>/dev/null || true)
+    [ -n "$LABEL_DEV" ] && [ -b "$LABEL_DEV" ] && mount -o ro "$LABEL_DEV" /mnt/cdrom 2>/dev/null
+fi
+if ! mountpoint -q /mnt/cdrom || [ ! -d /mnt/cdrom/data ]; then
+    echo "[FAIL] Could not mount installation media"; lsblk; exit 1
+fi
+
+echo "=========================================="
+echo " Running cm-master-install"
+echo "=========================================="
+cd /cm
+yes | perl ./cm-master-install --config /cm/build-config.xml --mountpath /mnt/cdrom --password "$PASS" 2>&1 | tee -a "$LOG"
+RETVAL=${PIPESTATUS[1]}
+if [ $RETVAL -ne 0 ]; then
+    echo " INSTALLATION FAILED (exit code: $RETVAL)"; exit $RETVAL
+fi
+
+echo "[..] Patching installed system GRUB + networking..."
+vgchange -ay 2>/dev/null || true; sleep 1
+INSTALLED_ROOT=""
+mkdir -p /mnt/installed
+for part in $(ls /dev/mapper/*-root /dev/mapper/*root 2>/dev/null) /dev/vda5 /dev/sda5 \
+    $(lsblk -rno PATH,FSTYPE 2>/dev/null | awk '$2 == "ext4" || $2 == "xfs" {print $1}') \
+    /dev/vda2 /dev/vda1 /dev/sda2 /dev/sda1; do
+    [ -b "$part" ] || continue
+    if mount "$part" /mnt/installed 2>/dev/null; then
+        if [ -f /mnt/installed/etc/default/grub ]; then INSTALLED_ROOT="$part"; break; fi
+        umount /mnt/installed 2>/dev/null
+    fi
+done
+if [ -n "$INSTALLED_ROOT" ]; then
+    echo "[OK] Found installed root at $INSTALLED_ROOT"
+
+    # Add net.ifnames=0 biosdevname=0 to GRUB
+    if ! grep -q "net.ifnames=0" /mnt/installed/etc/default/grub; then
+        sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 net.ifnames=0 biosdevname=0"/' /mnt/installed/etc/default/grub
+        echo "[OK] Patched /etc/default/grub"
+    fi
+
+    # Patch grub.cfg directly
+    BOOT_PART=""
+    for bp in /dev/vda1 /dev/sda1; do
+        [ -b "$bp" ] && mount "$bp" /mnt/installed/boot 2>/dev/null && BOOT_PART="$bp" && break
+    done
+    if [ -f /mnt/installed/boot/grub/grub.cfg ]; then
+        if ! grep -q "net.ifnames=0" /mnt/installed/boot/grub/grub.cfg; then
+            sed -i '/^\s*linux\s/s/$/ net.ifnames=0 biosdevname=0/' /mnt/installed/boot/grub/grub.cfg
+            echo "[OK] Patched grub.cfg"
+        fi
+    fi
+    [ -n "$BOOT_PART" ] && umount /mnt/installed/boot 2>/dev/null
+
+    umount /mnt/installed 2>/dev/null
+else
+    echo "[WARN] Could not find installed root partition"
+fi
+echo "=========================================="
+echo " INSTALLATION COMPLETE - powering off..."
+echo "=========================================="
+poweroff

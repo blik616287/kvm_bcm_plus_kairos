@@ -1,0 +1,27 @@
+---
+- name: "Teardown: destroy VMs and clean artifacts"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
+    build_dir: "{{ e2e_dir }}/build"
+  tasks:
+    - name: Kill BCM VM
+      ansible.builtin.shell: |
+        PID=$(cat {{ build_dir }}/.bcm-qemu.pid 2>/dev/null) && kill $PID 2>/dev/null || true
+      changed_when: false
+      failed_when: false
+
+    - name: Kill Kairos VM
+      ansible.builtin.shell: |
+        PID=$(cat {{ build_dir }}/.kairos-qemu.pid 2>/dev/null) && kill $PID 2>/dev/null || true
+      changed_when: false
+      failed_when: false
+
+    - name: Remove build artifacts
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ build_dir }}"
+        - "{{ e2e_dir }}/logs"
