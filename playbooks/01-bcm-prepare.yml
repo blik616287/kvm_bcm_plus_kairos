@@ -1,0 +1,10 @@
+---
+- name: "Stage 1: Download + patch + remaster BCM ISO"
+  hosts: localhost
+  gather_facts: true
+  vars:
+    e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
+    build_dir: "{{ e2e_dir }}/build"
+    dist_dir: "{{ e2e_dir }}/dist"
+  roles:
+    - bcm_prepare

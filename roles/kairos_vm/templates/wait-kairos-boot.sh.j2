@@ -1,0 +1,37 @@
+#!/bin/bash
+# Wait for Kairos to fully boot after disk install.
+set -uo pipefail
+
+BCM_HOST="localhost"
+BCM_PASSWORD="{{ bcm_password }}"
+BCM_SSH_PORT="{{ bcm_ssh_port }}"
+COMPUTE_MAC="{{ kairos_vm_mac }}"
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+SSH_CMD="sshpass -p ${BCM_PASSWORD} ssh ${SSH_OPTS} -p ${BCM_SSH_PORT} root@${BCM_HOST}"
+
+TIMEOUT=600
+ELAPSED=0
+
+echo "Waiting for Kairos boot (disk boot → recovery → active)..."
+
+while [ $ELAPSED -lt $TIMEOUT ]; do
+  # Check if Kairos has booted via SSH through BCM
+  KAIROS_IP=$(${SSH_CMD} "arp -an 2>/dev/null | grep -i '${COMPUTE_MAC}' | grep -oP '\d+\.\d+\.\d+\.\d+'" 2>/dev/null || true)
+  if [ -n "$KAIROS_IP" ]; then
+    HAS_KAIROS=$(${SSH_CMD} "sshpass -p kairos ssh ${SSH_OPTS} \
+      -o ConnectTimeout=3 -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+      kairos@${KAIROS_IP} 'test -f /etc/kairos-release && echo yes'" 2>/dev/null || echo "no")
+
+    if echo "$HAS_KAIROS" | grep -q "yes"; then
+      echo "KAIROS_BOOTED at ${KAIROS_IP} after ${ELAPSED}s"
+      exit 0
+    fi
+  fi
+
+  echo "  Waiting... (${ELAPSED}s, IP: ${KAIROS_IP:-detecting})"
+  sleep 15
+  ELAPSED=$((ELAPSED + 15))
+done
+
+echo "TIMEOUT after ${TIMEOUT}s"
+exit 1

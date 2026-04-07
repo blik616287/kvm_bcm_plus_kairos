@@ -1,0 +1,139 @@
+---
+# kairos_vm — Launch Kairos compute node in local KVM.
+# PXE boots from BCM on the internal socket network.
+# Flow: PXE → BCM provisions installer → dd writes Kairos → sysrq poweroff →
+#       reboot from disk → Kairos active
+
+- name: Set Kairos VM variables
+  ansible.builtin.set_fact:
+    kairos_disk: "{{ build_dir }}/kairos-compute.qcow2"
+    kairos_serial_log: "{{ e2e_dir }}/logs/kairos-serial.log"
+    kairos_pid_file: "{{ build_dir }}/.kairos-qemu.pid"
+    ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    bcm_ssh_cmd: "sshpass -p {{ bcm_password }} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p {{ bcm_ssh_port }} root@localhost"
+
+- name: Detect display availability
+  ansible.builtin.shell: |
+    if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+      if command -v xdpyinfo >/dev/null 2>&1 && xdpyinfo >/dev/null 2>&1; then
+        echo "gtk"
+      elif command -v xset >/dev/null 2>&1 && xset q >/dev/null 2>&1; then
+        echo "gtk"
+      else
+        echo "none"
+      fi
+    else
+      echo "none"
+    fi
+  register: qemu_display_type
+  changed_when: false
+
+- name: Create logs directory
+  ansible.builtin.file:
+    path: "{{ e2e_dir }}/logs"
+    state: directory
+
+- name: Kill any existing Kairos VM
+  ansible.builtin.shell: |
+    PID=$(cat "{{ kairos_pid_file }}" 2>/dev/null) && kill "$PID" 2>/dev/null || true
+    pkill -f "qemu-system.*Kairos-ComputeNode" 2>/dev/null || true
+    sleep 2
+  become: true
+  changed_when: false
+  failed_when: false
+
+- name: Reset node001 install mode to FULL before recreating disk
+  ansible.builtin.shell: |
+    {{ bcm_ssh_cmd }} "echo -e 'device\nuse node001\nset installmode FULL\ncommit' | cmsh 2>&1"
+  changed_when: true
+
+- name: Create fresh Kairos disk
+  ansible.builtin.shell: |
+    rm -f "{{ kairos_disk }}"
+    qemu-img create -f qcow2 "{{ kairos_disk }}" {{ kairos_vm_disk_size }}
+
+- name: Detect KVM acceleration
+  ansible.builtin.shell: test -e /dev/kvm && echo "-enable-kvm" || echo ""
+  register: kvm_flag
+  changed_when: false
+
+- name: Launch Kairos compute VM (PXE boot)
+  ansible.builtin.shell: |
+    > "{{ kairos_serial_log }}"
+    qemu-system-x86_64 \
+      {{ kvm_flag.stdout }} \
+      -m {{ kairos_vm_ram }} \
+      -smp {{ kairos_vm_cpus }} \
+      -cpu host \
+      -name "Kairos-ComputeNode" \
+      -display {{ qemu_display_type.stdout }} \
+      -drive file="{{ kairos_disk }}",format=qcow2,if=virtio \
+      -netdev socket,id=intnet,connect=:31337 \
+      -device virtio-net-pci,netdev=intnet,mac={{ kairos_vm_mac }} \
+      -chardev socket,id=ser0,host=localhost,port=4321,server=on,wait=off,telnet=on,logfile="{{ kairos_serial_log }}" \
+      -serial chardev:ser0 \
+      -pidfile "{{ kairos_pid_file }}" \
+      -daemonize \
+      -boot order=cn
+
+- name: Display Kairos VM info
+  ansible.builtin.debug:
+    msg:
+      - "Kairos compute VM started (PXE boot from BCM)"
+      - "Serial log: {{ kairos_serial_log }}"
+      - "Flow: PXE → installer → dd → poweroff → disk boot → Kairos"
+
+# ---- Wait for install (VM powers off after dd) ----
+
+- name: Render wait-for-boot script
+  ansible.builtin.template:
+    src: wait-kairos-boot.sh.j2
+    dest: "{{ build_dir }}/wait-kairos-boot.sh"
+    mode: "0755"
+
+- name: Wait for dd install to complete (VM powers off, up to 30 min)
+  ansible.builtin.shell: |
+    TIMEOUT=1800
+    ELAPSED=0
+    PID=$(cat "{{ kairos_pid_file }}" 2>/dev/null)
+    echo "Waiting for Kairos VM to power off after dd (PID $PID)..."
+    while [ $ELAPSED -lt $TIMEOUT ]; do
+      kill -0 "$PID" 2>/dev/null || { echo "VM powered off at ${ELAPSED}s"; exit 0; }
+      sleep 10
+      ELAPSED=$((ELAPSED + 10))
+    done
+    echo "TIMEOUT after ${TIMEOUT}s"
+    exit 1
+  register: poweroff_result
+  async: 1860
+  poll: 15
+
+# ---- Reboot from disk ----
+
+- name: Start Kairos VM from disk
+  ansible.builtin.shell: |
+    > "{{ kairos_serial_log }}"
+    qemu-system-x86_64 \
+      {{ kvm_flag.stdout }} \
+      -m {{ kairos_vm_ram }} \
+      -smp {{ kairos_vm_cpus }} \
+      -cpu host \
+      -name "Kairos-ComputeNode" \
+      -display {{ qemu_display_type.stdout }} \
+      -drive file="{{ kairos_disk }}",format=qcow2,if=virtio \
+      -netdev socket,id=intnet,connect=:31337 \
+      -device virtio-net-pci,netdev=intnet,mac={{ kairos_vm_mac }} \
+      -chardev socket,id=ser0,host=localhost,port=4321,server=on,wait=off,telnet=on,logfile="{{ kairos_serial_log }}" \
+      -serial chardev:ser0 \
+      -pidfile "{{ kairos_pid_file }}" \
+      -daemonize \
+      -boot c
+
+- name: Wait for Kairos to fully boot (up to 10 min)
+  ansible.builtin.shell: "{{ build_dir }}/wait-kairos-boot.sh"
+  register: kairos_boot_result
+  timeout: 600
+
+- name: Show Kairos boot result
+  ansible.builtin.debug:
+    msg: "{{ kairos_boot_result.stdout_lines | default(['unknown']) | last }}"

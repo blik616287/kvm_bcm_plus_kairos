@@ -1,0 +1,16 @@
+[Unit]
+Description=BCM Automated Head Node Installation
+Requires=bright-installer-configure.service
+After=bright-installer-configure.service network-online.target
+Conflicts=bright-installer-text.service bright-installer-graphical.service bright-installer-graphical-lowgfx.service bright-installer-backend.service bright-installer-remote.service getty@tty1.service serial-getty@ttyS0.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bcm-autoinstall.sh
+StandardInput=null
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutSec=infinity
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,48 @@
+# --- BCM Head Node ---
+bcm_password: <redacted>
+bcm_hostname: "bcm11-headnode"
+bcm_timezone: "America/Los_Angeles"
+
+# BCM networking (internal socket network)
+bcm_internal_ip: "10.141.255.254"
+bcm_internal_netmask: "16"
+bcm_internal_cidr: "10.141.0.0/16"
+
+# BCM external (QEMU user-mode NAT)
+bcm_external_gateway: "10.0.2.2"
+bcm_external_dns: "10.0.2.3"
+
+# SSH port forwarding (host -> BCM)
+bcm_ssh_port: 10022
+bcm_https_port: 10443
+
+# BCM VM resources
+bcm_vm_ram: 8192
+bcm_vm_cpus: 4
+bcm_vm_disk_size: "100G"
+
+# --- Kairos Compute Node VM ---
+kairos_vm_mac: "52:54:00:00:02:01"
+kairos_vm_ram: 4096
+kairos_vm_cpus: 2
+kairos_vm_disk_size: "80G"
+
+# --- Palette ---
+palette_endpoint: "api.spectrocloud.com"
+palette_token: <redacted>
+palette_project_uid: <redacted>
+
+# --- JFrog (BCM ISO download) ---
+jfrog_token: <redacted>
+jfrog_instance: "insightsoftmax.jfrog.io"
+jfrog_repo: "iso-releases"
+iso_filename: "bcm-11.0-ubuntu2404.iso"
+
+# --- Kairos Build ---
+kairos_kernel_version: "6.8.0-87-generic"
+kairos_container_registry: "ttl.sh"
+
+# --- Paths ---
+e2e_dir: "{{ playbook_dir | default('.') }}/.."
+build_dir: "{{ e2e_dir }}/build"
+dist_dir: "{{ e2e_dir }}/dist"

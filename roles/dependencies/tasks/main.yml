@@ -1,0 +1,57 @@
+---
+# Install build dependencies for BCM + Kairos KVM deployment.
+
+- name: Detect package manager
+  ansible.builtin.set_fact:
+    pkg_mgr: "{{ 'apt' if ansible_os_family == 'Debian' else 'dnf' }}"
+
+- name: Install dependencies (Debian/Ubuntu)
+  when: pkg_mgr == 'apt'
+  ansible.builtin.apt:
+    name:
+      - qemu-system-x86
+      - qemu-utils
+      - ovmf
+      - docker.io
+      - sshpass
+      - xorriso
+      - p7zip-full
+      - lz4
+      - jq
+      - mtools
+      - dosfstools
+      - cpio
+      - gzip
+      - curl
+      - nfs-common
+      - gdisk
+      - e2fsprogs
+      - socat
+    state: present
+    update_cache: true
+  become: true
+
+- name: Install dependencies (Fedora/RHEL)
+  when: pkg_mgr == 'dnf'
+  ansible.builtin.dnf:
+    name:
+      - qemu-system-x86-core
+      - qemu-img
+      - edk2-ovmf
+      - docker
+      - sshpass
+      - xorriso
+      - p7zip
+      - lz4
+      - jq
+      - mtools
+      - dosfstools
+      - cpio
+      - gzip
+      - curl
+      - nfs-utils
+      - gdisk
+      - e2fsprogs
+      - socat
+    state: present
+  become: true

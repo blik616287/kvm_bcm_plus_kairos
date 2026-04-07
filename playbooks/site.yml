@@ -1,0 +1,8 @@
+---
+# Full E2E pipeline: BCM + Kairos on local KVM
+- import_playbook: 01-bcm-prepare.yml
+- import_playbook: 02-bcm-vm.yml
+- import_playbook: 03-kairos-build.yml
+- import_playbook: 04-deploy-dd.yml
+- import_playbook: 05-kairos-vm.yml
+- import_playbook: 06-validate.yml

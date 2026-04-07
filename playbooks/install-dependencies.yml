@@ -1,0 +1,6 @@
+---
+- name: "Install build dependencies"
+  hosts: localhost
+  gather_facts: true
+  roles:
+    - dependencies

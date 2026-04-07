@@ -1,0 +1,214 @@
+---
+# bcm_vm — Launch BCM head node in local KVM.
+# Two-phase install: Phase 1 boots ISO for auto-install, Phase 2 boots from disk.
+# Two separate networks: internal (socket :31337) + external (user-mode NAT).
+
+- name: Set BCM connection variables
+  ansible.builtin.set_fact:
+    bcm_disk: "{{ build_dir }}/bcm-headnode.qcow2"
+    bcm_serial_log: "{{ e2e_dir }}/logs/bcm-serial.log"
+    bcm_pid_file: "{{ build_dir }}/.bcm-qemu.pid"
+    ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+
+- name: Detect display availability
+  ansible.builtin.shell: |
+    if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+      # Verify the display server is actually reachable
+      if command -v xdpyinfo >/dev/null 2>&1 && xdpyinfo >/dev/null 2>&1; then
+        echo "gtk"
+      elif command -v xset >/dev/null 2>&1 && xset q >/dev/null 2>&1; then
+        echo "gtk"
+      else
+        echo "none"
+      fi
+    else
+      echo "none"
+    fi
+  register: qemu_display_type
+  changed_when: false
+
+- name: Create logs directory
+  ansible.builtin.file:
+    path: "{{ e2e_dir }}/logs"
+    state: directory
+
+- name: Stop any existing BCM QEMU process
+  ansible.builtin.shell: |
+    # Kill by PID file
+    PID=$(cat "{{ bcm_pid_file }}" 2>/dev/null) && kill "$PID" 2>/dev/null || true
+    # Kill by process name (catches orphans)
+    pkill -f "qemu-system.*BCM-HeadNode" 2>/dev/null || true
+    sleep 2
+    # Verify ports are free
+    ss -tlnp 2>/dev/null | grep -q ":31337 " && { echo "WARN: port 31337 still in use"; exit 1; } || true
+    ss -tlnp 2>/dev/null | grep -q ":{{ bcm_ssh_port }} " && { echo "WARN: port {{ bcm_ssh_port }} still in use"; exit 1; } || true
+    echo "Clean"
+  become: true
+  changed_when: false
+  failed_when: false
+
+- name: Check if BCM disk exists
+  ansible.builtin.stat:
+    path: "{{ bcm_disk }}"
+  register: bcm_disk_stat
+
+# ---- Phase 1: Auto-install from ISO ----
+
+- name: Phase 1 — Install BCM from ISO
+  when: not bcm_disk_stat.stat.exists
+  block:
+    - name: Verify remastered ISO exists
+      ansible.builtin.stat:
+        path: "{{ build_dir }}/bcm-autoinstall.iso"
+      register: iso_check
+      failed_when: not iso_check.stat.exists
+
+    - name: Create BCM disk image
+      ansible.builtin.shell: qemu-img create -f qcow2 "{{ bcm_disk }}" {{ bcm_vm_disk_size }}
+
+    - name: Detect KVM acceleration
+      ansible.builtin.shell: test -e /dev/kvm && echo "-enable-kvm" || echo ""
+      register: kvm_flag
+      changed_when: false
+
+    - name: Launch BCM installer (direct kernel boot)
+      ansible.builtin.shell: |
+        > "{{ bcm_serial_log }}"
+        qemu-system-x86_64 \
+          {{ kvm_flag.stdout }} \
+          -m {{ bcm_vm_ram }} \
+          -smp {{ bcm_vm_cpus }} \
+          -cpu host \
+          -name "BCM-HeadNode-Install" \
+          -display {{ qemu_display_type.stdout }} \
+          -drive file="{{ bcm_disk }}",format=qcow2,if=virtio \
+          -drive format=raw,media=cdrom,readonly=on,file="{{ build_dir }}/bcm-autoinstall.iso" \
+          -drive file="{{ build_dir }}/.bcm-init.img",format=raw,if=virtio \
+          -kernel "{{ build_dir }}/.bcm-kernel" \
+          -initrd "{{ build_dir }}/.bcm-rootfs-auto.cgz" \
+          -append "dvdinstall nokeymap root=/dev/ram0 rw ramdisk_size=1000000 vga=normal bcmblacklist=nouveau systemd.unit=multi-user.target net.ifnames=0 biosdevname=0 console=ttyS0,115200 console=tty0" \
+          -netdev socket,id=intnet,listen=:31337 \
+          -device virtio-net-pci,netdev=intnet,mac=BC:24:11:7F:33:7C \
+          -netdev user,id=extnet,hostfwd=tcp::{{ bcm_ssh_port }}-:22,hostfwd=tcp::{{ bcm_https_port }}-:443 \
+          -device virtio-net-pci,netdev=extnet,mac=BC:24:11:ED:21:50 \
+          -vga virtio \
+          -serial file:"{{ bcm_serial_log }}" \
+          -pidfile "{{ bcm_pid_file }}" \
+          -daemonize \
+          -boot d
+
+    - name: Wait for BCM install to complete (VM powers off)
+      ansible.builtin.shell: |
+        TIMEOUT=5400
+        ELAPSED=0
+        PID=$(cat "{{ bcm_pid_file }}" 2>/dev/null)
+        echo "Waiting for BCM install to complete (PID $PID, up to 90 min)..."
+        while [ $ELAPSED -lt $TIMEOUT ]; do
+          kill -0 "$PID" 2>/dev/null || { echo "VM exited at ${ELAPSED}s"; exit 0; }
+          sleep 15
+          ELAPSED=$((ELAPSED + 15))
+          if (( ELAPSED % 60 == 0 )); then
+            echo "  ${ELAPSED}s elapsed..."
+          fi
+        done
+        echo "TIMEOUT after ${TIMEOUT}s"
+        kill "$PID" 2>/dev/null || true
+        exit 1
+      async: 5500
+      poll: 30
+
+# ---- Phase 2: Boot from installed disk ----
+
+- name: Kill any existing BCM QEMU process
+  ansible.builtin.shell: |
+    PID=$(cat "{{ bcm_pid_file }}" 2>/dev/null) && kill "$PID" 2>/dev/null; sleep 2; true
+  changed_when: false
+  failed_when: false
+
+- name: Detect KVM acceleration
+  ansible.builtin.shell: test -e /dev/kvm && echo "-enable-kvm" || echo ""
+  register: kvm_flag
+  changed_when: false
+
+- name: Launch BCM from installed disk
+  ansible.builtin.shell: |
+    > "{{ bcm_serial_log }}"
+    qemu-system-x86_64 \
+      {{ kvm_flag.stdout }} \
+      -m {{ bcm_vm_ram }} \
+      -smp {{ bcm_vm_cpus }} \
+      -cpu host \
+      -name "BCM-HeadNode" \
+      -display {{ qemu_display_type.stdout }} \
+      -drive file="{{ bcm_disk }}",format=qcow2,if=virtio \
+      -netdev socket,id=intnet,listen=:31337 \
+      -device virtio-net-pci,netdev=intnet,mac=BC:24:11:7F:33:7C \
+      -netdev user,id=extnet,hostfwd=tcp::{{ bcm_ssh_port }}-:22,hostfwd=tcp::{{ bcm_https_port }}-:443 \
+      -device virtio-net-pci,netdev=extnet,mac=BC:24:11:ED:21:50 \
+      -vga virtio \
+      -serial file:"{{ bcm_serial_log }}" \
+      -pidfile "{{ bcm_pid_file }}" \
+      -daemonize \
+      -boot c
+
+- name: Wait for BCM SSH to be reachable
+  ansible.builtin.shell: |
+    SSH_CMD="sshpass -p {{ bcm_password }} ssh {{ ssh_opts }} -p {{ bcm_ssh_port }} root@localhost"
+    ELAPSED=0
+    echo "Waiting for BCM SSH on port {{ bcm_ssh_port }}..."
+    while [ $ELAPSED -lt 300 ]; do
+      ${SSH_CMD} "echo ok" &>/dev/null && { echo "SSH ready at ${ELAPSED}s"; exit 0; }
+      sleep 5
+      ELAPSED=$((ELAPSED + 5))
+    done
+    echo "SSH not reachable after 300s"
+    exit 1
+  register: ssh_wait
+
+- name: Wait for cmfirstboot to complete
+  ansible.builtin.shell: |
+    #!/bin/bash
+    SSH_CMD="sshpass -p {{ bcm_password }} ssh {{ ssh_opts }} -p {{ bcm_ssh_port }} root@localhost"
+    ELAPSED=0
+    while [ $ELAPSED -lt 600 ]; do
+      STATUS=$(${SSH_CMD} "systemctl is-active cmfirstboot" 2>/dev/null | tail -1 | tr -d '[:space:]')
+      [ "$STATUS" != "activating" ] && [ "$STATUS" != "active" ] && break
+      sleep 10
+      ELAPSED=$((ELAPSED + 10))
+    done
+    # Wait for clean shell (MOTD may still be noisy — use tail -1 to grab just our echo)
+    for i in $(seq 1 30); do
+      RESULT=$(${SSH_CMD} 'echo CLEAN' 2>/dev/null | tail -1 | tr -d '[:space:]')
+      [ "$RESULT" = "CLEAN" ] && break
+      sleep 5
+    done
+    echo "cmfirstboot complete"
+  args:
+    executable: /bin/bash
+  async: 900
+  poll: 15
+
+- name: Wait for BCM services (cmd + cmsh)
+  ansible.builtin.shell: |
+    #!/bin/bash
+    SSH_CMD="sshpass -p {{ bcm_password }} ssh {{ ssh_opts }} -p {{ bcm_ssh_port }} root@localhost"
+    ELAPSED=0
+    while [ $ELAPSED -lt 300 ]; do
+      CMD=$(${SSH_CMD} "systemctl is-active cmd" 2>/dev/null | tail -1 | tr -d '[:space:]')
+      CMSH=$(${SSH_CMD} "cmsh -c 'device; list' >/dev/null 2>&1 && echo ok || echo no" 2>/dev/null | tail -1 | tr -d '[:space:]')
+      [ "$CMD" = "active" ] && [ "$CMSH" = "ok" ] && { echo "BCM services ready"; exit 0; }
+      sleep 5
+      ELAPSED=$((ELAPSED + 5))
+    done
+    echo "BCM services not ready after 300s"
+    exit 1
+  args:
+    executable: /bin/bash
+
+- name: Display BCM connection info
+  ansible.builtin.debug:
+    msg:
+      - "BCM head node running"
+      - "SSH: ssh -p {{ bcm_ssh_port }} root@localhost (password: {{ bcm_password }})"
+      - "Internal IP: {{ bcm_internal_ip }} (socket network)"
+      - "Serial log: {{ bcm_serial_log }}"

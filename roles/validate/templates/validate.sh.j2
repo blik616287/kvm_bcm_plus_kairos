@@ -1,0 +1,217 @@
+#!/bin/bash
+# validate.sh — Comprehensive deployment validation, rendered by Ansible.
+# KVM variant: connects to BCM via port-forwarded SSH.
+set -uo pipefail
+
+BCM_HOST="localhost"
+BCM_PASSWORD="{{ bcm_password }}"
+BCM_SSH_PORT="{{ bcm_ssh_port }}"
+COMPUTE_MAC="{{ kairos_vm_mac }}"
+KAIROS_USER="kairos"
+KAIROS_PASSWORD="kairos"
+BCM_INTERNAL_IP="{{ bcm_internal_ip }}"
+
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
+BCM_SSH="sshpass -p ${BCM_PASSWORD} ssh ${SSH_OPTS} -p ${BCM_SSH_PORT} root@${BCM_HOST}"
+
+filter_motd() { grep -vE "cmfirstboot is still in progress|^$|Welcome to|Documentation|Management|Support|updates is more|sudo apt update|Base Command Manager|Cluster Manager ID|module|Use the following|initadd|module add|^-----|^$" || true; }
+
+PASS=0; FAIL=0; WARN=0
+check() {
+    local name="$1" result="$2" detail="${3:-}"
+    if [[ "$result" == "PASS" ]]; then PASS=$((PASS+1))
+    elif [[ "$result" == "WARN" ]]; then WARN=$((WARN+1))
+    else FAIL=$((FAIL+1)); fi
+    if [[ -n "$detail" ]]; then echo "  [${result}] ${name} — ${detail}"
+    else echo "  [${result}] ${name}"; fi
+}
+
+echo "============================================"
+echo " E2E Deployment Validation (KVM)"
+echo "============================================"
+echo ""
+
+# =============================================
+# BCM HEAD NODE
+# =============================================
+echo "== BCM Head Node (port ${BCM_SSH_PORT}) =="
+echo ""
+
+echo "-- Connectivity --"
+${BCM_SSH} "echo ok" &>/dev/null && check "BCM SSH" "PASS" "port ${BCM_SSH_PORT}" || { check "BCM SSH" "FAIL" "Cannot reach BCM"; exit 1; }
+
+echo ""
+echo "-- BCM Services --"
+CMD_STATUS=$(${BCM_SSH} "systemctl is-active cmd 2>/dev/null" 2>/dev/null | filter_motd)
+[[ "$CMD_STATUS" == "active" ]] && check "cmd service" "PASS" "" || check "cmd service" "FAIL" "$CMD_STATUS"
+
+DHCPD_STATUS=$(${BCM_SSH} "systemctl is-active dhcpd 2>/dev/null" 2>/dev/null | filter_motd)
+[[ "$DHCPD_STATUS" == "active" ]] && check "dhcpd" "PASS" "" || check "dhcpd" "FAIL" ""
+
+NAMED_STATUS=$(${BCM_SSH} "systemctl is-active named 2>/dev/null" 2>/dev/null | filter_motd)
+[[ "$NAMED_STATUS" == "active" ]] && check "named (DNS)" "PASS" "" || check "named" "FAIL" ""
+
+NFS_STATUS=$(${BCM_SSH} "systemctl is-active nfs-server 2>/dev/null" 2>/dev/null | filter_motd)
+[[ "$NFS_STATUS" == "active" ]] && check "nfs-server" "PASS" "" || check "nfs-server" "FAIL" ""
+
+RSYNC_LISTEN=$(${BCM_SSH} "ss -tlnp 2>/dev/null | grep :873 | head -1" 2>/dev/null | filter_motd)
+[[ -n "$RSYNC_LISTEN" ]] && check "rsyncd (873)" "PASS" "" || check "rsyncd (873)" "WARN" ""
+
+HTTP_LISTEN=$(${BCM_SSH} "ss -tlnp 2>/dev/null | grep :8888 | head -1" 2>/dev/null | filter_motd)
+[[ -n "$HTTP_LISTEN" ]] && check "HTTP server (8888)" "PASS" "Kairos image server" || check "HTTP server (8888)" "FAIL" ""
+
+echo ""
+echo "-- BCM Connectivity --"
+${BCM_SSH} "ping -c1 -W3 localhost" &>/dev/null && check "BCM ping" "PASS" "" || check "BCM ping" "FAIL" ""
+
+echo ""
+echo "-- BCM Network --"
+ETH0_IP=$(${BCM_SSH} "ip -4 addr show eth0 2>/dev/null | grep -oP 'inet \K[0-9.]+'" 2>/dev/null | filter_motd)
+[[ "$ETH0_IP" == "$BCM_INTERNAL_IP" ]] && check "eth0 (internal)" "PASS" "$ETH0_IP" || check "eth0 (internal)" "FAIL" "expected $BCM_INTERNAL_IP got $ETH0_IP"
+
+ETH1_IP=$(${BCM_SSH} "ip -4 addr show eth1 2>/dev/null | grep -oP 'inet \K[0-9.]+'" 2>/dev/null | filter_motd)
+[[ -n "$ETH1_IP" ]] && check "eth1 (external)" "PASS" "$ETH1_IP" || check "eth1 (external)" "FAIL" "no IP on eth1"
+
+IP_FWD=$(${BCM_SSH} "cat /proc/sys/net/ipv4/ip_forward" 2>/dev/null | filter_motd)
+[[ "$IP_FWD" == "1" ]] && check "IP forwarding" "PASS" "" || check "IP forwarding" "WARN" "disabled — compute nodes may lack internet"
+
+echo ""
+echo "-- BCM DNS --"
+DNS_EXT=$(${BCM_SSH} "host google.com 2>/dev/null | head -1" 2>/dev/null | filter_motd)
+echo "$DNS_EXT" | grep -q "has address" && check "External DNS" "PASS" "" || check "External DNS" "FAIL" "$DNS_EXT"
+
+INET=$(${BCM_SSH} 'curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 20 https://google.com 2>/dev/null' 2>/dev/null | filter_motd)
+[[ "$INET" == "301" || "$INET" == "200" ]] && check "Internet access" "PASS" "HTTP $INET" || check "Internet access" "WARN" "HTTP ${INET:-timeout}"
+
+echo ""
+echo "-- BCM Cluster --"
+CMSH_LIST=$(${BCM_SSH} "cmsh -c 'device; list' 2>/dev/null" 2>/dev/null | filter_motd)
+echo "$CMSH_LIST" | grep -q "UP" && check "Head node (cmsh)" "PASS" "" || check "Head node (cmsh)" "FAIL" ""
+echo "$CMSH_LIST" | grep -q "node001" && check "node001 registered" "PASS" "" || check "node001 registered" "FAIL" ""
+
+NODE_IP=$(${BCM_SSH} "cmsh -c 'device; use node001; get ip' 2>/dev/null" 2>/dev/null | filter_motd)
+check "node001 IP" "PASS" "$NODE_IP"
+
+NODE_CAT=$(${BCM_SSH} "cmsh -c 'device; use node001; get category' 2>/dev/null" 2>/dev/null | filter_motd)
+[[ "$NODE_CAT" == "kairos" ]] && check "node001 category" "PASS" "$NODE_CAT" || check "node001 category" "FAIL" "$NODE_CAT"
+
+INSTALLER_IMG=$(${BCM_SSH} "test -d /cm/images/kairos-installer && echo exists" 2>/dev/null | filter_motd)
+[[ "$INSTALLER_IMG" == "exists" ]] && check "kairos-installer image" "PASS" "" || check "kairos-installer image" "FAIL" ""
+
+RAW_IMG=$(${BCM_SSH} "test -f /cm/shared/kairos/disk.raw.lz4 && echo exists" 2>/dev/null | filter_motd)
+[[ "$RAW_IMG" == "exists" ]] && check "Kairos raw image" "PASS" "/cm/shared/kairos/disk.raw.lz4" || check "Kairos raw image" "FAIL" ""
+
+# =============================================
+# KAIROS COMPUTE NODE
+# =============================================
+echo ""
+echo "============================================"
+echo "== Kairos Compute Node =="
+echo "============================================"
+echo ""
+
+KAIROS_IP=$(${BCM_SSH} "arp -an 2>/dev/null | grep -i '${COMPUTE_MAC}' | grep -oP '\\d+\\.\\d+\\.\\d+\\.\\d+'" 2>/dev/null | filter_motd)
+if [[ -z "$KAIROS_IP" ]]; then
+    NODE_IP=$(${BCM_SSH} "cmsh -c 'device; use node001; get ip' 2>/dev/null" 2>/dev/null | filter_motd)
+    KAIROS_IP="$NODE_IP"
+fi
+echo "Kairos IP: ${KAIROS_IP}"
+
+# Try SSH to Kairos
+KAIROS_SSH=""
+for attempt in $(seq 1 6); do
+    T=$(${BCM_SSH} "ssh ${SSH_OPTS} root@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
+    if [[ "$T" == *"CONNECTED"* ]]; then KAIROS_SSH="ssh ${SSH_OPTS} root@${KAIROS_IP}"; break; fi
+    T=$(${BCM_SSH} "sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} -o PreferredAuthentications=password -o PubkeyAuthentication=no ${KAIROS_USER}@${KAIROS_IP} 'echo CONNECTED' 2>&1" 2>/dev/null | filter_motd || true)
+    if [[ "$T" == *"CONNECTED"* ]]; then
+        KAIROS_SSH="sshpass -p ${KAIROS_PASSWORD} ssh ${SSH_OPTS} -o PreferredAuthentications=password -o PubkeyAuthentication=no ${KAIROS_USER}@${KAIROS_IP}"; break
+    fi
+    (( attempt < 6 )) && sleep 5
+done
+
+if [[ -z "$KAIROS_SSH" ]]; then
+    check "Kairos SSH" "FAIL" "Cannot reach ${KAIROS_IP}"
+    echo ""
+    TOTAL=$((PASS+FAIL+WARN))
+    echo "============================================"
+    echo " PASS: ${PASS}/${TOTAL}  WARN: ${WARN}/${TOTAL}  FAIL: ${FAIL}/${TOTAL}"
+    echo "============================================"
+    exit 1
+fi
+
+run_on_kairos() { ${BCM_SSH} "${KAIROS_SSH} '$1'" 2>/dev/null | filter_motd; }
+
+echo ""
+echo "-- Connectivity --"
+check "Kairos SSH" "PASS" "${KAIROS_IP}"
+${BCM_SSH} "ping -c1 -W3 ${KAIROS_IP}" &>/dev/null && check "Kairos ping" "PASS" "" || check "Kairos ping" "FAIL" ""
+
+echo ""
+echo "-- OS --"
+OS=$(run_on_kairos 'grep PRETTY_NAME /etc/os-release | cut -d\" -f2' || true)
+[[ -n "$OS" ]] && check "OS" "PASS" "$OS" || check "OS" "FAIL" ""
+
+KR=$(run_on_kairos 'grep KAIROS_VERSION /etc/kairos-release 2>/dev/null | head -1 | cut -d= -f2' || true)
+[[ -n "$KR" ]] && check "Kairos release" "PASS" "$KR" || check "Kairos release" "FAIL" ""
+
+KA=$(run_on_kairos 'kairos-agent version 2>/dev/null' || true)
+[[ -n "$KA" && "$KA" != "MISSING" ]] && check "kairos-agent" "PASS" "$KA" || check "kairos-agent" "FAIL" ""
+
+KERN=$(run_on_kairos 'uname -r' || true)
+[[ -n "$KERN" ]] && check "Kernel" "PASS" "$KERN" || check "Kernel" "FAIL" ""
+
+echo ""
+echo "-- Network --"
+K_IP=$(run_on_kairos 'ip -4 addr show | grep "inet " | grep -v 127.0.0 | head -1 | awk "{print \$2}"' || true)
+[[ -n "$K_IP" ]] && check "IP address" "PASS" "$K_IP" || check "IP address" "FAIL" ""
+
+K_GW=$(run_on_kairos 'ip route | grep default | head -1 | awk "{print \$3}"' || true)
+[[ -n "$K_GW" ]] && check "Gateway" "PASS" "$K_GW" || check "Gateway" "WARN" "no default route"
+
+K_DNS=$(run_on_kairos 'cat /etc/resolv.conf 2>/dev/null | grep nameserver | head -1 | awk "{print \$2}"' || true)
+[[ -n "$K_DNS" ]] && check "DNS resolver" "PASS" "$K_DNS" || check "DNS resolver" "WARN" "no nameserver"
+
+K_DNS_EXT=$(run_on_kairos 'ping -c1 -W3 google.com 2>/dev/null | head -1' || true)
+echo "$K_DNS_EXT" | grep -q "bytes of data" && check "External DNS resolution" "PASS" "" || check "External DNS resolution" "WARN" "cannot resolve google.com"
+
+K_INET=$(run_on_kairos 'curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 https://google.com 2>/dev/null' || true)
+[[ "$K_INET" == "301" || "$K_INET" == "200" ]] && check "Internet access" "PASS" "HTTP $K_INET" || check "Internet access" "WARN" "HTTP $K_INET"
+
+echo ""
+echo "-- Services --"
+STYLUS=$(run_on_kairos 'systemctl is-active stylus-agent 2>/dev/null' || true)
+[[ "$STYLUS" == "active" ]] && check "stylus-agent" "PASS" "" || check "stylus-agent" "WARN" "status: ${STYLUS:-unknown}"
+
+PALETTE_REG=$(run_on_kairos 'journalctl -u stylus-agent --no-pager 2>/dev/null | grep -c "registering edge host"' | tr -d '[:space:]' || echo 0)
+[ "${PALETTE_REG:-0}" -gt 0 ] 2>/dev/null && check "Palette registration" "PASS" "" || check "Palette registration" "WARN" "no registration log entries found"
+
+echo ""
+echo "-- Boot --"
+CMDLINE=$(run_on_kairos 'cat /proc/cmdline' || true)
+echo "$CMDLINE" | grep -q "net.ifnames=0" && check "net.ifnames=0" "PASS" "" || check "net.ifnames=0" "WARN" ""
+echo "$CMDLINE" | grep -qE "rd.immucore|rd.cos" && check "Kairos boot chain" "PASS" "" || check "Kairos boot chain" "WARN" ""
+
+echo ""
+echo "-- Disk / Partitions --"
+for lbl in COS_OEM COS_RECOVERY COS_STATE COS_PERSISTENT; do
+    D=$(run_on_kairos "blkid -L $lbl 2>/dev/null" || true)
+    [[ -n "$D" && "$D" != "MISSING" ]] && check "$lbl" "PASS" "$D" || check "$lbl" "WARN" "not found"
+done
+
+ROOT_RO=$(run_on_kairos 'mount | grep " / " | head -1' || true)
+echo "$ROOT_RO" | grep -qE "ro,|ro " && check "Root immutable" "PASS" "" || check "Root immutable" "WARN" ""
+
+DISK_FREE=$(run_on_kairos 'df -h / 2>/dev/null | tail -1 | awk "{print \$4}"' || true)
+[[ -n "$DISK_FREE" ]] && check "Disk free" "PASS" "$DISK_FREE" || check "Disk free" "WARN" ""
+
+echo ""
+echo "-- Cloud Config --"
+OEM=$(run_on_kairos 'ls /oem/*.yaml 2>/dev/null' || true)
+[[ -n "$OEM" ]] && check "OEM config" "PASS" "$OEM" || check "OEM config" "FAIL" ""
+
+echo ""
+TOTAL=$((PASS+FAIL+WARN))
+echo "============================================"
+echo " PASS: ${PASS}/${TOTAL}  WARN: ${WARN}/${TOTAL}  FAIL: ${FAIL}/${TOTAL}"
+echo "============================================"
+(( FAIL > 0 )) && exit 1 || exit 0
