@@ -2,6 +2,13 @@
 # kairos_build — Build Kairos ISO via CanvOS + generate raw disk image via local QEMU.
 # Uses SeaBIOS for BIOS+EFI bootable image. Patches squashfs for stable NIC naming.
 
+- name: Capture invoking user (ansible.cfg has become=true, so most tasks run as root;
+        we need the original user to chown artifacts back at the end)
+  ansible.builtin.command: whoami
+  register: invoking_user
+  become: false
+  changed_when: false
+
 - name: Set CanvOS variables
   ansible.builtin.set_fact:
     canvos_dir: "{{ e2e_dir }}/CanvOS"
@@ -55,7 +62,16 @@
         ARCH: "{{ arch }}"
 
     - name: Copy overlay files into CanvOS
-      ansible.builtin.shell: cp -r {{ e2e_dir }}/files/canvos/overlay/* {{ canvos_dir }}/overlay/ 2>/dev/null || true
+      ansible.builtin.shell: cp -rp {{ e2e_dir }}/files/canvos/overlay/* {{ canvos_dir }}/overlay/ 2>/dev/null || true
+
+    - name: Ensure overlay scripts are executable
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: "0755"
+      loop:
+        - "{{ canvos_dir }}/overlay/files/usr/bin/bcm-compat-fixes.sh"
+        - "{{ canvos_dir }}/overlay/files/usr/bin/bcm-sync-userdata.sh"
+      failed_when: false
 
     - name: Patch Earthfile — add BCM packages
       ansible.builtin.replace:
@@ -70,12 +86,15 @@
         line: "                RUN echo 'omit_dracutmodules+=\" nfit \"' > /etc/dracut.conf.d/99-skip-nfit.conf"
       failed_when: false
 
-    - name: Patch Dockerfile — add BCM scripts
-      ansible.builtin.lineinfile:
+    - name: Patch Dockerfile — add BCM scripts (COPY + chmod +x as real Dockerfile instructions)
+      ansible.builtin.blockinfile:
         path: "{{ canvos_dir }}/Dockerfile"
         insertafter: 'Add any other image customizations here'
-        line: "COPY overlay/files/usr/bin/bcm-compat-fixes.sh /usr/bin/bcm-compat-fixes.sh\nCOPY overlay/files/usr/bin/bcm-sync-userdata.sh /usr/bin/bcm-sync-userdata.sh\nRUN chmod +x /usr/bin/bcm-*.sh"
-      failed_when: false
+        marker: "# {mark} BCM compat scripts"
+        block: |
+          COPY overlay/files/usr/bin/bcm-compat-fixes.sh /usr/bin/bcm-compat-fixes.sh
+          COPY overlay/files/usr/bin/bcm-sync-userdata.sh /usr/bin/bcm-sync-userdata.sh
+          RUN chmod +x /usr/bin/bcm-compat-fixes.sh /usr/bin/bcm-sync-userdata.sh
 
     - name: Run CanvOS build
       ansible.builtin.shell: |
@@ -134,14 +153,23 @@
     - name: Create blank raw disk
       ansible.builtin.shell: truncate -s 81920M {{ build_dir }}/kairos-disk.raw
 
-    # SeaBIOS (QEMU default) so kairos-agent installs GRUB-pc (BIOS bootable).
-    # This makes the raw image bootable on both BIOS and EFI systems.
-    - name: Run kairos-agent install in QEMU (SeaBIOS)
+    # OVMF (UEFI) so kairos-agent detects UEFI and installs GRUB-EFI into an ESP.
+    # The resulting raw image is bootable on UEFI hardware (physical Dell servers etc.).
+    # BIOS-only platforms would need a separate image built with SeaBIOS.
+    - name: Run kairos-agent install in QEMU (OVMF / UEFI)
       ansible.builtin.shell: |
         SOCK="{{ build_dir }}/.qemu-install.sock"
         rm -f "$SOCK"
+        OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+        OVMF_VARS_SRC=/usr/share/OVMF/OVMF_VARS_4M.fd
+        [ -f "$OVMF_CODE" ] || OVMF_CODE=/usr/share/qemu/OVMF.fd
+        [ -f "$OVMF_VARS_SRC" ] || OVMF_VARS_SRC=/usr/share/ovmf/OVMF.fd
+        cp -f "$OVMF_VARS_SRC" {{ build_dir }}/ovmf-vars.fd
         qemu-system-x86_64 \
           -enable-kvm -m 4096 -smp 2 -cpu host \
+          -machine q35 \
+          -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+          -drive if=pflash,format=raw,file={{ build_dir }}/ovmf-vars.fd \
           -display none \
           -chardev socket,id=ser0,path="$SOCK",server=on,wait=off \
           -serial chardev:ser0 \
@@ -239,3 +267,12 @@
       ansible.builtin.shell: |
         cd {{ build_dir }}
         sha256sum kairos-disk.raw > kairos-disk.raw.sha256
+
+- name: Restore ownership of build artifacts to invoking user
+  ansible.builtin.file:
+    path: "{{ build_dir }}"
+    state: directory
+    owner: "{{ invoking_user.stdout }}"
+    group: "{{ invoking_user.stdout }}"
+    recurse: true
+  become: true
