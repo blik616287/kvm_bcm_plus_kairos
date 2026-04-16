@@ -4,7 +4,7 @@
 # KVM variant: connects via port-forwarded SSH, separate internal/external networks.
 set -uo pipefail
 
-BCM_HOST="localhost"
+BCM_HOST="{{ bcm_ssh_host | default('localhost') }}"
 BCM_PASSWORD="{{ bcm_password }}"
 BCM_SSH_PORT="{{ bcm_ssh_port }}"
 HEAD_NODE_IP="{{ bcm_internal_ip }}"
@@ -12,9 +12,26 @@ COMPUTE_MAC="{{ kairos_vm_mac }}"
 BUILD_DIR="{{ build_dir }}"
 RAW_IMAGE="${BUILD_DIR}/kairos-disk.raw"
 
+mkdir -p "${BUILD_DIR}"
+SSH_CONFIG="${BUILD_DIR}/.bcm-ssh-config"
+cat > "${SSH_CONFIG}" << SSHCONF
+Host bcm-target
+    HostName ${BCM_HOST}
+    Port ${BCM_SSH_PORT}
+    User root
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+{% if bcm_ssh_proxy_jump | default('') %}
+    ProxyCommand ssh -i {{ bcm_ssh_proxy_key | regex_replace('^~', lookup('env', 'HOME')) }} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -W %h:%p {{ bcm_ssh_proxy_jump }}
+{% endif %}
+SSHCONF
+chmod 600 "${SSH_CONFIG}"
+
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
-SSH_CMD="sshpass -p ${BCM_PASSWORD} ssh ${SSH_OPTS} -p ${BCM_SSH_PORT} root@${BCM_HOST}"
-SCP_CMD="sshpass -p ${BCM_PASSWORD} scp -O ${SSH_OPTS} -P ${BCM_SSH_PORT}"
+SSH_CMD="sshpass -p ${BCM_PASSWORD} ssh -F ${SSH_CONFIG} bcm-target"
+SCP_CMD="sshpass -p ${BCM_PASSWORD} scp -O -F ${SSH_CONFIG}"
+SCP_DEST="bcm-target"
 
 filter_motd() { grep -vE "cmfirstboot is still in progress|^$" || true; }
 
@@ -55,18 +72,39 @@ while true; do
 done
 info "BCM services ready"
 
-# Configure DNS forwarders via cmsh
+# Internal provisioning CIDR (from inventory; confirmed against BCM at setup time)
+DISCOVERED_CIDR="{{ bcm_internal_cidr }}"
+NET_BASE="{{ bcm_internal_cidr.split('/')[0] }}"
+NET_PREFIX="{{ bcm_internal_cidr.split('/')[0].rsplit('.', 1)[0] }}"
+POOL_START="${NET_PREFIX}.16"
+POOL_END_IP="${NET_PREFIX}.250"
+info "CIDR: ${DISCOVERED_CIDR}  DHCP pool: ${POOL_START} – ${POOL_END_IP}"
+
+{% if bcm_manage_dns | default(true) %}
+# Configure DNS forwarders via cmsh (only when we own the BCM cluster's DNS config —
+# skip on remote deploys where the site already has working DNS pointing at its own resolver).
 ${SSH_CMD} "echo -e 'partition\nuse base\nset nameservers {{ bcm_external_dns }}\ncommit' | cmsh 2>&1 && systemctl restart named 2>/dev/null" 2>/dev/null || true
 info "DNS forwarders set to {{ bcm_external_dns }} (via cmsh)"
+{% else %}
+info "Skipping DNS management (bcm_manage_dns=false) — leaving site's existing resolver untouched"
+{% endif %}
 
-# Enable IP forwarding so compute nodes can route through BCM to external
-${SSH_CMD} "
+# Enable IP forwarding + NAT so compute nodes can route through BCM to external.
+# Interface name is derived from BCM's default route (handles eth1, ens*, enp* alike).
+${SSH_CMD} bash -s << 'EOF' 2>/dev/null || true
 echo 1 > /proc/sys/net/ipv4/ip_forward
 sysctl -w net.ipv4.ip_forward=1 > /dev/null
 grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-iptables -t nat -C POSTROUTING -o eth1 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o eth1 -j MASQUERADE
-" 2>/dev/null || true
-info "IP forwarding and NAT enabled (internal → external)"
+EXT_IF=$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')
+if [ -n "$EXT_IF" ]; then
+    iptables -t nat -C POSTROUTING -o "$EXT_IF" -j MASQUERADE 2>/dev/null \
+      || iptables -t nat -A POSTROUTING -o "$EXT_IF" -j MASQUERADE
+    echo "[OK] MASQUERADE on $EXT_IF"
+else
+    echo "[WARN] No default route on BCM — skipping MASQUERADE"
+fi
+EOF
+info "IP forwarding + NAT configured"
 
 ${SSH_CMD} "command -v sshpass >/dev/null 2>&1 || apt-get install -y -qq sshpass >/dev/null 2>&1" 2>/dev/null || true
 
@@ -78,22 +116,25 @@ fi
 PUBKEY=$(cat "${BCM_KEY}.pub")
 ${SSH_CMD} "grep -qF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null || echo '${PUBKEY}' >> /root/.ssh/authorized_keys" 2>/dev/null || true
 
-# NFS exports (persistent via /etc/exports)
-${SSH_CMD} << 'EOF' | filter_motd
-grep -q 'default-image.*10.0.0.0' /etc/exports 2>/dev/null || echo '/cm/images/default-image 10.0.0.0/8(ro,no_subtree_check,no_root_squash,async)' >> /etc/exports
-grep -q 'default-image.*{{ bcm_internal_cidr }}' /etc/exports 2>/dev/null || echo '/cm/images/default-image {{ bcm_internal_cidr }}(ro,no_subtree_check,no_root_squash,async)' >> /etc/exports
-grep -q '/cm/shared.*10.0.0.0' /etc/exports 2>/dev/null || echo '/cm/shared 10.0.0.0/8(rw,no_subtree_check,no_root_squash,async)' >> /etc/exports
-grep -q 'kairos-installer' /etc/exports 2>/dev/null || echo '/cm/images/kairos-installer 10.0.0.0/8(ro,no_subtree_check,no_root_squash,async)' >> /etc/exports
+# NFS exports (persistent via /etc/exports) — scoped to discovered CIDR
+# Unquoted heredoc: local shell expands ${DISCOVERED_CIDR} before sending to remote.
+${SSH_CMD} bash -s << EOF | filter_motd
+grep -qF "default-image ${DISCOVERED_CIDR}" /etc/exports 2>/dev/null || echo "/cm/images/default-image ${DISCOVERED_CIDR}(ro,no_subtree_check,no_root_squash,async)" >> /etc/exports
+grep -qF "/cm/shared ${DISCOVERED_CIDR}" /etc/exports 2>/dev/null || echo "/cm/shared ${DISCOVERED_CIDR}(rw,no_subtree_check,no_root_squash,async)" >> /etc/exports
+grep -qF "kairos-installer ${DISCOVERED_CIDR}" /etc/exports 2>/dev/null || echo "/cm/images/kairos-installer ${DISCOVERED_CIDR}(ro,no_subtree_check,no_root_squash,async)" >> /etc/exports
 exportfs -ra
 
 # Fix DHCP authoritative
 if grep -q 'not authoritative' /etc/dhcpd.conf 2>/dev/null; then
     sed -i 's/not authoritative/authoritative/' /etc/dhcpd.conf
 fi
-# Exclude BCM's own IP from DHCP pool
-POOL_END=$(echo "{{ bcm_internal_ip }}" | awk -F. '{printf "%s.%s.%s.%d", $1,$2,$3,$4-1}')
-sed -i "s/range .*/range 10.141.0.16 ${POOL_END};/" /etc/dhcpd.conf 2>/dev/null || true
+
+# Rewrite DHCP pool range to match internal network
+sed -i 's|range .*|range ${POOL_START} ${POOL_END_IP};|' /etc/dhcpd.conf 2>/dev/null || true
 systemctl restart dhcpd
+EOF
+
+${SSH_CMD} << 'EOF' | filter_motd
 
 # Configure rsyncd
 cat > /etc/rsyncd.conf << 'RCONF'
@@ -122,7 +163,15 @@ info "[1/7] Compressing and uploading..."
 ${SSH_CMD} "mkdir -p /cm/shared/kairos" | filter_motd
 COMPRESSED="${RAW_IMAGE}.lz4"
 [ ! -f "$COMPRESSED" ] || [ "$RAW_IMAGE" -nt "$COMPRESSED" ] && lz4 -f "$RAW_IMAGE" "$COMPRESSED"
-${SCP_CMD} "${COMPRESSED}" root@${BCM_HOST}:/cm/shared/kairos/disk.raw.lz4
+# Skip SCP if remote file already matches local size (idempotent re-run through a slow jumphost)
+LOCAL_SZ=$(stat -c %s "${COMPRESSED}" 2>/dev/null || echo 0)
+REMOTE_SZ=$(${SSH_CMD} "stat -c %s /cm/shared/kairos/disk.raw.lz4 2>/dev/null" 2>/dev/null | filter_motd | tr -d '[:space:]' || echo 0)
+if [ "${LOCAL_SZ}" = "${REMOTE_SZ}" ] && [ "${LOCAL_SZ}" != "0" ]; then
+    info "Remote image already matches local size (${LOCAL_SZ} bytes) — skipping SCP"
+else
+    info "Uploading ${LOCAL_SZ} bytes (remote had ${REMOTE_SZ:-none})..."
+    ${SCP_CMD} "${COMPRESSED}" ${SCP_DEST}:/cm/shared/kairos/disk.raw.lz4
+fi
 
 # 2. HTTP server
 info "[2/7] HTTP server..."
@@ -163,11 +212,11 @@ EOF
 
 # 4. Install dd script + service into the software image
 info "[4/7] Installing dd service into kairos-installer image..."
-# Ensure lz4 is available in the image
-${SSH_CMD} "which lz4 >/dev/null 2>&1 || { echo 'nameserver {{ bcm_external_dns }}' > /etc/resolv.conf; DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq lz4 >/dev/null 2>&1; }"
-${SSH_CMD} "which lz4 >/dev/null 2>&1" || { err "lz4 not available on BCM host"; exit 1; }
+# Ensure lz4 is available on BCM (use whatever DNS BCM already has; don't clobber /etc/resolv.conf)
+${SSH_CMD} "which lz4 >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq lz4 >/dev/null 2>&1; }"
+${SSH_CMD} "which lz4 >/dev/null 2>&1" || { err "lz4 not available on BCM host — install manually and re-run"; exit 1; }
 ${SSH_CMD} "cp \$(which lz4) /cm/images/kairos-installer/usr/local/bin/lz4 && chmod +x /cm/images/kairos-installer/usr/local/bin/lz4"
-${SCP_CMD} "${BUILD_DIR}/install-kairos.sh" root@${BCM_HOST}:/cm/images/kairos-installer/usr/local/sbin/install-kairos.sh
+${SCP_CMD} "${BUILD_DIR}/install-kairos.sh" ${SCP_DEST}:/cm/images/kairos-installer/usr/local/sbin/install-kairos.sh
 ${SSH_CMD} "chmod +x /cm/images/kairos-installer/usr/local/sbin/install-kairos.sh"
 
 # Ensure DHCP is configured for all possible NIC names
@@ -223,8 +272,10 @@ if [ -n "$ACTUAL_KERNEL" ]; then
     cmsh -c "softwareimage; use kairos-installer; set kernelversion ${ACTUAL_KERNEL}; commit" 2>&1 || true
 fi
 
-# Create kairos category
-cmsh -c "category; list" 2>/dev/null | grep -q kairos || cmsh -c "category; clone default kairos; commit" 2>/dev/null
+# Create kairos category (clone from configured source — "default" on fresh BCM,
+# a site-specific category like "S-AI Partner Lab" on an existing deployment)
+cmsh -c "category; list" 2>/dev/null | grep -q '^kairos\b' \
+  || cmsh -c "category; clone \"{{ bcm_source_category | default('default') }}\" kairos; commit" 2>&1 || true
 
 # Configure category
 cmsh -c "category; use kairos; set softwareimage kairos-installer; commit" 2>&1 || true
@@ -232,23 +283,48 @@ cmsh -c "category; use kairos; set installmode FULL; commit" 2>&1 || true
 cmsh -c "category; use kairos; set newnodeinstallmode FULL; commit" 2>&1 || true
 cmsh -c "category; use kairos; set installbootrecord yes; commit" 2>&1 || true
 echo -e 'category\nuse kairos\nset kernelparameters "console=ttyS0,115200n8 net.ifnames=0 biosdevname=0"\ncommit' | cmsh 2>&1 || true
-# Note: BCM 11.0 removed healthconf — monitoring is per-data-producer.
-# Kairos nodes will report empty data for irrelevant metrics, which is harmless.
+
+# Strip fsmounts that don't apply to Kairos (immutable OS uses COS_PERSISTENT bind-mounts
+# for /home, doesn't mount /cm/shared). Leaving these causes permanent "health check failed"
+# alerts on the node with no functional impact.
+for mp in /cm/shared /home; do
+    if cmsh -c "category; use kairos; fsmounts; list" 2>/dev/null | grep -q " ${mp} "; then
+        echo -e "category\nuse kairos\nfsmounts\nremove ${mp}\ncommit" | cmsh 2>&1 || true
+    fi
+done
+
+# Disable the ntp monitoring measurable — Kairos uses systemd-timesyncd, not chronyd/ntpd,
+# so BCM's ntp check always flags it even when time is correctly synced.
+echo -e 'monitoring setup\nuse NtpOffset\nset disabled yes\ncommit' | cmsh 2>&1 || true
+echo -e 'monitoring setup\nuse Ntp\nset disabled yes\ncommit' | cmsh 2>&1 || true
+
+{% if bcm_manage_cluster_defaults | default(false) %}
+# Cluster-wide defaults — only touch on fresh BCMs where we own the whole cluster
 cmsh -c "partition; use base; set defaultcategory kairos; commit" 2>&1 || true
 cmsh -c "partition; use base; set nodebasename node; set nodedigits 3; commit" 2>&1 || true
+{% endif %}
 
 EOF
 
-# Register node with explicit IP to avoid BCM auto-assigning gateway
+{% if bcm_target_node is defined and bcm_target_node | length > 0 %}
+# Target an existing BCM device — move into kairos category, FULL installmode.
+# Also set softwareimage explicitly at the device level, because device-level
+# overrides (common on existing BCMs) beat the category value.
+${SSH_CMD} "echo -e 'device\nuse \"{{ bcm_target_node }}\"\nset category kairos\nset softwareimage kairos-installer\nset installmode FULL\ncommit' | cmsh 2>&1" 2>/dev/null | filter_motd
+TARGET_NODE_NAME="{{ bcm_target_node }}"
+{% else %}
+# Fresh BCM — register node001 with explicit IP to avoid BCM auto-assigning gateway
 COMPUTE_NODE_IP="{{ bcm_internal_ip.rsplit('.', 1)[0] }}.10"
 ${SSH_CMD} "echo -e 'device\nremove node001\ncommit' | cmsh 2>/dev/null; \
     echo -e 'device\nadd physicalnode node001 ${COMPUTE_NODE_IP} eth0\nset category kairos\nset mac ${COMPUTE_MAC}\ncommit' | cmsh 2>&1" 2>/dev/null | filter_motd
+TARGET_NODE_NAME="node001"
+{% endif %}
 
-${SSH_CMD} << 'EOF' | filter_motd
-VERIFY_IMG=$(cmsh -c "category; use kairos; get softwareimage" 2>/dev/null)
-echo "$VERIFY_IMG" | grep -q "kairos-installer" || { echo "[FAIL] softwareimage is not kairos-installer"; exit 1; }
+${SSH_CMD} bash -s << EOF | filter_motd
+VERIFY_IMG=\$(cmsh -c "category; use kairos; get softwareimage" 2>/dev/null)
+echo "\$VERIFY_IMG" | grep -q "kairos-installer" || { echo "[FAIL] softwareimage is not kairos-installer"; exit 1; }
 echo "[OK] Category configured: FULL install, kairos-installer image"
-echo "[OK] node001: MAC=${COMPUTE_MAC}, category=kairos"
+echo "[OK] Target node: ${TARGET_NODE_NAME}, category=kairos"
 EOF
 
 # 7. Regenerate ramdisk

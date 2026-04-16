@@ -6,7 +6,27 @@ stylus:
   site:
     paletteEndpoint: {{ palette_endpoint }}
     edgeHostToken: {{ palette_token }}
+{% if palette_project_name is defined %}
+    projectName: {{ palette_project_name }}
+{% elif palette_project_uid is defined %}
     projectUid: {{ palette_project_uid }}
+{% endif %}
+{% if palette_ca_cert is defined and palette_ca_cert | length > 0 %}
+    caCerts:
+    - |
+{{ palette_ca_cert | indent(8, first=true) }}
+{% endif %}
+    tags:
+      palette.ai: "true"
+      palette.ai/control-plane: "true"
+{% if palette_installation_mode is defined %}
+  installationMode: {{ palette_installation_mode }}
+{% endif %}
+{% if palette_management_mode is defined %}
+  managementMode: {{ palette_management_mode }}
+{% endif %}
+  vip:
+    skip: true
 users:
   - name: kairos
     shell: /bin/bash
