@@ -1,19 +1,27 @@
 # --- BCM Head Node ---
-bcm_password: <redacted>
+bcm_password: "rog8thriller3surge2risks"
 bcm_hostname: "bcm11-headnode"
 bcm_timezone: "America/Los_Angeles"
 
-# BCM networking (internal socket network)
-bcm_internal_ip: "10.141.255.254"
-bcm_internal_netmask: "16"
-bcm_internal_cidr: "10.141.0.0/16"
+# BCM networking (internal provisioning network as seen from compute nodes)
+bcm_internal_ip: "192.168.98.2"
+bcm_internal_netmask: "24"
+bcm_internal_cidr: "192.168.98.0/24"   # fallback only — deploy-dd discovers this from BCM at runtime
 
-# BCM external (QEMU user-mode NAT)
-bcm_external_gateway: "10.0.2.2"
-bcm_external_dns: "10.0.2.3"
+# BCM external gateway + DNS.
+# bcm_manage_dns: when true, deploy-dd rewrites BCM's cmsh "nameservers" to bcm_external_dns.
+# Leave false on existing BCMs with working site DNS.
+bcm_manage_dns: false
+bcm_external_gateway: "192.168.98.1"
+bcm_external_dns: "1.1.1.1"
 
-# SSH port forwarding (host -> BCM)
-bcm_ssh_port: 10022
+# SSH transport to BCM.
+# Local-VM mode: bcm_ssh_host=localhost, bcm_ssh_port=10022, proxy vars empty.
+# Remote mode:   bcm_ssh_host=<bcm_ip>, bcm_ssh_port=22, proxy vars set.
+bcm_ssh_host: "192.168.98.2"
+bcm_ssh_port: 22
+bcm_ssh_proxy_jump: "partner@100.90.255.42"
+bcm_ssh_proxy_key: "~/.ssh/sai"
 bcm_https_port: 10443
 
 # BCM VM resources
@@ -21,16 +29,64 @@ bcm_vm_ram: 8192
 bcm_vm_cpus: 4
 bcm_vm_disk_size: "100G"
 
-# --- Kairos Compute Node VM ---
+# --- Target compute node (existing BCM device) ---
+# For local-KVM deploys: leave defaults (bcm_target_node unset → falls back to node001 flow).
+# For remote deploys: set bcm_target_node to an existing cmsh device name.
+bcm_source_category: "S-AI Partner Lab"
+bcm_manage_cluster_defaults: false
+bcm_target_node: "edge-4c4c454400485610804bc3c04f4e4434"
+
+# Kairos install target (on the compute node)
+kairos_target_disk: "/dev/nvme0n1"
+kairos_wipe_disks: "nvme1n1 nvme2n1 nvme3n1 nvme4n1"
+
+# --- Kairos Compute Node VM (local-KVM mode only) ---
 kairos_vm_mac: "52:54:00:00:02:01"
 kairos_vm_ram: 4096
 kairos_vm_cpus: 2
 kairos_vm_disk_size: "80G"
 
-# --- Palette ---
-palette_endpoint: "api.spectrocloud.com"
-palette_token: <redacted>
-palette_project_uid: <redacted>
+# --- Palette (S-AI on-prem instance) ---
+palette_endpoint: "s-ai.lan"
+palette_token: "MTUxYjAxZTY5YTNmN2Q2ODdkMmVkOGY4ODgzMzQyZjI="
+palette_project_name: "Default"
+palette_installation_mode: "connected"
+palette_management_mode: "central"
+# Self-signed CA that signs the palette endpoint's cert. Required for s-ai.lan.
+palette_ca_cert: |
+  -----BEGIN CERTIFICATE-----
+  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
+  -----END CERTIFICATE-----
 
 # --- JFrog (BCM ISO download) ---
 jfrog_token: <redacted>

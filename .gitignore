@@ -1,0 +1,57 @@
+# --- Generated artifacts ---
+build/
+dist/
+logs/
+
+# --- Cloned third-party ---
+CanvOS/
+
+# --- Big binary images (anywhere) ---
+*.iso
+*.raw
+*.raw.lz4
+*.qcow2
+*.img
+
+# --- Logs + runtime state ---
+*.log
+*.pid
+*.sock
+*.retry
+
+# --- OVMF/UEFI variables ---
+ovmf-vars.fd
+*.fd
+
+# --- SSH keys generated during runs ---
+bcm-kairos-key
+bcm-kairos-key.pub
+.bcm-ssh-config
+
+# --- Ansible bits ---
+*.retry
+.ansible/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- Claude ---
+.claude/
+CLAUDE.md
+
+# --- Checksums ---
+*.sha256
+
+# --- Secrets ---
+inventory/group_vars/all.yml
+
