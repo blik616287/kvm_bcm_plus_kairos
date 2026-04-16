@@ -4,9 +4,14 @@ LOG="/dev/shm/kairos-install.log"
 exec > >(tee -a "$LOG") 2>&1
 HEAD_IP="{{ bcm_internal_ip }}"
 RAW_URL="http://${HEAD_IP}:8888/disk.raw.lz4"
+{% if kairos_target_disk is defined and kairos_target_disk | length > 0 %}
+DISK="{{ kairos_target_disk }}"
+{% else %}
 DISK=$(lsblk -ndo NAME,TYPE | awk '$2=="disk" && $1!~/^fd[0-9]/{print "/dev/"$1; exit}')
+{% endif %}
+WIPE_DISKS="{{ kairos_wipe_disks | default('') }}"
 echo "[$(date)] Kairos Raw Image Installer"
-echo "[$(date)] URL: ${RAW_URL}  Target: ${DISK:-NOT FOUND}"
+echo "[$(date)] URL: ${RAW_URL}  Target: ${DISK:-NOT FOUND}  Wipe: ${WIPE_DISKS:-<none>}"
 [[ -z "$DISK" || ! -b "$DISK" ]] && { echo "ERROR: No disk"; exit 1; }
 RETRIES=0
 while ! curl --fail --silent --head "$RAW_URL" >/dev/null 2>&1; do
@@ -15,7 +20,7 @@ done
 echo "[$(date)] Staging binaries to RAM..."
 RAMDIR="/dev/shm/kinstall"
 mkdir -p "$RAMDIR/lib"
-for bin in bash curl lz4 dd sync sleep sgdisk; do
+for bin in bash curl lz4 dd sync sleep sgdisk wipefs dmsetup efibootmgr partprobe blkid; do
     BIN_PATH=$(which "$bin" 2>/dev/null) && cp "$BIN_PATH" "$RAMDIR/" || true
 done
 for b in "$RAMDIR"/*; do
@@ -31,11 +36,42 @@ echo 1 > /proc/sys/kernel/sysrq
 cat > "$RAMDIR/run-dd.sh" << DDEOF
 #!/dev/shm/kinstall/bash
 export LD_LIBRARY_PATH="/dev/shm/kinstall/lib"
+# Wipe signatures on sibling disks so stale LVM/DRBD/filesystems don't auto-activate on first Kairos boot.
+if [ -n "${WIPE_DISKS}" ]; then
+    for d in ${WIPE_DISKS}; do
+        if [ -b "/dev/\$d" ]; then
+            echo "[\$(date)] wipefs /dev/\$d"
+            /dev/shm/kinstall/dmsetup remove_all 2>/dev/null || true
+            /dev/shm/kinstall/wipefs -a -f "/dev/\$d" 2>&1 || true
+        fi
+    done
+fi
 echo "[\$(date)] Writing to ${DISK}..."
 /dev/shm/kinstall/curl --fail -s "${RAW_URL}" | /dev/shm/kinstall/lz4 -d - - | /dev/shm/kinstall/dd of="${DISK}" bs=4M oflag=direct 2>&1
 /dev/shm/kinstall/sync
 echo "[\$(date)] Fixing GPT backup header..."
 /dev/shm/kinstall/sgdisk -e ${DISK} 2>&1 || true
+/dev/shm/kinstall/partprobe ${DISK} 2>&1 || true
+# Create a UEFI boot entry pointing at our new ESP (partition 1 of the target disk).
+# Without this, physical UEFI firmwares keep booting stale BootXXXX entries tied to the
+# previous install's GPT UUIDs and never discover our freshly-dd'd Kairos bootloader.
+if [ -d /sys/firmware/efi/efivars ] && [ -x /dev/shm/kinstall/efibootmgr ]; then
+    echo "[\$(date)] Creating UEFI boot entry for Kairos..."
+    # Remove any existing 'Kairos' entries so we don't stack duplicates on re-installs.
+    for n in \$(/dev/shm/kinstall/efibootmgr 2>/dev/null | grep 'Kairos\$' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//'); do
+        /dev/shm/kinstall/efibootmgr -b "\$n" -B 2>/dev/null || true
+    done
+    /dev/shm/kinstall/efibootmgr --create --disk ${DISK} --part 1 --label Kairos --loader '\EFI\BOOT\bootx64.efi' 2>&1 || true
+    # Put the new entry at the front of BootOrder.
+    NEWID=\$(/dev/shm/kinstall/efibootmgr 2>/dev/null | grep 'Kairos\$' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//' | head -1)
+    if [ -n "\$NEWID" ]; then
+        CURORDER=\$(/dev/shm/kinstall/efibootmgr 2>/dev/null | awk '/^BootOrder:/ {print \$2}')
+        NEWORDER=\$(echo "\$CURORDER" | tr ',' '\n' | grep -v "^\${NEWID}\$" | paste -sd, -)
+        /dev/shm/kinstall/efibootmgr -o "\${NEWID},\${NEWORDER}" 2>&1 || true
+    fi
+else
+    echo "[\$(date)] efivars or efibootmgr unavailable; skipping EFI entry creation"
+fi
 echo "[\$(date)] Dropping page cache to prevent stale writeback..."
 echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 /dev/shm/kinstall/sync
