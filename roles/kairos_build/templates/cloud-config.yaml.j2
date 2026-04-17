@@ -5,7 +5,9 @@ install:
 stylus:
   site:
     paletteEndpoint: {{ palette_endpoint }}
+{% if palette_token is defined and palette_token | length > 0 %}
     edgeHostToken: {{ palette_token }}
+{% endif %}
 {% if palette_project_name is defined %}
     projectName: {{ palette_project_name }}
 {% elif palette_project_uid is defined %}
@@ -34,6 +36,19 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: false
 stages:
+  initramfs:
+{% if palette_api_key is defined and palette_api_key | length > 0 and palette_project_uid is defined and palette_project_uid | length > 0 %}
+    - name: "Write Palette admin creds for pre-registration cleanup"
+      files:
+        - path: /oem/palette-admin.env
+          content: |
+            APIKEY={{ palette_api_key }}
+            PROJECTUID={{ palette_project_uid }}
+            ENDPOINT={{ palette_endpoint }}
+          permissions: 0600
+          owner: 0
+          group: 0
+{% endif %}
   boot:
     - name: "Set kairos user password"
       users:
