@@ -1,86 +1,129 @@
-# BCM + Kairos KVM Deployment
+# BCM + Kairos Deployment
 
-Automated end-to-end pipeline that deploys a BCM 11.0 head node and Kairos edge compute nodes in local KVM virtual machines, culminating in Palette registration.
+Automated end-to-end pipeline that provisions **Spectro Cloud Kairos edge nodes** through an existing **Bright Cluster Manager (BCM) 11.0** head node. Supports two deployment modes from the same repo:
+
+1. **Remote BCM** — deploy Kairos to bare-metal compute nodes managed by an already-running BCM head node, optionally reached through an SSH jumphost. This is the primary mode for customer sites.
+2. **Local KVM** — stand up a full BCM head node + Kairos compute node entirely in QEMU VMs for development / demo / regression testing.
+
+End state in both cases: compute nodes PXE boot from BCM, `dd` a pre-built Kairos raw disk onto their OS disk, reboot into Kairos under UEFI, and register with Palette.
 
 ## Architecture
 
 ```
-Host Machine (QEMU/KVM)
-  |
-  |-- BCM Head Node VM
-  |     eth0: internal provisioning (socket :31337) -- 10.141.255.254/16
-  |     eth1: external NAT (QEMU user-mode)         -- 10.0.2.15 (auto)
-  |     SSH:  localhost:10022 -> VM:22
-  |
-  |-- Kairos Compute Node VM
-        eth0: internal provisioning (socket :31337) -- DHCP from BCM
-        PXE boot from BCM -> installer -> dd -> Kairos
+                       ┌──────────────────┐
+                       │  Build Host      │
+                       │  (this repo)     │
+                       └────────┬─────────┘
+                                │ ansible + ssh (optional jumphost)
+                                ▼
+┌───────────────────────────────────────────────────────────────┐
+│ BCM head node (remote metal OR local KVM VM)                  │
+│   • cmd, dhcpd, named, nfs-server, rsyncd                     │
+│   • HTTP server on :8888 serving /cm/shared/kairos/disk.raw.lz4│
+│   • software image:   kairos-installer  (dd + efibootmgr)     │
+│   • category:         kairos            (FULL install mode)   │
+│   • nodeexecutionfilters: Exclude mounts/interfaces/ntp       │
+│                            scoped to category=kairos          │
+└──────────────────────────────┬────────────────────────────────┘
+                               │ PXE + rsync + HTTP (provisioning net)
+                               ▼
+                     ┌─────────────────────┐
+                     │  Compute node       │
+                     │  (bare metal or VM) │
+                     │   UEFI → Kairos     │
+                     │   stylus-agent →    │
+                     │   Palette           │
+                     └─────────────────────┘
 ```
 
-Two separate QEMU networks eliminate ARP conflicts and policy routing hacks:
-- **Internal**: Socket-based L2 bridge (`:31337`) for BCM provisioning and PXE boot
-- **External**: QEMU user-mode NAT with port forwarding for internet access
+- **Provisioning network**: flat L2 where BCM runs DHCP/PXE/TFTP/NFS/HTTP and the compute nodes live. On remote sites this is the customer's existing BCM internal VLAN; locally it's a QEMU socket bridge.
+- **Palette**: reached from the compute node once it's booted Kairos. Can be public SaaS or on-prem (self-signed CA supported via `palette_ca_cert`).
 
 ## Prerequisites
 
-- QEMU/KVM (`qemu-system-x86_64`, `/dev/kvm`)
-- Docker (for CanvOS/Earthly ISO build)
 - Ansible
-- `sshpass`, `xorriso`, `p7zip`, `lz4`, `jq`, `mtools`, `dosfstools`
+- `sshpass`, `jq` (always)
+- `qemu-system-x86_64` + `/dev/kvm`, Docker, `xorriso`, `p7zip`, `lz4`, `mtools`, `dosfstools`, OVMF (UEFI) firmware — required for the **kairos-build** stage (CanvOS + Earthly + UEFI raw-image generator). Also required for all stages when running in **local KVM** mode.
 
 ```bash
-make install-deps   # auto-install all dependencies (Debian/Fedora)
+make install-deps   # auto-install on Debian/Fedora/Ubuntu
+make setup          # verify prerequisites
 ```
 
-## Quick Start
+## Quick Start — Remote BCM
 
 ```bash
-# 1. Configure
-cp inventory/group_vars/all.example inventory/group_vars/all
-# Edit: set jfrog_token, palette_token, palette_project_uid
+# 1. Discover an existing BCM (prompts for IP, user/pass, optional jumphost)
+make discover
+#    → writes bcm-discovery-<bcm-hostname>.yml with suggested group_vars
 
-# 2. Verify prerequisites
-make setup
+# 2. Copy the example and fill in values from the discovery output
+cp inventory/group_vars/all.example.yml inventory/group_vars/all.yml
+$EDITOR inventory/group_vars/all.yml
+#    → bcm_ssh_host, bcm_ssh_proxy_jump/key, bcm_target_node,
+#      bcm_source_category, kairos_target_disk, palette_*
 
-# 3. Run full pipeline
-make all
+# 3. Build the Kairos raw image once (runs locally, ~30 min)
+make kairos-build
+
+# 4. Push to BCM + configure PXE + kairos category
+make deploy-dd
+
+# 5. Power-cycle the target node to PXE boot (via iDRAC / IPMI / Redfish).
+#    BCM's installer writes Kairos via dd + efibootmgr, then powers off.
+#    Power on again — node boots Kairos from its own disk.
+
+# 6. Validate
+make validate
+```
+
+`inventory/group_vars/all.yml` is gitignored. `inventory/group_vars/all.example.yml` is the committable template and documents every variable.
+
+## Quick Start — Local KVM (dev / demo)
+
+```bash
+cp inventory/group_vars/all.example.yml inventory/group_vars/all.yml
+# Uncomment the local-KVM section; set jfrog_token, palette_api_key, etc.
+
+make all   # runs the full 6-stage pipeline (~100-120 min)
 ```
 
 ## Pipeline Stages
 
 | Stage | Target | Duration | Description |
 |-------|--------|----------|-------------|
-| 1 | `make bcm-prepare` | ~2 min | Download BCM ISO from JFrog, patch rootfs, remaster for auto-install |
-| 2 | `make bcm-vm` | ~60-90 min | Launch BCM in KVM, auto-install, boot from disk, wait for services |
-| 3 | `make kairos-build` | ~10 min | Clone CanvOS, build Kairos ISO via Earthly, generate raw disk image |
-| 4 | `make deploy-dd` | ~3 min | Upload lz4-compressed image to BCM, configure PXE + installer |
-| 5 | `make kairos-vm` | ~10 min | PXE boot compute VM, dd Kairos to disk, boot into Kairos |
-| 6 | `make validate` | ~15 sec | 39-point validation across BCM and Kairos |
+| 1 | `make bcm-prepare` | ~2 min | Download BCM ISO from JFrog, patch rootfs, remaster for auto-install *(local-KVM only)* |
+| 2 | `make bcm-vm` | ~60–90 min | Launch BCM in KVM, auto-install, boot from disk, wait for services *(local-KVM only)* |
+| 3 | `make kairos-build` | ~30 min | Clone CanvOS, build Kairos ISO via Earthly, generate **UEFI** raw disk image under OVMF |
+| 4 | `make deploy-dd` | ~3–5 min | SSH to BCM (direct or via jumphost), upload lz4 image, install `kairos-installer`, configure `kairos` category + nodeexecutionfilters |
+| 5 | `make kairos-vm` | ~10 min | PXE boot compute VM, dd Kairos to disk, reboot into Kairos *(local-KVM only)* |
+| 6 | `make validate` | ~15 sec | 41-point validation across BCM and Kairos (works for remote BCM + remote compute node through jumphost) |
 
 ```
-bcm-prepare ──> bcm-vm ──> deploy-dd ──> kairos-vm ──> validate
-                              ^
-kairos-build ─────────────────┘
+                   ┌──> bcm-prepare ──> bcm-vm ─┐            (local-KVM only)
+Remote-BCM deploy ─┤                            ├─> deploy-dd ──> validate
+                   └──> kairos-build ───────────┘              (kairos-vm only in local-KVM mode)
 ```
 
-Stages 2 and 3 can run in parallel (BCM install + Kairos build).
+Stages **bcm-vm** and **kairos-build** can run in parallel.
 
 ## Make Targets
 
 ```bash
 # Pipeline
-make bcm-prepare        # Stage 1: Download + patch + remaster BCM ISO
-make bcm-vm             # Stage 2: Launch BCM in local KVM
-make kairos-build       # Stage 3: Build Kairos ISO + raw disk image
-make deploy-dd          # Stage 4: Upload image to BCM, configure PXE
-make kairos-vm          # Stage 5: PXE boot Kairos compute VM
-make validate           # Stage 6: Validation
-make all                # Run full pipeline (stages 1-6)
+make bcm-prepare        # Stage 1 — local-KVM only
+make bcm-vm             # Stage 2 — local-KVM only
+make kairos-build       # Stage 3 — builds Kairos raw image via CanvOS + OVMF
+make deploy-dd          # Stage 4 — push to BCM, configure PXE + kairos category
+make kairos-vm          # Stage 5 — local-KVM only (PXE boots a local compute VM)
+make validate           # Stage 6 — 41-point health check
+make all                # Stages 1–6 (local-KVM mode)
 
 # Discovery
-make discover           # Discover existing BCM head node config (interactive)
+make discover           # Interactive: prompts for BCM IP/user/pass + optional jumphost,
+                        # emits bcm-discovery-<hostname>.yml with suggested group_vars
 
-# VM Management
+# VM management (local-KVM mode)
 make bcm-stop           # Stop BCM VM
 make kairos-stop        # Stop Kairos compute VM
 make stop               # Stop all VMs
@@ -88,108 +131,132 @@ make bcm-serial         # Tail BCM serial log
 make kairos-serial      # Tail Kairos serial log
 
 # Cleanup
-make clean              # Remove build/, logs/ (keeps dist/ and CanvOS/)
-make clean-dist         # Remove downloaded ISOs (dist/)
+make clean              # Remove build/, logs/
+make clean-dist         # Remove downloaded ISOs
 make clean-canvos       # Remove cloned CanvOS repo
 make clean-all          # Stop VMs + remove everything
-make teardown           # Stop VMs + remove build artifacts (keeps dist/ and CanvOS/)
+make teardown           # Stop VMs + remove build artifacts
 
 # Dependencies
 make setup              # Verify prerequisites
-make install-deps       # Install all build dependencies
+make install-deps       # Install build dependencies
 ```
 
 ## Configuration
 
-Copy `inventory/group_vars/all.example` to `inventory/group_vars/all` and set:
+Single source of truth: `inventory/group_vars/all.yml` (copied from `all.example.yml`). Key variables:
+
+### Connection to BCM
 
 | Variable | Description |
 |----------|-------------|
-| `bcm_password` | BCM root password |
-| `jfrog_token` | JFrog bearer token for BCM ISO download |
-| `palette_token` | Palette registration token (base64) |
-| `palette_project_uid` | Palette project UID |
-| `bcm_internal_ip` | BCM internal IP (default: `10.141.255.254`) |
-| `bcm_vm_ram` / `bcm_vm_cpus` | BCM VM resources (default: 8192 MB / 4 CPUs) |
-| `kairos_vm_ram` / `kairos_vm_cpus` | Compute VM resources (default: 4096 MB / 2 CPUs) |
+| `bcm_ssh_host` / `bcm_ssh_port` | BCM's SSH endpoint |
+| `bcm_password` | Root SSH password |
+| `bcm_ssh_proxy_jump` | `user@host` form for a jumphost (blank = direct). Applied via OpenSSH `ProxyCommand` to every SSH/SCP invocation |
+| `bcm_ssh_proxy_key` | Path to the jumphost key (`~` expanded at render time) |
+| `bcm_internal_ip` / `bcm_internal_cidr` | BCM's IP on the provisioning network (baked into the installer's HTTP URL and NFS exports) |
+| `bcm_manage_dns` | **Default `false`** on remote BCM — don't rewrite the site's cluster DNS. Set `true` only when you own the whole BCM |
+| `bcm_manage_cluster_defaults` | **Default `false`** — don't flip `defaultcategory` / `nodebasename` cluster-wide on a customer's BCM |
 
-## Deploying to an Existing BCM Head Node
+### Target compute node
 
-If you already have a BCM head node running (not a local KVM VM), you can skip stages 1-2 and deploy Kairos directly. Use `make discover` to auto-detect the configuration:
+| Variable | Description |
+|----------|-------------|
+| `bcm_target_node` | Existing cmsh device name to move into the `kairos` category (e.g. `edge-4c4c454400485610804bc3c04f4e4434`) |
+| `bcm_source_category` | Existing BCM category to clone when creating `kairos` (carries over disksetup, mon templates, etc.) |
+| `kairos_target_disk` | Disk device on the node to `dd` onto (e.g. `/dev/nvme0n1` or `/dev/sda`). Pinned — not auto-detected |
+| `kairos_wipe_disks` | Space-separated list of sibling disks to `wipefs -a -f` before `dd` (cleans LVM/DRBD residue from previous installs) |
 
-```bash
-make discover
+### Palette
+
+| Variable | Description |
+|----------|-------------|
+| `palette_endpoint` | Palette API hostname (SaaS or on-prem) |
+| `palette_project_name` / `palette_project_uid` | Project identity |
+| `palette_api_key` | Admin API key with `edgeToken.create` + `edgehost.delete` permissions. Used by the on-node pre-registration hook |
+| `palette_ca_cert` | PEM block for a private CA signing the Palette endpoint (optional) |
+| `palette_installation_mode` | `connected` or `airgap` |
+| `palette_management_mode` | `central` or `local` |
+| `palette_token` | **Optional.** Pre-minted edge-host registration token. If omitted, the node mints one on first boot using `palette_api_key` |
+
+See `inventory/group_vars/all.example.yml` for the complete list with inline commentary.
+
+## Documentation
+
+- `docs/POC_Client_Deployment.md` — client-facing POC deployment document (also rendered to `docs/POC_Client_Deployment.pdf`)
+- `docs/pipeline-deep-dive.md` — engineer-level walkthrough of every stage, including the exact commands each role issues and why
+
+## Key Design Points
+
+### Additive, reversible changes to BCM
+
+`deploy-dd` **never** flips cluster-wide BCM settings on a customer's head node. The `kairos` category is cloned from `bcm_source_category` (inheriting disksetup and mon templates); only the target device from `bcm_target_node` is moved into it. Existing categories, nodes, and cluster defaults are untouched. Move the device back to its original category and it reverts to standard HPC provisioning on next PXE boot.
+
+### UEFI raw image + post-`dd` boot entry
+
+The Kairos raw image is built under **OVMF firmware** (not SeaBIOS), producing a real EFI System Partition with `\EFI\BOOT\bootx64.efi`. `install-kairos.sh` runs `efibootmgr --create --disk $DISK --part 1 --label Kairos --loader '\EFI\BOOT\bootx64.efi'` after `dd` so UEFI firmware boots the freshly-written disk on next power-up — no manual OneTimeBoot dance required.
+
+### Idempotent re-deploys
+
+Palette won't re-register an edge host with a UID that's already on file. The image ships with `/usr/bin/palette-cleanup-stale.sh`, hooked via `systemd ExecStartPre` before `stylus-agent`:
+
+1. Gates on registration mode (no-op if the node is already registered).
+2. Queries Palette admin API with `palette_api_key`, deletes any stale record matching this node's SMBIOS-UUID-derived UID, freeing the UID.
+3. Auto-mints a fresh `edgeHostToken` via `POST /v1/edgehosts/tokens` if one wasn't baked in.
+4. Fail-open — never blocks stylus-agent startup.
+
+This makes reimaging a previously-provisioned node a one-command operation (`make deploy-dd` + power-cycle).
+
+### Category-scoped health-check suppression
+
+BCM's `mounts`, `interfaces`, and `ntp` measurables flag Kairos's immutable-OS architecture as health failures (read-only root, no `/etc/fstab` in the expected form, no `ntp.conf`). `deploy-dd` installs `nodeexecutionfilters` with `Exclude + category=kairos` for those three measurables so the `kairos` category reports clean `[ UP ]` in cmsh without affecting any other category.
+
+### Other details
+
+- **lz4** compression (not gzip) — faster decompression than the dd write
+- **`oflag=direct`** — bypasses page cache, prevents thin-pool overflow on LVM-backed disks
+- **sysrq poweroff from RAM** — binaries staged to `/dev/shm/kinstall/` before `dd` overwrites the running rootfs
+- **`sgdisk -e` + `partprobe`** — fixes the GPT backup header after `dd` onto a differently-sized disk, then re-reads the partition table
+- **Squashfs patching** — `net.ifnames=0 biosdevname=0` + `ifcfg-eth0` injected into active/passive/recovery images for BCM compatibility
+- **Jumphost-aware tooling** — `deploy-dd`, `validate`, and `discover` all build a per-run SSH config file with a `ProxyCommand` line when `bcm_ssh_proxy_jump` is set
+
+## File Layout
+
 ```
-
-This prompts for the BCM IP, SSH port, user, and password, then SSHs in and discovers:
-
-- Network configuration (internal/external IPs, CIDR, gateway, DNS)
-- Service status (cmd, dhcpd, named, nfs-server)
-- Cluster state (categories, registered nodes)
-- Default image kernel version
-- Available disk space on `/cm/shared`
-
-It outputs recommended `group_vars/all` values and saves them to `bcm-discovery-<ip>.yml`. Review the output, copy the values into `inventory/group_vars/all`, then run:
-
-```bash
-make kairos-build    # Build the Kairos raw disk image (runs locally)
-make deploy-dd       # Upload image + configure PXE on your BCM head node
+kvm_bcm_plus_kairos/
+├── Makefile
+├── ansible.cfg
+├── inventory/
+│   ├── hosts.yml
+│   └── group_vars/
+│       ├── all.example.yml      # template — committed
+│       └── all.yml              # your values — gitignored
+├── playbooks/
+│   ├── 01-bcm-prepare.yml  …  06-validate.yml
+│   ├── discover-bcm.yml         # remote BCM discovery (supports jumphost)
+│   ├── site.yml                 # full pipeline
+│   ├── teardown.yml
+│   └── install-dependencies.yml
+├── roles/
+│   ├── bcm_prepare/             # ISO download, patch, remaster (local-KVM)
+│   ├── bcm_vm/                  # Two-phase KVM install + disk boot (local-KVM)
+│   ├── kairos_build/            # CanvOS ISO + OVMF raw disk
+│   ├── deploy_dd/               # Upload + configure BCM for PXE deploy
+│   ├── kairos_vm/               # PXE boot compute VM (local-KVM)
+│   ├── validate/                # 41-point health checks
+│   └── dependencies/
+├── files/canvos/                # CanvOS overlay
+│   └── overlay/files/usr/bin/palette-cleanup-stale.sh   # pre-registration hook
+├── docs/
+│   ├── POC_Client_Deployment.md   # client-facing POC doc
+│   ├── POC_Client_Deployment.pdf  # rendered via weasyprint
+│   └── pipeline-deep-dive.md      # engineer walkthrough
+├── build/   dist/   logs/       # generated artifacts — gitignored
+└── CanvOS/                      # cloned at build time — gitignored
 ```
-
-The `deploy-dd` stage SSHes to the BCM head node using `bcm_connect_ip` and `bcm_connect_port` from your group_vars, uploads the lz4-compressed image, and configures the installer. After that, any node that PXE boots from BCM with the `kairos` category will receive Kairos.
-
-## How It Works
-
-### BCM Install (Stage 2)
-
-Two-phase QEMU install:
-1. **Phase 1**: Direct kernel boot from extracted ISO rootfs with auto-install service injected. Runs `cm-master-install` unattended, patches GRUB for `net.ifnames=0`, powers off.
-2. **Phase 2**: Boots from installed disk. Waits for `cmfirstboot`, `cmd` service, and `cmsh` to become responsive.
-
-### Kairos Build (Stage 3)
-
-1. Clones [CanvOS](https://github.com/spectrocloud/CanvOS), patches Earthfile (adds `wget`, `ifupdown`, `nfs-common`, skips dracut nfit)
-2. Builds ISO via Earthly
-3. Generates 80GB raw disk image in headless QEMU (SeaBIOS for BIOS+EFI boot)
-4. Post-processing: fixes ext4 `metadata_csum` for GRUB, patches `net.ifnames=0` in all squashfs images, sets GRUB timeout, trims sparse zeros
-
-### Deploy (Stage 4)
-
-1. Compresses raw image with lz4, uploads to BCM via SCP
-2. Starts HTTP server on BCM (port 8888)
-3. Clones `default-image` to `kairos-installer` software image
-4. Installs dd service: `curl | lz4 -d | dd of=/dev/vda bs=4M oflag=direct`
-5. Configures PXE, kairos category (FULL install), node registration
-6. Generates ramdisk
-
-### PXE Boot (Stage 5)
-
-1. Compute VM PXE boots from BCM on internal network
-2. BCM rsyncs `kairos-installer` image to node
-3. `kairos-install.service` fires: downloads lz4 image via HTTP, stages binaries to RAM, dd's to disk with `oflag=direct`, fixes GPT backup header with `sgdisk -e`, drops page cache, powers off via sysrq
-4. Playbook restarts VM from disk — Kairos boots with COS partitions
-
-## Display
-
-VMs auto-detect display availability:
-- If X11/Wayland is available: GTK window with VM console
-- If headless (SSH session): no display, serial log only
-
-## Key Technical Details
-
-- **lz4** compression (not gzip) for faster decompression during dd
-- **`oflag=direct`** prevents page cache / thin pool overflow
-- **SeaBIOS** for raw image build makes it bootable on both BIOS and EFI
-- **sysrq poweroff from RAM** — binaries staged to `/dev/shm` before dd overwrites boot disk
-- **`sgdisk -e`** fixes GPT backup header after dd to smaller/larger disk
-- **Persistent NFS exports**, rsyncd, DHCP fixes applied to BCM
-- **IP forwarding + NAT** enabled so compute nodes route through BCM to internet
-- **Squashfs patching** — `net.ifnames=0 biosdevname=0` + `ifcfg-eth0` in all images (active, passive, recovery)
-- **BCM compat scripts** baked into Kairos image: hostname sync, resolv.conf fix, stylus-agent registration mode
 
 ## Logs
 
-Each stage logs to `logs/`:
 ```
 logs/01-bcm-prepare.log
 logs/02-bcm-vm.log
@@ -202,38 +269,15 @@ logs/kairos-serial.log
 logs/qemu-install.log
 ```
 
-## File Layout
-
-```
-kvm/
-├── ansible.cfg
-├── Makefile
-├── inventory/
-│   ├── hosts.yml
-│   └── group_vars/all.example
-├── playbooks/              # Numbered stages + utilities
-├── roles/
-│   ├── bcm_prepare/        # ISO download, patch, remaster
-│   ├── bcm_vm/             # Two-phase KVM install + disk boot
-│   ├── kairos_build/       # CanvOS ISO + raw disk via QEMU
-│   ├── deploy_dd/          # Upload + configure BCM for PXE deploy
-│   ├── kairos_vm/          # PXE boot compute node
-│   ├── validate/           # 39-point health checks
-│   └── dependencies/       # Package installer
-├── files/canvos/           # CanvOS overlay (BCM compat scripts)
-├── build/                  # Generated artifacts (gitignored)
-├── dist/                   # Downloaded ISOs (gitignored)
-└── logs/                   # Execution logs (gitignored)
-```
-
 ## Re-running Stages
 
 Stages are idempotent:
-- **bcm-prepare**: Skips ISO download and remaster if artifacts exist
-- **bcm-vm**: Skips Phase 1 if disk exists, restarts VM for Phase 2
-- **kairos-build**: Skips ISO build and raw image generation if artifacts exist
-- **deploy-dd**: Always re-runs (configures BCM fresh)
-- **kairos-vm**: Kills existing VM, resets node to FULL install mode, creates fresh disk
-- **validate**: Always re-runs
 
-To force a full rebuild: `make clean && make all`
+- **bcm-prepare** — skips ISO download and remaster if artifacts exist
+- **bcm-vm** — skips Phase 1 if disk exists, resumes from Phase 2
+- **kairos-build** — skips ISO build and raw image generation if artifacts exist
+- **deploy-dd** — always re-runs (reconfigures BCM; skips SCP if the remote image matches size); safe to re-run for every re-deploy
+- **kairos-vm** — kills existing VM, resets node to FULL install mode, creates fresh disk
+- **validate** — always re-runs
+
+Force a full rebuild with `make clean && make all` (local-KVM) or `make clean && make kairos-build deploy-dd` (remote BCM).
