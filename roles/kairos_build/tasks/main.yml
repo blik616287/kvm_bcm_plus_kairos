@@ -71,6 +71,7 @@
       loop:
         - "{{ canvos_dir }}/overlay/files/usr/bin/bcm-compat-fixes.sh"
         - "{{ canvos_dir }}/overlay/files/usr/bin/bcm-sync-userdata.sh"
+        - "{{ canvos_dir }}/overlay/files/usr/bin/palette-cleanup-stale.sh"
       failed_when: false
 
     - name: Patch Earthfile — add BCM packages
@@ -94,7 +95,8 @@
         block: |
           COPY overlay/files/usr/bin/bcm-compat-fixes.sh /usr/bin/bcm-compat-fixes.sh
           COPY overlay/files/usr/bin/bcm-sync-userdata.sh /usr/bin/bcm-sync-userdata.sh
-          RUN chmod +x /usr/bin/bcm-compat-fixes.sh /usr/bin/bcm-sync-userdata.sh
+          COPY overlay/files/usr/bin/palette-cleanup-stale.sh /usr/bin/palette-cleanup-stale.sh
+          RUN chmod +x /usr/bin/bcm-compat-fixes.sh /usr/bin/bcm-sync-userdata.sh /usr/bin/palette-cleanup-stale.sh
 
     - name: Run CanvOS build
       ansible.builtin.shell: |

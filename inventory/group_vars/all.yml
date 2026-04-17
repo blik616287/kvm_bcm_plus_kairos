@@ -52,6 +52,12 @@ palette_token: "MTUxYjAxZTY5YTNmN2Q2ODdkMmVkOGY4ODgzMzQyZjI="
 palette_project_name: "Default"
 palette_installation_mode: "connected"
 palette_management_mode: "central"
+# Admin API key + project UID for pre-registration stale-record cleanup on the node.
+# WARNING: baked into the on-disk image, readable by root on the node. If the project
+# is multi-tenant / shared, scope this key to the minimum permissions (edgehost.delete,
+# edgehost.get in the target project only).
+palette_api_key: "NjliZDcyZmFhN2UzZTVhZWRhNWQ2MjRlZGEyNjU4YjY="
+palette_project_uid: "69a81eb07122277de95c3b1f"
 # Self-signed CA that signs the palette endpoint's cert. Required for s-ai.lan.
 palette_ca_cert: |
   -----BEGIN CERTIFICATE-----
