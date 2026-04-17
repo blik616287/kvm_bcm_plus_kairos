@@ -54,4 +54,5 @@ CLAUDE.md
 
 # --- Secrets ---
 inventory/group_vars/all.yml
+bcm-discovery-*.yml
 
