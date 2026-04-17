@@ -1,0 +1,54 @@
+# BCM Discovery — bcm11-headnode
+# Reached: 192.168.98.2:22 via partner@100.90.255.42
+# Discovered: 2026-04-17T19:28:48Z
+#
+# Copy the values below into inventory/group_vars/all.yml
+# Review and adjust before running deploy-dd
+
+# ---- Discovered BCM Configuration ----
+# BCM: bcm11-headnode ()
+# Discovered: 2026-04-17T19:28:48Z
+
+# --- BCM Head Node ---
+bcm_password: "rog8thriller3surge2risks"
+bcm_hostname: "bcm11-headnode"
+
+# BCM provisioning network (from cmsh network;internalnet)
+bcm_internal_ip:      "192.168.98.2"
+bcm_internal_netmask: "24"
+bcm_internal_cidr:    "192.168.98.0/24"
+# (BCM presents the internal IP on interface: enp6s0)
+
+# BCM external routing
+bcm_external_gateway: "192.168.98.1"
+bcm_external_dns:     "192.168.98.5"
+# External iface: enp6s0  IP: 192.168.98.2
+
+# SSH transport (how we reached this BCM)
+bcm_ssh_host:        "192.168.98.2"
+bcm_ssh_port:        22
+bcm_ssh_proxy_jump:  "partner@100.90.255.42"
+bcm_ssh_proxy_key:   "~/.ssh/sai"
+
+# Safe defaults for a remote (existing) BCM
+bcm_manage_dns:              false
+bcm_manage_cluster_defaults: false
+
+# --- Kairos Build ---
+kairos_kernel_version: "6.8.0-51-generic"
+
+
+# --- Cluster state at discovery time ---
+# Services:
+#   cmd:        active
+#   dhcpd:      active
+#   named:      active
+#   nfs-server: active
+# Categories (2): S-AI Partner Lab, kairos
+# Images (6): default-image, dell-r6725-0-img1, kairos-installer, node001-custom-image, palette-image, ubuntu-2024.4
+# Nodes (4):
+#   bcm11-headnode | 00:16:3E:81:A1:53 | 192.168.98.2 |  | 
+#   edge-4c4c454400485610804bc3c04f4e4434 | E8:9E:49:CA:94:F8 | 192.168.98.10 | kairos | kairos-installer
+#   sai-dell-XE7745 | E8:9E:49:CA:9C:08 | 192.168.98.12 | S-AI Partner Lab | default-image (category:S-AI Partner Lab)
+#   sai-dell-r6725-0 | E8:9E:49:CB:4B:88 | 192.168.98.11 | S-AI Partner Lab | ubuntu-2024.4
+# /cm/shared free: 147G
