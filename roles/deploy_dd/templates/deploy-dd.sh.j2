@@ -293,10 +293,17 @@ for mp in /cm/shared /home; do
     fi
 done
 
-# Disable the ntp monitoring measurable — Kairos uses systemd-timesyncd, not chronyd/ntpd,
-# so BCM's ntp check always flags it even when time is correctly synced.
-echo -e 'monitoring setup\nuse NtpOffset\nset disabled yes\ncommit' | cmsh 2>&1 || true
-echo -e 'monitoring setup\nuse Ntp\nset disabled yes\ncommit' | cmsh 2>&1 || true
+# Exclude the `kairos` category from health checks that don't fit an immutable-OS
+# compute node (Kairos names its NIC eth0 not BOOTIF, uses local ext2 loop root not NFS,
+# and uses systemd-timesyncd not chronyd/ntpd). Uses BCM's documented `nodeexecutionfilters`
+# mechanism — category-scoped Exclude, idempotent (commit is a no-op if unchanged).
+for CHECK in mounts interfaces ntp; do
+    if ! cmsh -c "monitoring setup; use ${CHECK}; nodeexecutionfilters; list" 2>/dev/null \
+         | grep -q 'exclude-kairos'; then
+        echo -e "monitoring setup\nuse ${CHECK}\nnodeexecutionfilters\nadd category exclude-kairos\nset filteroperation Exclude\nset categories kairos\ncommit" \
+            | cmsh 2>&1 | tail -3 || true
+    fi
+done
 
 {% if bcm_manage_cluster_defaults | default(false) %}
 # Cluster-wide defaults — only touch on fresh BCMs where we own the whole cluster
