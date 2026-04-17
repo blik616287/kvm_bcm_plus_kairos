@@ -9,6 +9,7 @@
     kairos_disk: "{{ build_dir }}/kairos-compute.qcow2"
     kairos_serial_log: "{{ e2e_dir }}/logs/kairos-serial.log"
     kairos_pid_file: "{{ build_dir }}/.kairos-qemu.pid"
+    kairos_ovmf_vars: "{{ build_dir }}/ovmf-vars-kairos-vm.fd"
     ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
     bcm_ssh_cmd: "sshpass -p {{ bcm_password }} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p {{ bcm_ssh_port }} root@localhost"
 
@@ -47,24 +48,35 @@
     {{ bcm_ssh_cmd }} "echo -e 'device\nuse node001\nset installmode FULL\ncommit' | cmsh 2>&1"
   changed_when: true
 
-- name: Create fresh Kairos disk
+- name: Create fresh Kairos disk + OVMF vars
   ansible.builtin.shell: |
-    rm -f "{{ kairos_disk }}"
+    rm -f "{{ kairos_disk }}" "{{ kairos_ovmf_vars }}"
     qemu-img create -f qcow2 "{{ kairos_disk }}" {{ kairos_vm_disk_size }}
+    # Per-VM writable copy of OVMF UEFI vars — matches the OVMF firmware used by
+    # kairos_build. Shared between PXE-install and disk-boot phases so efibootmgr
+    # entries created during install persist into the post-install boot.
+    OVMF_VARS_SRC=/usr/share/OVMF/OVMF_VARS_4M.fd
+    [ -f "$OVMF_VARS_SRC" ] || OVMF_VARS_SRC=/usr/share/ovmf/OVMF.fd
+    cp -f "$OVMF_VARS_SRC" "{{ kairos_ovmf_vars }}"
 
 - name: Detect KVM acceleration
   ansible.builtin.shell: test -e /dev/kvm && echo "-enable-kvm" || echo ""
   register: kvm_flag
   changed_when: false
 
-- name: Launch Kairos compute VM (PXE boot)
+- name: Launch Kairos compute VM (PXE boot, OVMF/UEFI)
   ansible.builtin.shell: |
     > "{{ kairos_serial_log }}"
+    OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+    [ -f "$OVMF_CODE" ] || OVMF_CODE=/usr/share/qemu/OVMF.fd
     qemu-system-x86_64 \
       {{ kvm_flag.stdout }} \
       -m {{ kairos_vm_ram }} \
       -smp {{ kairos_vm_cpus }} \
       -cpu host \
+      -machine q35 \
+      -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+      -drive if=pflash,format=raw,file="{{ kairos_ovmf_vars }}" \
       -name "Kairos-ComputeNode" \
       -display {{ qemu_display_type.stdout }} \
       -drive file="{{ kairos_disk }}",format=qcow2,if=virtio \
@@ -110,14 +122,19 @@
 
 # ---- Reboot from disk ----
 
-- name: Start Kairos VM from disk
+- name: Start Kairos VM from disk (OVMF/UEFI, reuses vars with Kairos boot entry)
   ansible.builtin.shell: |
     > "{{ kairos_serial_log }}"
+    OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+    [ -f "$OVMF_CODE" ] || OVMF_CODE=/usr/share/qemu/OVMF.fd
     qemu-system-x86_64 \
       {{ kvm_flag.stdout }} \
       -m {{ kairos_vm_ram }} \
       -smp {{ kairos_vm_cpus }} \
       -cpu host \
+      -machine q35 \
+      -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+      -drive if=pflash,format=raw,file="{{ kairos_ovmf_vars }}" \
       -name "Kairos-ComputeNode" \
       -display {{ qemu_display_type.stdout }} \
       -drive file="{{ kairos_disk }}",format=qcow2,if=virtio \
