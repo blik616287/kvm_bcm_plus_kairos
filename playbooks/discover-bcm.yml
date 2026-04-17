@@ -4,7 +4,7 @@
   gather_facts: true
   vars_prompt:
     - name: bcm_host
-      prompt: "BCM head node IP or hostname"
+      prompt: "BCM head node IP or hostname (reachable directly or via proxy)"
       private: false
 
     - name: bcm_port
@@ -21,12 +21,40 @@
       prompt: "SSH password"
       private: true
 
+    - name: bcm_proxy_jump
+      prompt: "Jumphost in user@host form (blank if BCM is directly reachable)"
+      default: ""
+      private: false
+
+    - name: bcm_proxy_key
+      prompt: "Jumphost SSH key (blank if no jumphost; ~ OK)"
+      default: ""
+      private: false
+
   vars:
     e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
-    ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
-    ssh_cmd: "sshpass -p '{{ bcm_pass }}' ssh {{ ssh_opts }} -p {{ bcm_port }} {{ bcm_user }}@{{ bcm_host }}"
+    ssh_config_path: "{{ e2e_dir }}/.discover-ssh-config"
+    # Defined at play-vars scope so {{ ssh_cmd }} is available at task-load time
+    # (Ansible pre-parses templating; set_fact values aren't).
+    ssh_cmd: "sshpass -p '{{ bcm_pass }}' ssh -F {{ ssh_config_path }} bcm-discover"
 
   tasks:
+    - name: Build per-run SSH config (with optional jumphost ProxyCommand)
+      ansible.builtin.copy:
+        dest: "{{ ssh_config_path }}"
+        mode: "0600"
+        content: |
+          Host bcm-discover
+              HostName {{ bcm_host }}
+              Port {{ bcm_port }}
+              User {{ bcm_user }}
+              StrictHostKeyChecking no
+              UserKnownHostsFile /dev/null
+              LogLevel ERROR
+              ConnectTimeout 10
+          {% if bcm_proxy_jump | length > 0 %}    ProxyCommand ssh -i {{ bcm_proxy_key | regex_replace('^~', lookup('env', 'HOME')) }} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -W %h:%p {{ bcm_proxy_jump }}
+          {% endif %}
+
     - name: Verify SSH connectivity
       ansible.builtin.shell: "{{ ssh_cmd }} 'echo OK' 2>/dev/null | tail -1 | tr -d '[:space:]'"
       args:
@@ -36,64 +64,142 @@
       changed_when: false
 
     - name: Gather BCM configuration
-      ansible.builtin.shell: |
-        #!/bin/bash
-        {{ ssh_cmd }} 'bash -s' << 'REMOTE' 2>/dev/null
-        echo "BCM_VERSION=$(dpkg -l cm-config 2>/dev/null | awk "/cm-config/{print \$3}" || echo unknown)"
-        echo "BCM_HOSTNAME=$(hostname)"
+      # `cmd:` (rather than shorthand) avoids Ansible's module-arg parser
+      # trying to split my VAR=value lines as if they were task keyword args.
+      ansible.builtin.shell:
+        cmd: |
+          #!/bin/bash
+          {{ ssh_cmd }} 'bash -s' << 'REMOTE' 2>/dev/null
+          echo "BCM_VERSION=$(dpkg -l cm-config 2>/dev/null | awk "/cm-config/{print \$3}" || echo unknown)"
+          echo "BCM_HOSTNAME=$(hostname)"
 
-        # Network — try eth then ens naming
-        get_ip() { ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1; }
-        get_mask() { ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f2; }
-        ETH0_IP=$(get_ip eth0); [ -z "$ETH0_IP" ] && ETH0_IP=$(get_ip ens18)
-        ETH0_MASK=$(get_mask eth0); [ -z "$ETH0_MASK" ] && ETH0_MASK=$(get_mask ens18)
-        ETH1_IP=$(get_ip eth1); [ -z "$ETH1_IP" ] && ETH1_IP=$(get_ip ens19)
-        ETH1_MASK=$(get_mask eth1); [ -z "$ETH1_MASK" ] && ETH1_MASK=$(get_mask ens19)
-        echo "ETH0_IP=$ETH0_IP"
-        echo "ETH0_MASK=$ETH0_MASK"
-        echo "ETH1_IP=$ETH1_IP"
-        echo "ETH1_MASK=$ETH1_MASK"
+          # --- Internal-network discovery via cmsh (authoritative) ---
+          # Find the network flagged as "Internal" type, read its baseaddress + netmaskbits.
+          INTNET_NAME=$(cmsh -c 'network; list' 2>/dev/null \
+              | awk 'tolower($2)=="internal" {print $1; exit}')
+          if [ -n "$INTNET_NAME" ]; then
+              INTNET_BASE=$(cmsh -c "network; use $INTNET_NAME; get baseaddress" 2>/dev/null \
+                  | tr -d '[:space:]')
+              INTNET_BITS=$(cmsh -c "network; use $INTNET_NAME; get netmaskbits" 2>/dev/null \
+                  | tr -d '[:space:]')
+              INTERNAL_CIDR="${INTNET_BASE}/${INTNET_BITS}"
+          else
+              INTERNAL_CIDR="unknown"
+          fi
+          echo "INTERNAL_CIDR=$INTERNAL_CIDR"
+          echo "INTERNAL_NETMASK=$INTNET_BITS"
 
-        # CIDR
-        if [ -n "$ETH0_IP" ] && [ -n "$ETH0_MASK" ]; then
-          IFS='.' read -r a b c d <<< "$ETH0_IP"
-          if [ "$ETH0_MASK" -ge 24 ]; then CIDR="${a}.${b}.${c}.0/${ETH0_MASK}"
-          elif [ "$ETH0_MASK" -ge 16 ]; then CIDR="${a}.${b}.0.0/${ETH0_MASK}"
-          else CIDR="${a}.0.0.0/${ETH0_MASK}"; fi
-          echo "INTERNAL_CIDR=$CIDR"
-        else
-          echo "INTERNAL_CIDR=unknown"
-        fi
+          # Find which host interface holds an IP inside that CIDR — not by NIC name.
+          if [ -n "$INTNET_BASE" ] && [ -n "$INTNET_BITS" ]; then
+              NET_PREFIX=${INTNET_BASE%.*}   # assumes /24 or wider; first 3 octets
+              INTERNAL_IP=$(ip -4 -o addr 2>/dev/null \
+                  | awk -v p="$NET_PREFIX" '$4 ~ "^"p {split($4,a,"/"); print a[1]; exit}')
+              INTERNAL_IF=$(ip -4 -o addr 2>/dev/null \
+                  | awk -v p="$NET_PREFIX" '$4 ~ "^"p {print $2; exit}')
+          fi
+          echo "INTERNAL_IP=$INTERNAL_IP"
+          echo "INTERNAL_IF=$INTERNAL_IF"
 
-        echo "GATEWAY=$(ip route show default 2>/dev/null | grep -oP 'via \K[0-9.]+' | head -1)"
-        echo "DNS=$(grep nameserver /etc/resolv.conf 2>/dev/null | head -1 | awk '{print $2}')"
-        echo "CMSH_DNS=$(cmsh -c 'partition; use base; get nameservers' 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+          # External: default-route interface + its IP
+          EXT_IF=$(ip -o route 2>/dev/null | awk '/^default/{print $5; exit}')
+          EXT_IP=$(ip -4 -o addr show dev "$EXT_IF" 2>/dev/null | awk '{split($4,a,"/"); print a[1]}' | head -1)
+          echo "EXT_IF=$EXT_IF"
+          echo "EXT_IP=$EXT_IP"
 
-        echo "CMD_STATUS=$(systemctl is-active cmd 2>/dev/null)"
-        echo "DHCPD_STATUS=$(systemctl is-active dhcpd 2>/dev/null)"
-        echo "NAMED_STATUS=$(systemctl is-active named 2>/dev/null)"
-        echo "NFS_STATUS=$(systemctl is-active nfs-server 2>/dev/null)"
+          echo "GATEWAY=$(ip route show default 2>/dev/null | awk '/^default/{print $3; exit}')"
+          echo "DNS=$(grep ^nameserver /etc/resolv.conf 2>/dev/null | head -1 | awk '{print $2}')"
+          echo "CMSH_DNS=$(cmsh -c 'partition; use base; get nameservers' 2>/dev/null \
+              | grep -oP '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 
-        echo "CATEGORIES=$(cmsh -c 'category; list' 2>/dev/null | awk 'NR>1 && NF>1{print $2}' | tr '\n' ',' | sed 's/,$//')"
-        echo "NODES=$(cmsh -c 'device; list' 2>/dev/null | grep -i node | awk '{printf "%s(MAC:%s,IP:%s,cat:%s) ", $2, $3, $5, $4}')"
-        echo "KERNEL=$(ls /cm/images/default-image/boot/vmlinuz-* 2>/dev/null | head -1 | sed 's|.*/vmlinuz-||')"
-        echo "SHARED_FREE=$(df -h /cm/shared 2>/dev/null | tail -1 | awk '{print $4}')"
-        echo "IP_FWD=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)"
-        REMOTE
+          echo "CMD_STATUS=$(systemctl is-active cmd 2>/dev/null)"
+          echo "DHCPD_STATUS=$(systemctl is-active dhcpd 2>/dev/null)"
+          echo "NAMED_STATUS=$(systemctl is-active named 2>/dev/null)"
+          echo "NFS_STATUS=$(systemctl is-active nfs-server 2>/dev/null)"
+
+          # --- Structured cmsh output via per-object `get` calls ---
+          # cmsh's column-aligned `list` can't be awk-parsed safely because category
+          # names contain whitespace (e.g. "S-AI Partner Lab"). Per-field get is slow
+          # but reliable. Each line below uses '|' as the between-field separator.
+
+          # Names don't contain whitespace on BCM, so first `list` column is safe to awk.
+          # But CATEGORY/IMAGE names (second column and beyond) can contain spaces —
+          # for those we take only the first whitespace-separated token per data row.
+          # `cmsh ... list -f name` returns one Name per line with no header,
+          # whitespace-padded to column width. Strip trailing whitespace per line.
+          echo "---BEGIN_CATEGORIES---"
+          cmsh -c 'category; list -f name' 2>/dev/null \
+              | sed 's/[[:space:]]*$//' | awk 'NF>0 {print}'
+          echo "---END_CATEGORIES---"
+
+          echo "---BEGIN_IMAGES---"
+          cmsh -c 'softwareimage; list -f name' 2>/dev/null \
+              | sed 's/[[:space:]]*$//' | awk 'NF>0 {print}'
+          echo "---END_IMAGES---"
+
+          echo "---BEGIN_NODES---"
+          # Filter device rows by type (col 1 = PhysicalNode/HeadNode), take col 2 = name.
+          # Per-device get calls so category names with spaces survive. Strip cmsh "help"
+          # fallback text (happens for HeadNode which has no category/softwareimage) by
+          # requiring the value to be a single short token.
+          sanitize() {
+              local v
+              v=$(cat | tr -d '\n' | sed 's/^ *//; s/ *$//')
+              case "$v" in
+                  *"Name:"*|*"Usage:"*|*"Arguments:"*) echo "" ;;
+                  *) echo "$v" ;;
+              esac
+          }
+          cmsh -c 'device; list' 2>/dev/null \
+              | awk '$1 ~ /^PhysicalNode|^HeadNode$/ {print $2}' \
+              | while read -r dev; do
+                  [ -z "$dev" ] && continue
+                  mac=$(cmsh -c "device; use ${dev}; get mac"  2>/dev/null | sanitize)
+                  ip=$(cmsh  -c "device; use ${dev}; get ip"   2>/dev/null | sanitize)
+                  cat=$(cmsh -c "device; use ${dev}; get category" 2>/dev/null | sanitize)
+                  im=$(cmsh  -c "device; use ${dev}; get softwareimage" 2>/dev/null | sanitize)
+                  echo "${dev}|${mac}|${ip}|${cat}|${im}"
+              done
+          echo "---END_NODES---"
+
+          echo "KERNEL=$(ls /cm/images/default-image/boot/vmlinuz-* 2>/dev/null | head -1 | sed 's|.*/vmlinuz-||')"
+          echo "SHARED_FREE=$(df -h /cm/shared 2>/dev/null | tail -1 | awk '{print $4}')"
+          echo "IP_FWD=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)"
+          REMOTE
       args:
         executable: /bin/bash
       register: discovery_raw
       changed_when: false
 
-    - name: Filter discovery output
+    - name: Extract key=value lines
       ansible.builtin.set_fact:
-        discovery_lines: "{{ discovery_raw.stdout_lines | map('trim') | select('match', '^[A-Z0-9_]+=') | list }}"
+        discovery_lines: "{{ discovery_raw.stdout_lines | map('trim') | select('match', '^[A-Z_][A-Z0-9_]*=') | list }}"
 
-    - name: Parse discovery results
+    - name: Parse key=value into dict
       ansible.builtin.set_fact:
         disc: "{{ disc | default({}) | combine({item.split('=', 1)[0] | trim: item.split('=', 1)[1] | trim}) }}"
       loop: "{{ discovery_lines }}"
       when: "'=' in item"
+
+    - name: Parse cmsh blocks (categories, nodes, images)
+      ansible.builtin.set_fact:
+        categories_list: "{{ (discovery_raw.stdout.split('---BEGIN_CATEGORIES---')[1].split('---END_CATEGORIES---')[0] | trim).split('\n') | select | list }}"
+        nodes_raw_list:  "{{ (discovery_raw.stdout.split('---BEGIN_NODES---')[1].split('---END_NODES---')[0] | trim).split('\n') | select | list }}"
+        images_list:     "{{ (discovery_raw.stdout.split('---BEGIN_IMAGES---')[1].split('---END_IMAGES---')[0] | trim).split('\n') | select | list }}"
+
+    - name: Parse each node line into a record (name|mac|ip|category|image)
+      ansible.builtin.set_fact:
+        nodes_list: >-
+          {{
+            nodes_raw_list
+            | map('split', '|')
+            | map('map', 'trim')
+            | selectattr('0', 'defined')
+            | list
+          }}
+
+    - name: Determine output filename (BCM's own hostname, not the user-supplied host)
+      ansible.builtin.set_fact:
+        discovery_filename: "{{ e2e_dir }}/bcm-discovery-{{ disc.BCM_HOSTNAME | default(bcm_host) | regex_replace('[^A-Za-z0-9._-]', '_') }}.yml"
 
     - name: Generate group_vars recommendations
       ansible.builtin.set_fact:
@@ -106,57 +212,71 @@
           bcm_password: "{{ bcm_pass }}"
           bcm_hostname: "{{ disc.BCM_HOSTNAME | default('bcm-headnode') }}"
 
-          # BCM networking (internal provisioning)
-          bcm_internal_ip: "{{ disc.ETH0_IP | default('NEEDS_MANUAL_CONFIG') }}"
-          bcm_internal_netmask: "{{ disc.ETH0_MASK | default('24') }}"
-          bcm_internal_cidr: "{{ disc.INTERNAL_CIDR | default('NEEDS_MANUAL_CONFIG') }}"
+          # BCM provisioning network (from cmsh network;internalnet)
+          bcm_internal_ip:      "{{ disc.INTERNAL_IP | default('NEEDS_MANUAL_CONFIG') }}"
+          bcm_internal_netmask: "{{ disc.INTERNAL_NETMASK | default('24') }}"
+          bcm_internal_cidr:    "{{ disc.INTERNAL_CIDR | default('NEEDS_MANUAL_CONFIG') }}"
+          # (BCM presents the internal IP on interface: {{ disc.INTERNAL_IF | default('?') }})
 
-          # BCM external
+          # BCM external routing
           bcm_external_gateway: "{{ disc.GATEWAY | default('NEEDS_MANUAL_CONFIG') }}"
-          bcm_external_dns: "{{ disc.CMSH_DNS | default(disc.DNS) | default('NEEDS_MANUAL_CONFIG') }}"
+          bcm_external_dns:     "{{ disc.CMSH_DNS | default(disc.DNS) | default('NEEDS_MANUAL_CONFIG') }}"
+          # External iface: {{ disc.EXT_IF | default('?') }}  IP: {{ disc.EXT_IP | default('?') }}
 
-          # BCM connection (for deploy-dd SSH)
-          bcm_connect_ip: "{{ bcm_host }}"
-          bcm_connect_port: "{{ bcm_port }}"
+          # SSH transport (how we reached this BCM)
+          bcm_ssh_host:        "{{ bcm_host }}"
+          bcm_ssh_port:        {{ bcm_port }}
+          bcm_ssh_proxy_jump:  "{{ bcm_proxy_jump }}"
+          bcm_ssh_proxy_key:   "{{ bcm_proxy_key }}"
+
+          # Safe defaults for a remote (existing) BCM
+          bcm_manage_dns:              false
+          bcm_manage_cluster_defaults: false
 
           # --- Kairos Build ---
           kairos_kernel_version: "{{ disc.KERNEL | default('NEEDS_MANUAL_CONFIG') }}"
 
     - name: Display discovery results
       vars:
+        node_header: "NAME | MAC | IP | CATEGORY | SOFTWAREIMAGE"
         report: |-
 
           ============================================
            BCM Discovery Results
           ============================================
 
-          Host:           {{ bcm_host }}:{{ bcm_port }}
-          Hostname:       {{ disc.BCM_HOSTNAME | default('unknown') }}
-          Version:        {{ disc.BCM_VERSION | default('unknown') }}
+          Reached via:     {{ bcm_host }}:{{ bcm_port }}{% if bcm_proxy_jump | length > 0 %} (proxy: {{ bcm_proxy_jump }}){% endif %}
+
+          Hostname:        {{ disc.BCM_HOSTNAME | default('unknown') }}
+          Version:         {{ disc.BCM_VERSION | default('unknown') }}
 
           -- Network --
-          eth0 (internal):  {{ disc.ETH0_IP | default('N/A') }}/{{ disc.ETH0_MASK | default('N/A') }}
-          eth1 (external):  {{ disc.ETH1_IP | default('N/A') }}/{{ disc.ETH1_MASK | default('N/A') }}
-          Internal CIDR:    {{ disc.INTERNAL_CIDR | default('N/A') }}
-          Gateway:          {{ disc.GATEWAY | default('N/A') }}
-          DNS:              {{ disc.DNS | default('N/A') }}
-          cmsh DNS:         {{ disc.CMSH_DNS | default('N/A') }}
-          IP forwarding:    {{ disc.IP_FWD | default('N/A') }}
+          Internal iface:  {{ disc.INTERNAL_IF | default('N/A') }} = {{ disc.INTERNAL_IP | default('N/A') }}/{{ disc.INTERNAL_NETMASK | default('N/A') }}
+          External iface:  {{ disc.EXT_IF | default('N/A') }} = {{ disc.EXT_IP | default('N/A') }}
+          CIDR:            {{ disc.INTERNAL_CIDR | default('N/A') }}
+          Gateway:         {{ disc.GATEWAY | default('N/A') }}
+          DNS (resolv.conf): {{ disc.DNS | default('N/A') }}
+          DNS (cmsh):        {{ disc.CMSH_DNS | default('N/A') }}
+          IP forwarding:   {{ disc.IP_FWD | default('N/A') }}
 
           -- Services --
-          cmd:              {{ disc.CMD_STATUS | default('N/A') }}
-          dhcpd:            {{ disc.DHCPD_STATUS | default('N/A') }}
-          named:            {{ disc.NAMED_STATUS | default('N/A') }}
-          nfs-server:       {{ disc.NFS_STATUS | default('N/A') }}
+          cmd:             {{ disc.CMD_STATUS | default('N/A') }}
+          dhcpd:           {{ disc.DHCPD_STATUS | default('N/A') }}
+          named:           {{ disc.NAMED_STATUS | default('N/A') }}
+          nfs-server:      {{ disc.NFS_STATUS | default('N/A') }}
 
           -- Cluster --
-          Categories:       {{ disc.CATEGORIES | default('none') }}
-          Nodes:            {{ disc.NODES | default('none') }}
-          Kernel:           {{ disc.KERNEL | default('N/A') }}
-          /cm/shared free:  {{ disc.SHARED_FREE | default('N/A') }}
+          Categories:      {{ categories_list | join(', ') }}
+          Software images: {{ images_list | join(', ') }}
+          Nodes ({{ node_header }}):
+          {% for n in nodes_list %}
+            - {{ n | join(' | ') }}
+          {% endfor %}
+          Kernel:          {{ disc.KERNEL | default('N/A') }}
+          /cm/shared free: {{ disc.SHARED_FREE | default('N/A') }}
 
           ============================================
-           Recommended group_vars/all values
+           Recommended group_vars values
           ============================================
 
           {{ recommended_vars }}
@@ -166,24 +286,38 @@
     - name: Save discovery to file
       ansible.builtin.copy:
         content: |
-          # BCM Discovery — {{ bcm_host }}:{{ bcm_port }}
+          # BCM Discovery — {{ disc.BCM_HOSTNAME | default(bcm_host) }}
+          # Reached: {{ bcm_host }}:{{ bcm_port }}{% if bcm_proxy_jump | length > 0 %} via {{ bcm_proxy_jump }}{% endif %}
+
           # Discovered: {{ ansible_facts.date_time.iso8601 }}
           #
-          # Copy the values below into inventory/group_vars/all
+          # Copy the values below into inventory/group_vars/all.yml
           # Review and adjust before running deploy-dd
 
           {{ recommended_vars }}
-          # --- Status at discovery time ---
-          # cmd: {{ disc.CMD_STATUS | default('N/A') }}
-          # dhcpd: {{ disc.DHCPD_STATUS | default('N/A') }}
-          # named: {{ disc.NAMED_STATUS | default('N/A') }}
-          # nfs-server: {{ disc.NFS_STATUS | default('N/A') }}
-          # Categories: {{ disc.CATEGORIES | default('none') }}
-          # Nodes: {{ disc.NODES | default('none') }}
+
+          # --- Cluster state at discovery time ---
+          # Services:
+          #   cmd:        {{ disc.CMD_STATUS | default('N/A') }}
+          #   dhcpd:      {{ disc.DHCPD_STATUS | default('N/A') }}
+          #   named:      {{ disc.NAMED_STATUS | default('N/A') }}
+          #   nfs-server: {{ disc.NFS_STATUS | default('N/A') }}
+          # Categories ({{ categories_list | length }}): {{ categories_list | join(', ') }}
+          # Images ({{ images_list | length }}): {{ images_list | join(', ') }}
+          # Nodes ({{ nodes_list | length }}):
+          {% for n in nodes_list %}
+          #   {{ n | join(' | ') }}
+          {% endfor %}
           # /cm/shared free: {{ disc.SHARED_FREE | default('N/A') }}
-        dest: "{{ e2e_dir }}/bcm-discovery-{{ bcm_host }}.yml"
+        dest: "{{ discovery_filename }}"
+      changed_when: false
+
+    - name: Clean up SSH config
+      ansible.builtin.file:
+        path: "{{ ssh_config_path }}"
+        state: absent
       changed_when: false
 
     - name: Discovery saved
       ansible.builtin.debug:
-        msg: "Saved to {{ e2e_dir }}/bcm-discovery-{{ bcm_host }}.yml"
+        msg: "Saved to {{ discovery_filename }}"
