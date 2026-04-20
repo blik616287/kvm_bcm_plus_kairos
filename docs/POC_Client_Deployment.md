@@ -25,6 +25,8 @@ Typical alternatives all have serious downsides:
 - **Custom PXE infrastructure separate from BCM** — duplicates what BCM already provides, requires separate DHCP/TFTP, creates network conflicts with existing BCM provisioning.
 - **Replacing BCM entirely** — loses HPC cluster management capabilities.
 
+<div style="page-break-before: always;"></div>
+
 ### Our Solution
 
 We inject Kairos into BCM's existing provisioning pipeline. BCM already knows how to PXE boot nodes, rsync software images, and manage node lifecycle. We create a new BCM software image (`kairos-installer`) whose only job is to boot once, download a pre-built Kairos raw disk image over HTTP from BCM, and `dd` it onto the node's disk. After that, the node powers off and subsequently boots Kairos directly from its own disk via UEFI.
@@ -112,6 +114,8 @@ We SSH to the BCM head node (directly or via configured jumphost) and make the f
 
 ---
 
+<div style="page-break-before: always;"></div>
+
 ## Per-Node Provisioning Flow
 
 The node PXE boots exactly as it would for any BCM-managed node. The only difference is the software image BCM serves it.
@@ -128,6 +132,75 @@ The node PXE boots exactly as it would for any BCM-managed node. The only differ
 | **Total** | **~13 min** | From first power-on to `[ UP ]` in BCM + `healthy` in Palette |
 
 ---
+
+<div style="page-break-before: always;"></div>
+
+## Quick Start (Remote BCM via SSH Jumphost)
+
+The minimum configuration for a remote-BCM deploy through an SSH jumphost. Fuller detail on each step is in **Implementation Steps**.
+
+### Required inputs
+
+Copy `inventory/group_vars/all.example.yml` to `inventory/group_vars/all.yml` and fill in at least the following. All other variables in the example file can stay at their defaults.
+
+| Variable | What it is | Example |
+| --- | --- | --- |
+| `bcm_password` | BCM root SSH password | `"…"` |
+| `bcm_ssh_host` | BCM's address on the provisioning network (reached via the jumphost) | `"192.168.98.2"` |
+| `bcm_ssh_port` | SSH port on BCM | `22` |
+| `bcm_ssh_proxy_jump` | Jumphost in `user@host` form — applied as an OpenSSH `ProxyCommand` to every BCM call | `"partner@100.90.255.42"` |
+| `bcm_ssh_proxy_key` | Private key for jumphost auth (`~` is expanded) | `"~/.ssh/bcm-jump"` |
+| `bcm_internal_ip` | BCM's IP on the provisioning network (baked into the compute node's HTTP URL) | `"192.168.98.2"` |
+| `bcm_internal_cidr` | CIDR for NFS exports and DHCP pool scope | `"192.168.98.0/24"` |
+| `bcm_manage_dns` | **Must stay `false`** on a customer BCM — skips the cluster-wide DNS rewrite | `false` |
+| `bcm_manage_cluster_defaults` | **Must stay `false`** on a customer BCM — skips flipping `defaultcategory` / `nodebasename` | `false` |
+| `bcm_target_node` | Existing cmsh device name to re-image | `"edge-4c4c454400485610804bc3c04f4e4434"` |
+| `bcm_source_category` | Existing BCM category to clone for the new `kairos` category (inherits disksetup + mon templates + FinalizeXML) | `"Partner Lab"` |
+| `kairos_target_disk` | Disk device on the compute node that `dd` will overwrite | `"/dev/nvme0n1"` |
+| `kairos_wipe_disks` | Sibling disks to `wipefs -a -f` before `dd` (clears stale LVM/DRBD signatures) | `"nvme1n1 nvme2n1 nvme3n1 nvme4n1"` |
+| `palette_endpoint` | Palette API hostname | `"palette.example.com"` |
+| `palette_project_name` | Palette project | `"Default"` |
+| `palette_project_uid` | Palette project UID | `"69a81eb…"` |
+| `palette_api_key` | Admin API key with `edgeToken.create` + `edgehost.delete` | `"…"` |
+| `palette_ca_cert` | PEM block — only needed if Palette uses a self-signed CA | `-----BEGIN CERTIFICATE----- …` |
+| `palette_token` | **Optional.** Pre-minted edge-host registration token. If omitted, the node auto-mints one on first boot using `palette_api_key` + `palette_project_uid` | `"…"` |
+
+### Sequence of commands
+
+```bash
+# 1. (optional) Discover the BCM — prompts for the same credentials and emits
+#    a starter inventory with the network/category/node fields pre-filled.
+make discover
+
+# 2. Fill in inventory/group_vars/all.yml with values from above.
+cp inventory/group_vars/all.example.yml inventory/group_vars/all.yml
+$EDITOR inventory/group_vars/all.yml
+
+# 3. Build the Kairos raw image once (runs entirely on the build host,
+#    no BCM interaction). ~30 min.
+make kairos-build
+
+# 4. Upload the image to BCM and configure the kairos-installer + category +
+#    target device. ~3–5 min on direct network; up to ~30 min on the first
+#    run through a slow jumphost (SCP of the ~5.4 GB image is the bottleneck).
+#    Subsequent runs skip the SCP when sizes match.
+make deploy-dd
+
+# 5. Power-cycle the target compute node to PXE boot (via iDRAC, IPMI, or
+#    Redfish). BCM drops the kairos-installer ramdisk onto it; the installer
+#    dd's the Kairos image onto the target disk, registers a UEFI boot entry,
+#    and powers off. Power the node back on — UEFI boots Kairos from disk.
+
+# 6. Validate end-to-end — SSHes to BCM through the jumphost, then from BCM to
+#    the booted Kairos node. ~15 sec.
+make validate
+```
+
+All BCM-facing commands in steps 4 and 6 route through `bcm_ssh_proxy_jump` via a per-run SSH config file — no manual tunnel setup is needed on the build host.
+
+---
+
+<div style="page-break-before: always;"></div>
 
 ## Implementation Steps
 
@@ -181,6 +254,8 @@ ansible-playbook playbooks/discover-bcm.yml \
 
 **Time:** ~10 min on a fresh/local BCM, or ~30 min on a remote BCM (the SCP upload of the ~5.4 GB image through a jumphost is the bottleneck). Skip-if-exists on subsequent runs drops that to ~3 min.
 
+<div style="page-break-before: always;"></div>
+
 **Key inventory variables (see `inventory/group_vars/all.example.yml`):**
 
 | Variable | Purpose |
@@ -199,6 +274,8 @@ ansible-playbook playbooks/discover-bcm.yml \
 | `palette_api_key` | Admin key (baked to node for cleanup + token auto-gen) |
 | `palette_ca_cert` | Self-signed CA PEM for non-public Palette |
 | `palette_token` | *Optional* pre-minted edge-host token; auto-generated when absent |
+
+<div style="page-break-before: always;"></div>
 
 ### Step 3: PXE boot the compute node
 
@@ -231,6 +308,10 @@ The **first** PXE boot exists because the current BootOrder doesn't contain a Ka
 **BCM checks (18):** SSH reachability, service status (`cmd`, `dhcpd`, `named`, `nfs-server`, `rsyncd`, HTTP:8888), internal IP present on any interface, external interface detection, IP forwarding, external DNS resolution, internet reachability, cluster state (head node UP, target node registered with correct IP + `kairos` category), `kairos-installer` image present, raw disk on `/cm/shared/`.
 
 **Kairos node checks (23):** SSH reachability (via BCM jump host), ping, OS version (Ubuntu 22.04 base), Kairos release + version, kairos-agent version, kernel version, IP address, gateway, DNS resolver, external DNS resolution, internet access, stylus-agent active, Palette registration logged, boot cmdline has `net.ifnames=0` + Kairos boot chain markers, COS partitions present (OEM/RECOVERY/STATE/PERSISTENT), root immutable, disk free, `/oem/*.yaml` present.
+
+<div style="page-break-before: always;"></div>
+
+<div class="keep-together" markdown="1">
 
 **Sample output:**
 
@@ -285,7 +366,7 @@ The **first** PXE boot exists because the current BootOrder doesn't contain a Ka
  PASS: 41/41   WARN: 0/41   FAIL: 0/41
 ```
 
-**Time:** ~2 min.
+</div>
 
 ---
 
@@ -315,6 +396,8 @@ A previously-provisioned Kairos node can be re-imaged safely:
 The re-deploy procedure is identical to the first-time procedure: `make deploy-dd` (if the image or config changed; otherwise skip), then PXE-boot-once via iDRAC.
 
 ---
+
+<div style="page-break-before: always;"></div>
 
 ## Rollback
 
