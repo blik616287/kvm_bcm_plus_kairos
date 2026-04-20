@@ -1,18 +1,38 @@
 #!/bin/bash
 # validate.sh — Comprehensive deployment validation, rendered by Ansible.
-# KVM variant: connects to BCM via port-forwarded SSH.
+# Works for both local-KVM (BCM on localhost:10022, QEMU MAC) and remote (BCM
+# behind a jumphost, physical node with real MAC) by reusing the same SSH
+# config pattern as deploy-dd.sh and parameterizing the target node identity.
 set -uo pipefail
 
-BCM_HOST="localhost"
+BCM_HOST="{{ bcm_ssh_host | default('localhost') }}"
 BCM_PASSWORD="{{ bcm_password }}"
 BCM_SSH_PORT="{{ bcm_ssh_port }}"
-COMPUTE_MAC="{{ kairos_vm_mac }}"
+BUILD_DIR="{{ build_dir }}"
 KAIROS_USER="kairos"
 KAIROS_PASSWORD="kairos"
 BCM_INTERNAL_IP="{{ bcm_internal_ip }}"
+TARGET_NODE="{{ bcm_target_node | default('node001') }}"
+
+mkdir -p "${BUILD_DIR}"
+SSH_CONFIG="${BUILD_DIR}/.bcm-ssh-config"
+cat > "${SSH_CONFIG}" << SSHCONF
+Host bcm-target
+    HostName ${BCM_HOST}
+    Port ${BCM_SSH_PORT}
+    User root
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+    ConnectTimeout 10
+{% if bcm_ssh_proxy_jump | default('') %}
+    ProxyCommand ssh -i {{ bcm_ssh_proxy_key | regex_replace('^~', lookup('env', 'HOME')) }} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -W %h:%p {{ bcm_ssh_proxy_jump }}
+{% endif %}
+SSHCONF
+chmod 600 "${SSH_CONFIG}"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
-BCM_SSH="sshpass -p ${BCM_PASSWORD} ssh ${SSH_OPTS} -p ${BCM_SSH_PORT} root@${BCM_HOST}"
+BCM_SSH="sshpass -p ${BCM_PASSWORD} ssh -F ${SSH_CONFIG} bcm-target"
 
 filter_motd() { grep -vE "cmfirstboot is still in progress|^$|Welcome to|Documentation|Management|Support|updates is more|sudo apt update|Base Command Manager|Cluster Manager ID|module|Use the following|initadd|module add|^-----|^$" || true; }
 
@@ -66,11 +86,20 @@ ${BCM_SSH} "ping -c1 -W3 localhost" &>/dev/null && check "BCM ping" "PASS" "" ||
 
 echo ""
 echo "-- BCM Network --"
-ETH0_IP=$(${BCM_SSH} "ip -4 addr show eth0 2>/dev/null | grep -oP 'inet \K[0-9.]+'" 2>/dev/null | filter_motd)
-[[ "$ETH0_IP" == "$BCM_INTERNAL_IP" ]] && check "eth0 (internal)" "PASS" "$ETH0_IP" || check "eth0 (internal)" "FAIL" "expected $BCM_INTERNAL_IP got $ETH0_IP"
+# BCM's internal IP may be on eth0 (local-KVM with net.ifnames=0) or enp*/ens* (remote).
+# Match by IP, not interface name.
+INT_IF=$(${BCM_SSH} "ip -4 -o addr 2>/dev/null | awk -v ip='${BCM_INTERNAL_IP}' '\$4 ~ \"^\"ip\"/\" {print \$2; exit}'" 2>/dev/null | filter_motd | tr -d '[:space:]')
+[[ -n "$INT_IF" ]] && check "BCM internal IP" "PASS" "${BCM_INTERNAL_IP} on ${INT_IF}" || check "BCM internal IP" "FAIL" "${BCM_INTERNAL_IP} not on any BCM interface"
 
+{% if bcm_manage_dns | default(true) %}
+# Local-KVM / fresh-BCM only: check eth1 (BCM's external NAT interface).
+# Remote BCMs use ens*/enp* names and may not route internet through themselves.
 ETH1_IP=$(${BCM_SSH} "ip -4 addr show eth1 2>/dev/null | grep -oP 'inet \K[0-9.]+'" 2>/dev/null | filter_motd)
 [[ -n "$ETH1_IP" ]] && check "eth1 (external)" "PASS" "$ETH1_IP" || check "eth1 (external)" "FAIL" "no IP on eth1"
+{% else %}
+EXT_IF=$(${BCM_SSH} "ip -o route 2>/dev/null | awk '/^default/{print \$5; exit}'" 2>/dev/null | filter_motd)
+[[ -n "$EXT_IF" ]] && check "BCM external iface" "PASS" "$EXT_IF" || check "BCM external iface" "WARN" "no default route"
+{% endif %}
 
 IP_FWD=$(${BCM_SSH} "cat /proc/sys/net/ipv4/ip_forward" 2>/dev/null | filter_motd)
 [[ "$IP_FWD" == "1" ]] && check "IP forwarding" "PASS" "" || check "IP forwarding" "WARN" "disabled — compute nodes may lack internet"
@@ -87,13 +116,17 @@ echo ""
 echo "-- BCM Cluster --"
 CMSH_LIST=$(${BCM_SSH} "cmsh -c 'device; list' 2>/dev/null" 2>/dev/null | filter_motd)
 echo "$CMSH_LIST" | grep -q "UP" && check "Head node (cmsh)" "PASS" "" || check "Head node (cmsh)" "FAIL" ""
-echo "$CMSH_LIST" | grep -q "node001" && check "node001 registered" "PASS" "" || check "node001 registered" "FAIL" ""
+echo "$CMSH_LIST" | grep -q "${TARGET_NODE}" && check "${TARGET_NODE} registered" "PASS" "" || check "${TARGET_NODE} registered" "FAIL" ""
 
-NODE_IP=$(${BCM_SSH} "cmsh -c 'device; use node001; get ip' 2>/dev/null" 2>/dev/null | filter_motd)
-check "node001 IP" "PASS" "$NODE_IP"
+NODE_IP=$(${BCM_SSH} "cmsh -c 'device; use ${TARGET_NODE}; get ip' 2>/dev/null" 2>/dev/null | filter_motd)
+check "${TARGET_NODE} IP" "PASS" "$NODE_IP"
 
-NODE_CAT=$(${BCM_SSH} "cmsh -c 'device; use node001; get category' 2>/dev/null" 2>/dev/null | filter_motd)
-[[ "$NODE_CAT" == "kairos" ]] && check "node001 category" "PASS" "$NODE_CAT" || check "node001 category" "FAIL" "$NODE_CAT"
+NODE_CAT=$(${BCM_SSH} "cmsh -c 'device; use ${TARGET_NODE}; get category' 2>/dev/null" 2>/dev/null | filter_motd)
+[[ "$NODE_CAT" == "kairos" ]] && check "${TARGET_NODE} category" "PASS" "$NODE_CAT" || check "${TARGET_NODE} category" "FAIL" "$NODE_CAT"
+
+# Derive the real MAC from cmsh — for local-KVM this equals kairos_vm_mac,
+# for remote it's the physical NIC MAC BCM has recorded.
+COMPUTE_MAC=$(${BCM_SSH} "cmsh -c 'device; use ${TARGET_NODE}; get mac' 2>/dev/null" 2>/dev/null | filter_motd | tr -d '[:space:]')
 
 INSTALLER_IMG=$(${BCM_SSH} "test -d /cm/images/kairos-installer && echo exists" 2>/dev/null | filter_motd)
 [[ "$INSTALLER_IMG" == "exists" ]] && check "kairos-installer image" "PASS" "" || check "kairos-installer image" "FAIL" ""
@@ -110,10 +143,12 @@ echo "== Kairos Compute Node =="
 echo "============================================"
 echo ""
 
-KAIROS_IP=$(${BCM_SSH} "arp -an 2>/dev/null | grep -i '${COMPUTE_MAC}' | grep -oP '\\d+\\.\\d+\\.\\d+\\.\\d+'" 2>/dev/null | filter_motd)
+KAIROS_IP=""
+if [[ -n "$COMPUTE_MAC" ]]; then
+    KAIROS_IP=$(${BCM_SSH} "arp -an 2>/dev/null | grep -i '${COMPUTE_MAC}' | grep -oP '\\d+\\.\\d+\\.\\d+\\.\\d+'" 2>/dev/null | filter_motd)
+fi
 if [[ -z "$KAIROS_IP" ]]; then
-    NODE_IP=$(${BCM_SSH} "cmsh -c 'device; use node001; get ip' 2>/dev/null" 2>/dev/null | filter_motd)
-    KAIROS_IP="$NODE_IP"
+    KAIROS_IP=$(${BCM_SSH} "cmsh -c 'device; use ${TARGET_NODE}; get ip' 2>/dev/null" 2>/dev/null | filter_motd)
 fi
 echo "Kairos IP: ${KAIROS_IP}"
 
