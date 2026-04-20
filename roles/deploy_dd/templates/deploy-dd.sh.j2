@@ -317,7 +317,12 @@ EOF
 # Target an existing BCM device — move into kairos category, FULL installmode.
 # Also set softwareimage explicitly at the device level, because device-level
 # overrides (common on existing BCMs) beat the category value.
-${SSH_CMD} "echo -e 'device\nuse \"{{ bcm_target_node }}\"\nset category kairos\nset softwareimage kairos-installer\nset installmode FULL\ncommit' | cmsh 2>&1" 2>/dev/null | filter_motd
+# If kairos_target_mac / kairos_target_ip are provided in inventory, set them
+# too — mirrors what the local-KVM path does (where `device add physicalnode`
+# takes name + ip + mac at registration time), so deploy-dd owns the MAC and
+# IP mapping rather than relying on the device having been registered with the
+# right values via cmsh.
+${SSH_CMD} "echo -e 'device\nuse \"{{ bcm_target_node }}\"\nset category kairos\nset softwareimage kairos-installer\nset installmode FULL{% if kairos_target_mac is defined and kairos_target_mac | length > 0 %}\nset mac {{ kairos_target_mac }}{% endif %}{% if kairos_target_ip is defined and kairos_target_ip | length > 0 %}\nset ip {{ kairos_target_ip }}{% endif %}\ncommit' | cmsh 2>&1" 2>/dev/null | filter_motd
 TARGET_NODE_NAME="{{ bcm_target_node }}"
 {% else %}
 # Fresh BCM — register node001 with explicit IP to avoid BCM auto-assigning gateway

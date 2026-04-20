@@ -155,6 +155,8 @@ Copy `inventory/group_vars/all.example.yml` to `inventory/group_vars/all.yml` an
 | `bcm_manage_dns` | **Must stay `false`** on a customer BCM — skips the cluster-wide DNS rewrite | `false` |
 | `bcm_manage_cluster_defaults` | **Must stay `false`** on a customer BCM — skips flipping `defaultcategory` / `nodebasename` | `false` |
 | `bcm_target_node` | Existing cmsh device name to re-image | `"edge-4c4c454400485610804bc3c04f4e4434"` |
+| `kairos_target_mac` | **Optional.** MAC of the compute node's provisioning NIC. When set, `deploy-dd` does `set mac <value>` on `bcm_target_node` — mirrors the local-KVM path so the MAC mapping is owned by this deploy rather than pre-configured in cmsh. Leave empty to keep the existing MAC | `"4c:4c:45:44:00:48"` |
+| `kairos_target_ip` | **Optional.** IP to assign on the provisioning network. When set, `deploy-dd` does `set ip <value>` on `bcm_target_node`. Must be inside `bcm_internal_cidr` and outside the DHCP pool (`.16`–`.250`). Leave empty to keep the existing IP | `"192.168.98.10"` |
 | `bcm_source_category` | Existing BCM category to clone for the new `kairos` category (inherits disksetup + mon templates + FinalizeXML) | `"Partner Lab"` |
 | `kairos_target_disk` | Disk device on the compute node that `dd` will overwrite | `"/dev/nvme0n1"` |
 | `kairos_wipe_disks` | Sibling disks to `wipefs -a -f` before `dd` (clears stale LVM/DRBD signatures) | `"nvme1n1 nvme2n1 nvme3n1 nvme4n1"` |
