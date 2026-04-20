@@ -97,7 +97,7 @@ make all   # runs the full 6-stage pipeline (~100-120 min)
 | 3 | `make kairos-build` | ~30 min | Clone CanvOS, build Kairos ISO via Earthly, generate **UEFI** raw disk image under OVMF |
 | 4 | `make deploy-dd` | ~3–5 min | SSH to BCM (direct or via jumphost), upload lz4 image, install `kairos-installer`, configure `kairos` category + nodeexecutionfilters |
 | 5 | `make kairos-vm` | ~10 min | PXE boot compute VM, dd Kairos to disk, reboot into Kairos *(local-KVM only)* |
-| 6 | `make validate` | ~15 sec | 41-point validation across BCM and Kairos (works for remote BCM + remote compute node through jumphost) |
+| 6 | `make validate` | ~15 sec | ~40-point validation across BCM and Kairos (works for remote BCM + remote compute node through jumphost) |
 
 ```
                    ┌──> bcm-prepare ──> bcm-vm ─┐            (local-KVM only)
@@ -116,7 +116,7 @@ make bcm-vm             # Stage 2 — local-KVM only
 make kairos-build       # Stage 3 — builds Kairos raw image via CanvOS + OVMF
 make deploy-dd          # Stage 4 — push to BCM, configure PXE + kairos category
 make kairos-vm          # Stage 5 — local-KVM only (PXE boots a local compute VM)
-make validate           # Stage 6 — 41-point health check
+make validate           # Stage 6 — ~40-point health check
 make all                # Stages 1–6 (local-KVM mode)
 
 # Discovery
@@ -243,7 +243,7 @@ kvm_bcm_plus_kairos/
 │   ├── kairos_build/            # CanvOS ISO + OVMF raw disk
 │   ├── deploy_dd/               # Upload + configure BCM for PXE deploy
 │   ├── kairos_vm/               # PXE boot compute VM (local-KVM)
-│   ├── validate/                # 41-point health checks
+│   ├── validate/                # ~40-point health checks
 │   └── dependencies/
 ├── files/canvos/                # CanvOS overlay
 │   └── overlay/files/usr/bin/palette-cleanup-stale.sh   # pre-registration hook
