@@ -210,7 +210,7 @@ All BCM-facing commands in steps 4 and 6 route through `bcm_ssh_proxy_jump` via 
 
 **What:** Interactive playbook that SSHes to the BCM head node (through your jumphost), reads the internal network definition from cmsh, enumerates categories, software images, and registered devices, and writes a site-specific inventory starter file at `bcm-discovery-<bcm-hostname>.yml`.
 
-**When to use:** Run first on any BCM you haven't deployed to before, to harvest the right values for `bcm_internal_ip`, `bcm_internal_cidr`, `bcm_external_dns`, `kairos_kernel_version`, and to see which category/image names already exist on the BCM so you can pick the right `bcm_source_category`.
+**When to use:** Run first on any BCM you haven't deployed to before, to harvest the right values for `bcm_internal_ip`, `bcm_internal_cidr`, `bcm_external_dns`, and to see which category/image names already exist on the BCM so you can pick the right `bcm_source_category`.
 
 **Non-interactive invocation** (so you can script it):
 
