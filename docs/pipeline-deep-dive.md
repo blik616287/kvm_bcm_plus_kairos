@@ -1,743 +1,812 @@
-# KVM BCM + Kairos Pipeline — Step-by-Step Technical Deep Dive
+# BCM + Kairos Pipeline — Technical Deep Dive
 
-This document explains every stage of the end-to-end pipeline in enough detail for an engineer to understand exactly what happens, why, and how the pieces connect.
+Engineer-level walkthrough of every stage: what runs, what it touches, and why. The README is the user-facing introduction; this document is the complement an engineer consults before modifying a role.
 
----
+The pipeline supports two deployment modes from the same roles:
+
+- **Remote BCM** (primary, customer sites) — deploy Kairos to bare-metal compute nodes managed by an already-running BCM head node, reached over SSH (optionally via a jumphost). Only stages 3, 4, and 6 run.
+- **Local KVM** (dev / demo / regression) — stand up BCM + Kairos compute node entirely in local QEMU VMs. All six stages run.
+
+Where a stage, role, or code path is mode-specific it is called out explicitly.
 
 ## Table of Contents
 
-1. [Prerequisites & Dependencies](#1-prerequisites--dependencies)
-2. [Stage 1 — BCM Prepare (`make bcm-prepare`)](#2-stage-1--bcm-prepare)
-3. [Stage 2 — BCM VM (`make bcm-vm`)](#3-stage-2--bcm-vm)
-4. [Stage 3 — Kairos Build (`make kairos-build`)](#4-stage-3--kairos-build)
-5. [Stage 4 — Deploy DD (`make deploy-dd`)](#5-stage-4--deploy-dd)
-6. [Stage 5 — Kairos VM (`make kairos-vm`)](#6-stage-5--kairos-vm)
-7. [Stage 6 — Validate (`make validate`)](#7-stage-6--validate)
-8. [Network Topology](#8-network-topology)
+1. [Prerequisites & shared machinery](#1-prerequisites--shared-machinery)
+2. [`make discover` — remote BCM discovery](#2-make-discover--remote-bcm-discovery)
+3. [Stage 1 — BCM Prepare *(local-KVM only)*](#3-stage-1--bcm-prepare-local-kvm-only)
+4. [Stage 2 — BCM VM *(local-KVM only)*](#4-stage-2--bcm-vm-local-kvm-only)
+5. [Stage 3 — Kairos Build](#5-stage-3--kairos-build)
+6. [Stage 4 — Deploy DD](#6-stage-4--deploy-dd)
+7. [Stage 5 — Kairos VM *(local-KVM only)*](#7-stage-5--kairos-vm-local-kvm-only)
+8. [Stage 6 — Validate](#8-stage-6--validate)
+9. [Cross-cutting design points](#9-cross-cutting-design-points)
+10. [Network topology](#10-network-topology)
 
 ---
 
-## 1. Prerequisites & Dependencies
+## 1. Prerequisites & shared machinery
 
-**Role:** `roles/dependencies/tasks/main.yml`
+### 1.1 System packages
 
-Before anything runs, the host machine needs a set of system packages. The `make install-deps` target invokes an Ansible playbook that detects the OS family (Debian/Ubuntu vs Fedora/RHEL) and installs the appropriate packages via `apt` or `dnf`:
+`make install-deps` invokes `playbooks/install-dependencies.yml` (role: `roles/dependencies`) which detects the OS family (Debian/Ubuntu vs Fedora/RHEL) and installs via `apt` or `dnf`:
 
 | Package | Purpose |
 |---------|---------|
-| `qemu-system-x86`, `qemu-utils`, `ovmf` | KVM virtualization — runs both the BCM and Kairos VMs |
-| `docker.io` / `docker` | Required by Earthly to build the CanvOS container and Kairos ISO |
-| `sshpass` | Non-interactive SSH authentication to the BCM VM using a password |
-| `xorriso` | ISO remastering — rebuilds the BCM ISO with injected auto-install scripts |
-| `p7zip-full` / `p7zip` | Extracts the original BCM ISO contents for modification |
-| `lz4` | Fast compression of the 80GB Kairos raw disk image before upload |
-| `jq` | JSON processing during build steps |
-| `mtools`, `dosfstools` | Creates FAT32 images (config drives, cloud-init user-data) |
-| `cpio`, `gzip` | Unpacks and repacks the BCM installer rootfs (initramfs) |
-| `curl` | Downloads the BCM ISO from JFrog |
-| `nfs-common` / `nfs-utils` | NFS client support for Kairos nodes mounting BCM exports |
-| `gdisk` | Fixes GPT backup headers after raw disk imaging (`sgdisk -e`) |
-| `e2fsprogs` | Fixes ext4 metadata_csum feature flags for GRUB compatibility |
-| `socat` | Network utility for serial console and socket connections |
+| `qemu-system-x86`, `qemu-utils`, `ovmf` | KVM virtualization + **OVMF UEFI firmware** required for Kairos build |
+| `docker.io` / `docker` | Earthly uses Docker to build the CanvOS container and Kairos ISO |
+| `sshpass` | Non-interactive password auth to BCM (used by every role that SSHes to BCM) |
+| `xorriso` | ISO remastering (local-KVM bcm_prepare) |
+| `p7zip-full` / `p7zip` | Extract the original BCM ISO (local-KVM bcm_prepare) |
+| `lz4` | Fast compression of the 80 GB Kairos raw image before SCP to BCM |
+| `jq` | JSON parsing in build/validation scripts |
+| `mtools`, `dosfstools` | Create FAT32 images (CIDATA cloud-init, BCM config drive) |
+| `cpio`, `gzip` | Repack BCM initramfs (local-KVM bcm_prepare) |
+| `curl` | Download BCM ISO from JFrog (local-KVM bcm_prepare) |
+| `nfs-common` / `nfs-utils` | NFS mount support (kairos_build bakes this into image too) |
+| `gdisk` | `sgdisk -e` to fix GPT backup header after dd (install-kairos.sh) |
+| `e2fsprogs` | `tune2fs -O ^metadata_csum` for GRUB compatibility in kairos_build |
+| `socat` | Serial console / socket helper |
 
-The `make setup` target verifies these are all present without installing anything.
+`make setup` verifies these are present without installing. The `make setup` check also requires `inventory/group_vars/all.yml` to exist.
+
+### 1.2 Single source of truth for configuration
+
+`inventory/group_vars/all.yml` (gitignored) holds every site- and run-specific value; `inventory/group_vars/all.example.yml` is the committed template and documents each variable. All playbooks run against `hosts: localhost` (`inventory/hosts.yml`). Ansible does not connect to BCM directly — every BCM-side operation is a local shell task that opens its own `sshpass | ssh` connection.
+
+### 1.3 Per-run SSH config + jumphost ProxyCommand
+
+Three places build their own per-run SSH config file in `build/` or the repo root and route all traffic through it:
+
+- `roles/deploy_dd/templates/deploy-dd.sh.j2` → `build/.bcm-ssh-config` (stage 4)
+- `roles/validate/templates/validate.sh.j2` → `build/.bcm-ssh-config` (stage 6)
+- `playbooks/discover-bcm.yml` → `.discover-ssh-config` (top-level, cleaned up at end)
+
+The template is:
+
+```
+Host bcm-target
+    HostName {{ bcm_ssh_host }}
+    Port {{ bcm_ssh_port }}
+    User root
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+{% if bcm_ssh_proxy_jump %}
+    ProxyCommand ssh -i <expanded bcm_ssh_proxy_key> ... -W %h:%p <bcm_ssh_proxy_jump>
+{% endif %}
+```
+
+Every SSH/SCP call then takes the form `sshpass -p $BCM_PASSWORD ssh -F $SSH_CONFIG bcm-target …` (or `scp -O -F $SSH_CONFIG …`). The `-F` flag confines OpenSSH to *only* the per-run config — it does not read `~/.ssh/config`. Jumphost auth uses the key at `bcm_ssh_proxy_key` (which may start with `~` — the template pre-expands `~` via `lookup('env','HOME')` because OpenSSH doesn't always expand `~` inside `ProxyCommand`). BCM auth is still by password via `sshpass -p`.
+
+Any new code that needs to talk to BCM must reuse this pattern (`-F <config> bcm-target`) rather than shelling out with ad-hoc `-J` flags — otherwise it silently ignores the jumphost and breaks customer deploys.
 
 ---
 
-## 2. Stage 1 — BCM Prepare
+## 2. `make discover` — remote BCM discovery
 
-**Role:** `roles/bcm_prepare/tasks/main.yml`  
-**Produces:** `build/bcm-autoinstall.iso`, `build/.bcm-kernel`, `build/.bcm-rootfs-auto.cgz`, `build/.bcm-init.img`  
-**Duration:** ~2 minutes  
+**Playbook:** `playbooks/discover-bcm.yml`
+**Produces:** `bcm-discovery-<bcm-hostname>.yml` (gitignored) + inline TTY report
+**Duration:** ~10 seconds
 
-### What this stage does
+Not a pipeline stage — a precursor for remote-BCM deploys. Prompts interactively for BCM host/port/user/password and optional jumphost, writes a per-run SSH config (as above), then `ssh bcm-target bash -s <<REMOTE` to run a single remote script that collects:
 
-This stage takes the stock BCM 11.0 ISO (a standard interactive installer) and transforms it into a fully unattended auto-install ISO. The BCM installer normally requires a human to click through a GUI or text-mode wizard. We eliminate that by injecting a custom systemd service and shell script into the installer's initramfs (rootfs.cgz), so when the ISO boots, it configures networking, renders the cluster configuration, and runs `cm-master-install` without any interaction.
+- `dpkg -l cm-config` → BCM version
+- `hostname` → BCM hostname (used for the output filename)
+- `cmsh -c 'network; list'` → finds the "Internal" network, reads its base address and netmask bits to get the provisioning CIDR
+- Discovers which BCM interface holds an IP inside that CIDR by matching IP against interface, not by NIC name (customer BCMs use `ens*`/`enp*`, not `eth*`)
+- Default route → external interface + gateway, `/etc/resolv.conf` DNS, `cmsh partition base nameservers`
+- `systemctl is-active` for `cmd`, `dhcpd`, `named`, `nfs-server`
+- `cmsh category; list -f name` → existing categories (with whitespace trimmed; names can contain spaces like `"Partner Lab"`, so per-field `get` calls are used rather than parsing column-aligned `list` output)
+- `cmsh softwareimage; list -f name` → existing software images
+- `cmsh device; list` filtered to `PhysicalNode|HeadNode` rows → node name, MAC, IP, category, software image (one per-field `get` call per field to survive whitespace-containing category names)
+- Installed kernel version (`/cm/images/default-image/boot/vmlinuz-*`)
+- Free space on `/cm/shared`, `ip_forward` status
 
-### Step-by-step
+The output file is a commented-out YAML block that can be pasted directly into `all.yml`, with the safe defaults `bcm_manage_dns: false` and `bcm_manage_cluster_defaults: false` pre-set and the SSH transport (host/port/proxy_jump/proxy_key) preserved verbatim from the prompts.
 
-#### 2.1 Download the BCM ISO
+---
 
-The ISO is fetched from a JFrog Artifactory instance using a bearer token. The download is skipped if the file already exists in `dist/`. The ISO filename and JFrog coordinates are defined in `inventory/group_vars/all.yml`.
+## 3. Stage 1 — BCM Prepare *(local-KVM only)*
+
+**Role:** `roles/bcm_prepare/tasks/main.yml`
+**Produces:** `build/bcm-autoinstall.iso`, `build/.bcm-kernel`, `build/.bcm-rootfs-auto.cgz`, `build/.bcm-init.img`
+**Duration:** ~2 minutes
+**Mode:** local-KVM only. Skip entirely if you have a real BCM.
+
+Takes the stock BCM 11.0 installer ISO and turns it into an unattended auto-install ISO by injecting a systemd service into the installer's initramfs.
+
+### 3.1 Download the BCM ISO from JFrog
+
+Fetched with a bearer token to `dist/bcm-*.iso`; skipped if the file already exists:
 
 ```
-curl --fail --location --progress-bar \
-  -H "Authorization: Bearer <jfrog_token>" \
-  -o dist/bcm-11.0-ubuntu2404.iso \
+curl --fail -L -H "Authorization: Bearer $jfrog_token" \
+  -o dist/<iso_filename> \
   "https://<jfrog_instance>/artifactory/<jfrog_repo>/<iso_filename>"
 ```
 
-#### 2.2 Mount and extract the rootfs
+### 3.2 Extract kernel + rootfs
 
-The ISO is loop-mounted read-only. Two files are extracted:
-- `boot/kernel` — the Linux kernel used by the installer (saved as `build/.bcm-kernel`)
-- `boot/rootfs.cgz` — the compressed cpio initramfs containing the entire installer environment
+ISO is loop-mounted read-only. `boot/kernel` is saved as `build/.bcm-kernel`; `boot/rootfs.cgz` is extracted (`gunzip | cpio -iumd`) into a working directory.
 
-The rootfs is extracted into a temporary directory using `gunzip | cpio -iumd`. This gives us a full filesystem tree that we can modify.
+### 3.3 Inject the cluster-config Jinja template
 
-#### 2.3 Inject the build-config.xml template
+`roles/bcm_prepare/files/build-config.xml.tpl` is a ~4500-line template describing the whole BCM cluster config (networks, DHCP ranges, interface assignments, package lists, hostname, timezone). Copied into the rootfs at `/cm/build-config.xml.tpl`. Python `jinja2` + `pyyaml` are installed into the rootfs via chroot pip3 so the auto-install script can render the template at boot time against the runtime inventory values.
 
-The file `roles/bcm_prepare/files/build-config.xml.tpl` is a ~4500-line Jinja2 template that defines the entire BCM cluster configuration: network definitions, DHCP ranges, interface assignments, package lists, hostname, timezone, and more. This template is copied into the rootfs at `/cm/build-config.xml.tpl`.
+### 3.4 Inject `bcm-autoinstall.sh`
 
-Python's `jinja2` and `pyyaml` packages are installed into the rootfs (via chroot pip3 install) so the auto-install script can render this template at boot time.
+`roles/bcm_prepare/templates/bcm-autoinstall.sh.j2` is rendered with inventory values and placed at `/usr/local/bin/bcm-autoinstall.sh`. On BCM's first boot, this script:
 
-The default `build-config.xml` (already present in the rootfs) is also patched with the configured hostname and timezone as a fallback.
+1. Configures eth0 static IP (`$bcm_internal_ip/$bcm_internal_netmask`) and DHCPs eth1 for NAT egress.
+2. Renders `build-config.xml` from the template with `internalnet` = `$bcm_internal_cidr` and `externalnet` = 10.0.2.0/24 (QEMU user-mode).
+3. Waits for the BCM installer's HTTP server (polls `/var/www/htdocs/content/masterdisklayouts/master-one-big-partition.xml`, up to 120 s).
+4. Finds install media (`/dev/sr0`, `/dev/sr1`, or `findfs LABEL=BCMINSTALLERHEAD` as fallback).
+5. Runs `yes | perl ./cm-master-install --config /cm/build-config.xml --mountpath /mnt/cdrom --password <bcm_password>` — the real BCM installer.
+6. Post-install GRUB patching: activates LVM, locates the installed root partition, injects `net.ifnames=0 biosdevname=0` into `/etc/default/grub` and `grub.cfg` so the installed system uses stable NIC names (every subsequent role assumes eth0/eth1).
+7. `poweroff` — signals Ansible that Phase 1 is done.
 
-#### 2.4 Inject the auto-install script
+### 3.5 Systemd unit + service hookup
 
-The Ansible template `roles/bcm_prepare/templates/bcm-autoinstall.sh.j2` is rendered with variables from inventory and placed into the rootfs at `/usr/local/bin/bcm-autoinstall.sh`. This script is the core of the unattended install. At boot time, it:
+`roles/bcm_prepare/files/bcm-autoinstall.service` is copied into the rootfs. It `Conflicts=` the interactive (text + graphical) installers and getty services, runs as `Type=oneshot` with no timeout, and is symlinked into `multi-user.target.wants`. The interactive installers and getty units are disabled/masked so nothing else grabs the console.
 
-1. **Configures networking** — Sets eth0 to the static internal IP (e.g. `10.141.255.254/16`) and runs `dhclient eth1` for external NAT connectivity. Sets `/etc/resolv.conf` to the QEMU DNS forwarder.
+### 3.6 Repack + remaster
 
-2. **Renders build-config.xml** — Uses an embedded Python script to render the Jinja2 template with two network definitions:
-   - `internalnet`: 10.141.0.0/16 for provisioning (DHCP range .16–.254)
-   - `externalnet`: 10.0.2.0/24 for internet access via QEMU NAT
-
-3. **Waits for the installer environment** — Polls for `/var/www/htdocs/content/masterdisklayouts/master-one-big-partition.xml` to confirm the BCM installer's HTTP server is ready (up to 120 seconds).
-
-4. **Mounts the installation media** — Tries `/dev/sr0`, `/dev/sr1`, `/dev/cdrom`, `/dev/dvd` in order, falling back to `findfs LABEL=BCMINSTALLERHEAD` for the FAT config drive.
-
-5. **Runs cm-master-install** — Executes `perl ./cm-master-install --config /cm/build-config.xml --mountpath /mnt/cdrom --password <bcm_password>` piped through `yes` to auto-accept prompts. This is the actual BCM installation process — it partitions the disk, installs the OS, configures cluster management services, etc.
-
-6. **Post-install GRUB patching** — After installation completes, the script activates LVM volumes, finds the installed root partition, and injects `net.ifnames=0 biosdevname=0` into both `/etc/default/grub` and `grub.cfg`. This ensures the installed system uses predictable NIC names (eth0, eth1) instead of names like ens3 or enp0s3, which is critical because all subsequent scripts and configurations reference eth0/eth1.
-
-7. **Powers off** — The VM shuts down, signaling to the Ansible controller that Phase 1 is complete.
-
-#### 2.5 Inject the systemd service
-
-The file `roles/bcm_prepare/files/bcm-autoinstall.service` is a systemd unit that:
-- Depends on `bright-installer-configure.service` (the BCM installer's own initialization)
-- Conflicts with `bright-installer-text.service` and `bright-installer-graphical.service` (the interactive installers) and all getty services
-- Runs `bcm-autoinstall.sh` with `Type=oneshot` and infinite timeout
-
-This service is symlinked into `multi-user.target.wants`. The interactive installers and getty services are disabled/masked to prevent them from competing for the console.
-
-#### 2.6 Repack the rootfs
-
-The modified rootfs directory is repacked:
 ```
 find . | cpio -o -H newc | gzip --fast > build/.bcm-rootfs-auto.cgz
 ```
-The `--fast` flag trades compression ratio for speed, since this is a temporary artifact.
 
-#### 2.7 Remaster the ISO
+Original ISO is extracted with `7z`. Patched rootfs replaces the original. Both GRUB and isolinux configs are modified: timeout set to 0/1, default entry switched to text installer, kernel command line gets `net.ifnames=0 biosdevname=0 console=ttyS0,115200 console=tty0`. MBR first 432 bytes are kept as the hybrid MBR. `xorriso -as mkisofs` rebuilds with both BIOS (isolinux) and EFI (efi.img) boot support.
 
-The original ISO is extracted with `7z` into a working directory. The stock rootfs is replaced with the patched version. Both GRUB and isolinux configs are modified:
-- Timeout set to 0 (GRUB) or 1 (isolinux) for instant boot
-- Default entry set to the text installer
-- Kernel command line gets `net.ifnames=0 biosdevname=0 console=ttyS0,115200 console=tty0` appended (serial console output + stable NIC names)
-- The "Boot from hard drive" option is removed from isolinux
+### 3.7 Config drive
 
-The MBR is extracted from the original ISO (first 432 bytes) and used as the hybrid MBR for the new ISO. `xorriso` rebuilds the ISO with both BIOS (isolinux) and EFI (efi.img) boot support:
-
-```
-xorriso -as mkisofs \
-  -o build/bcm-autoinstall.iso \
-  -V "BCMINSTALLERHEAD" \
-  -isohybrid-mbr mbr.bin \
-  -b isolinux/isolinux.bin -no-emul-boot -boot-load-size 4 -boot-info-table \
-  -eltorito-alt-boot -e efi.img -no-emul-boot -isohybrid-gpt-basdat \
-  iso-work
-```
-
-#### 2.8 Create the config drive
-
-A 4MB FAT32 image labeled `BCMCONFIG` is created using `dd` + `mkfs.vfat`. The BCM password is written to it as `password.txt` using `mcopy`. This drive is attached to the VM as a secondary virtio disk so the auto-install script can read the password without it being baked into the ISO.
+A 4 MB FAT32 image labeled `BCMCONFIG` with `password.txt` is created via `dd` + `mkfs.vfat` + `mcopy`. Attached to the VM as a secondary virtio disk so the password isn't baked into the ISO.
 
 ---
 
-## 3. Stage 2 — BCM VM
+## 4. Stage 2 — BCM VM *(local-KVM only)*
 
-**Role:** `roles/bcm_vm/tasks/main.yml`  
-**Produces:** `build/bcm-headnode.qcow2` (persistent disk), running BCM VM  
-**Duration:** 60–90 minutes  
+**Role:** `roles/bcm_vm/tasks/main.yml`
+**Produces:** `build/bcm-headnode.qcow2` + a running BCM VM
+**Duration:** 60–90 minutes
+**Mode:** local-KVM only.
 
-### What this stage does
+Two-phase QEMU install: boot from the remastered ISO, wait for auto-install + poweroff, then relaunch booting from the installed disk and wait for BCM services to come up.
 
-This stage boots the remastered ISO in a QEMU/KVM virtual machine, waits for the unattended install to complete, then reboots the VM from the installed disk and waits for all BCM services to come online. It is a two-phase process because BCM's `cm-master-install` writes to disk and then the system must be rebooted to run from the installed OS.
+### 4.1 Display detection
 
-### Phase 1 — Install from ISO
+Tests for `$DISPLAY`/`$WAYLAND_DISPLAY` + `xdpyinfo`/`xset`. Chooses `-display gtk` if a display server is reachable, otherwise `-display none`. Lets the pipeline run both on a desktop and over SSH.
 
-#### 3.1 Display detection
+### 4.2 Phase 1 — ISO install
 
-The playbook checks whether a graphical display is available by testing for `$DISPLAY` or `$WAYLAND_DISPLAY` environment variables, then verifying via `xdpyinfo` or `xset`. If a display server is reachable, QEMU uses `-display gtk` (shows a window); otherwise `-display none` (headless). This allows the pipeline to run in both desktop and SSH-only environments.
-
-#### 3.2 Create the disk and launch QEMU
-
-A qcow2 disk is created (default 100GB). QEMU is launched with direct kernel boot — instead of booting from the ISO's bootloader, we pass the extracted kernel and initramfs directly:
+qcow2 disk is created (default 100 GB). QEMU is launched with **direct kernel boot** (not the ISO bootloader):
 
 ```
 qemu-system-x86_64 \
-  -enable-kvm -m 8192 -smp 4 -cpu host \
+  -enable-kvm -m $bcm_vm_ram -smp $bcm_vm_cpus -cpu host \
   -drive file=build/bcm-headnode.qcow2,format=qcow2,if=virtio \
   -drive format=raw,media=cdrom,readonly=on,file=build/bcm-autoinstall.iso \
   -drive file=build/.bcm-init.img,format=raw,if=virtio \
   -kernel build/.bcm-kernel \
   -initrd build/.bcm-rootfs-auto.cgz \
-  -append "dvdinstall nokeymap root=/dev/ram0 rw ramdisk_size=1000000 ... net.ifnames=0 biosdevname=0 console=ttyS0,115200" \
+  -append "dvdinstall nokeymap root=/dev/ram0 rw ramdisk_size=1000000 … net.ifnames=0 biosdevname=0 console=ttyS0,115200" \
   -netdev socket,id=intnet,listen=:31337 \
   -device virtio-net-pci,netdev=intnet,mac=BC:24:11:7F:33:7C \
-  -netdev user,id=extnet,hostfwd=tcp::10022-:22,hostfwd=tcp::10443-:443 \
+  -netdev user,id=extnet,hostfwd=tcp::${bcm_ssh_port}-:22,hostfwd=tcp::${bcm_https_port}-:443 \
   -device virtio-net-pci,netdev=extnet,mac=BC:24:11:ED:21:50 \
-  -serial file:logs/bcm-serial.log \
-  -pidfile build/.bcm-qemu.pid \
-  -daemonize -boot d
+  -serial file:logs/bcm-serial.log -pidfile build/.bcm-qemu.pid -daemonize -boot d
 ```
 
 Key points:
-- **Direct kernel boot** (`-kernel` + `-initrd` + `-append`): Bypasses the ISO bootloader entirely, which is more reliable and faster. The `dvdinstall` parameter tells the BCM installer to look for packages on the CD-ROM.
-- **Two NICs**: eth0 on the socket network (`:31337` — BCM listens, compute nodes connect), eth1 on user-mode NAT with port forwards.
-- **Config drive**: Attached as the third virtio disk so the auto-install script can read the password.
-- **Serial logging**: All console output goes to `logs/bcm-serial.log` for debugging.
-- **Daemonize**: QEMU runs in the background; Ansible polls the PID.
+- Direct `-kernel`/`-initrd`/`-append` — bypasses the ISO bootloader; `dvdinstall` tells the installer to look on CD-ROM.
+- eth0 on a QEMU **socket network** listening on `:31337` (compute VM will `connect=:31337`); eth1 on user-mode NAT with host port-forwards for SSH + HTTPS.
+- Config drive is the third virtio disk.
+- Serial to `logs/bcm-serial.log` for tailing (`make bcm-serial`).
 
-#### 3.3 Wait for install completion
+Ansible polls the PID every 15 s for up to 90 minutes; when `bcm-autoinstall.sh` calls `poweroff`, the process exits and install is complete.
 
-Ansible polls the QEMU PID every 15 seconds for up to 90 minutes. When the auto-install script calls `poweroff`, the QEMU process exits, and Ansible detects this by checking `kill -0 $PID`. If the PID disappears, the install is complete.
+### 4.3 Phase 2 — Boot from disk
 
-### Phase 2 — Boot from installed disk
+Lingering QEMU killed (`kill` by PID file + pgrep by VM name). New QEMU launched with almost the same args but no `-kernel`/`-initrd`/`-append`, no ISO, no config drive, `-boot c`.
 
-#### 3.4 Launch from disk
+Ansible then sequentially waits for:
 
-Any lingering QEMU process is killed. A fresh QEMU instance is launched with almost the same parameters, but:
-- No `-kernel`, `-initrd`, or `-append` — the VM boots from the qcow2 disk's installed bootloader
-- `-boot c` instead of `-boot d` — boot from disk, not CD-ROM
-- No ISO or config drive attached
+1. SSH on host:$bcm_ssh_port (polled every 5 s for up to 5 min).
+2. `cmfirstboot` service finishes (polls `systemctl is-active cmfirstboot`, up to 10 min; BCM's first-boot service generates certificates, starts services, provisions the default software image).
+3. A "clean shell" — send `echo CLEAN`, verify output is exactly `CLEAN`. BCM's MOTD prints `cmfirstboot is still in progress` during init; we filter it out but also need stable stdout.
+4. `cmd` active + `cmsh -c 'device; list'` exits 0 (5 s poll, 5 min timeout).
 
-#### 3.5 Wait for SSH
-
-Ansible polls `sshpass -p <password> ssh -p 10022 root@localhost "echo ok"` every 5 seconds for up to 5 minutes. The port forward (host 10022 → guest 22) was set up in the QEMU command line.
-
-#### 3.6 Wait for cmfirstboot
-
-On first boot after installation, BCM runs `cmfirstboot` — a lengthy systemd service that finalizes cluster configuration, generates certificates, starts services, and provisions the default software image. Ansible polls `systemctl is-active cmfirstboot` via SSH. While it returns `active` or `activating`, we keep waiting (up to 10 minutes with 10-second intervals).
-
-After cmfirstboot settles, Ansible also waits for a "clean shell" — the BCM MOTD can be noisy during initialization, so we send `echo CLEAN` and verify the output is exactly `CLEAN` to confirm the SSH session is stable.
-
-#### 3.7 Wait for BCM services (cmd + cmsh)
-
-The two critical BCM services are:
-- **cmd** — the Bright Cluster Manager daemon (the core management service)
-- **cmsh** — the cluster management shell (the CLI tool that talks to cmd)
-
-Ansible polls both every 5 seconds for up to 5 minutes:
-- `systemctl is-active cmd` must return `active`
-- `cmsh -c 'device; list'` must succeed (exit code 0)
-
-Only when both are ready does the stage complete. At this point, BCM is fully operational: DHCP, DNS, NFS, PXE, and cluster management are all running.
+At the end, BCM is fully operational: DHCP, DNS, NFS, PXE, cluster management all up.
 
 ---
 
-## 4. Stage 3 — Kairos Build
+## 5. Stage 3 — Kairos Build
 
-**Role:** `roles/kairos_build/tasks/main.yml`  
-**Produces:** `build/palette-edge-installer.iso`, `build/kairos-disk.raw`, `build/kairos-disk.raw.sha256`  
-**Duration:** ~10 minutes  
-**Note:** This stage can run in parallel with Stage 2 (bcm-vm) since it has no dependency on BCM being online.
+**Role:** `roles/kairos_build/tasks/main.yml`
+**Produces:** `build/palette-edge-installer.iso`, `build/kairos-disk.raw`, `build/kairos-disk.raw.sha256`, `build/bcm-kairos-key{,.pub}`
+**Duration:** ~30 minutes (10–15 min CanvOS build + ~15 min OVMF kairos-agent install)
+**Mode:** both (runs in parallel with stage 2 in local-KVM mode — no dependency on BCM being up)
 
-### What this stage does
+Builds a Kairos edge OS image with CanvOS (Spectro Cloud's Earthly-based builder), then uses a local QEMU VM under **OVMF (UEFI)** to run `kairos-agent install` onto a blank raw disk. The resulting raw disk is a fully-installed Kairos system with GRUB-EFI in its ESP, ready to be `dd`'d onto a target node's OS disk.
 
-This stage builds a Kairos edge OS image using Spectro Cloud's CanvOS build system, then converts the ISO into a raw disk image that can be written directly to a compute node's disk via `dd`. The raw disk approach is used instead of PXE-booting the ISO because it produces a fully installed system in one step, with all partitions, bootloader, and configuration pre-baked.
+### 5.1 Clone CanvOS
 
-### Step-by-step
+If `CanvOS/` doesn't exist, clone `https://github.com/spectrocloud/CanvOS.git`. The directory is gitignored — `make clean-canvos` removes it to force a fresh clone.
 
-#### 4.1 Clone CanvOS
+### 5.2 Generate the `.arg` file
 
-If the `CanvOS/` directory doesn't exist, the Spectro Cloud CanvOS repository is cloned from GitHub. This repository contains the Earthly-based build system for creating Kairos-based edge OS images.
+`files/canvos/.arg.template` is a Jinja2 template rendered to `CanvOS/.arg`:
 
-#### 4.2 Generate the .arg file
+| Variable | Value |
+|----------|-------|
+| `CUSTOM_TAG` | `bcm-test` |
+| `IMAGE_REGISTRY` | `$kairos_container_registry` (default `ttl.sh` — temporary registry) |
+| `OS_DISTRIBUTION` / `OS_VERSION` | `ubuntu` / `22.04` |
+| `K8S_DISTRIBUTION` | `k3s` |
+| `ISO_NAME` | `palette-edge-installer` |
+| `ARCH` | `amd64` |
 
-The file `files/canvos/.arg.template` is a Jinja2 template that produces the `.arg` file CanvOS needs. It sets:
-- `CUSTOM_TAG`: `bcm-test`
-- `IMAGE_REGISTRY`: `ttl.sh` (a temporary container registry)
-- `OS_DISTRIBUTION`: `ubuntu`, `OS_VERSION`: `22.04`
-- `K8S_DISTRIBUTION`: `k3s`
-- `ISO_NAME`: `palette-edge-installer`
-- `ARCH`: `amd64`
+### 5.3 Copy the overlay
 
-#### 4.3 Copy overlay files
+`files/canvos/overlay/` is copied onto `CanvOS/overlay/`. Three BCM-integration scripts are baked into the image at build time:
 
-The `files/canvos/overlay/` directory is copied into `CanvOS/overlay/`. These are files that get baked into the Kairos image:
-- `etc/network/interfaces.d/ifcfg-eth0` — DHCP configuration for eth0
-- `etc/systemd/system/bcm-compat-fixes.service` — Runs BCM compatibility fixes on every boot
-- `usr/bin/bcm-compat-fixes.sh` — Ensures hostname matches `/etc/hostname`, fixes `systemd-resolved` hook (changes `return` to `exit 0`), fixes dead `resolv.conf` symlinks
-- `etc/systemd/system/stylus-agent.service.d/bcm-sync.conf` — Drop-in that runs `bcm-sync-userdata.sh` before stylus-agent starts
-- `usr/bin/bcm-sync-userdata.sh` — Detects Palette registration mode, seeds userdata from `/oem/99_userdata.yaml`, syncs hostname to Palette edge site name
+| Script | What it does |
+|--------|--------------|
+| `usr/bin/bcm-compat-fixes.sh` | On every boot — ensures hostname matches `/etc/hostname`, patches systemd-resolved's Kairos init hook (`return` → `exit 0`) so the hook doesn't abort, repairs dead `resolv.conf` symlinks. |
+| `usr/bin/bcm-sync-userdata.sh` | Before stylus-agent — detects Palette registration mode, seeds userdata from `/oem/99_userdata.yaml`, syncs hostname into Palette edge-site name. |
+| `usr/bin/palette-cleanup-stale.sh` | Before stylus-agent — the **Palette pre-registration hook**. See §9.3 for full behavior. Gates on registration mode, deletes any stale edge-host record whose UID collides with our SMBIOS-UUID-derived `edge-<uuid>`, and auto-mints a fresh `edgeHostToken` via the admin API if `palette_token` wasn't baked in. Fail-open on every error path — never blocks stylus-agent startup. |
 
-#### 4.4 Patch the Earthfile and Dockerfile
+All three are marked executable; failure to chmod is ignored (the Dockerfile patch below does it again inside the image layer).
 
-Two patches are applied to the CanvOS build configuration:
+### 5.4 Patch Earthfile and Dockerfile
 
-1. **Earthfile**: The `apt-get install` line is modified to add `wget`, `ifupdown`, and `nfs-common` — packages needed for BCM integration (ifupdown for `/etc/network/interfaces` support, nfs-common for mounting BCM NFS exports). A dracut config is also added to skip the `nfit` module (avoids build failures on systems without NVDIMM support).
+- **Earthfile** — `apt-get install --no-install-recommends kbd` is replaced with `… wget ifupdown nfs-common kbd` so the image has the BCM-integration tools. A dracut conf is added that sets `omit_dracutmodules+=" nfit "` to avoid dracut build failures on hosts without NVDIMM support.
+- **Dockerfile** — inserted `COPY` + `RUN chmod +x` for the three overlay scripts so they end up at `/usr/bin/` in the image with executable bits.
 
-2. **Dockerfile**: Lines are added to copy `bcm-compat-fixes.sh` and `bcm-sync-userdata.sh` into the image and make them executable.
-
-#### 4.5 Run the CanvOS build
+### 5.5 Run the CanvOS build
 
 ```
 cd CanvOS && ./earthly.sh +iso --ARCH=amd64
 ```
 
-This runs Earthly (a CI/CD tool similar to Dockerfile + Makefile) which:
-- Builds a container image based on Ubuntu 22.04 with Kairos framework, k3s, and the Palette stylus agent
-- Pushes the container image to `ttl.sh` (temporary registry)
-- Generates a bootable ISO from the container image
+Earthly builds a container image based on Ubuntu 22.04 with the Kairos framework, k3s, and Palette stylus agent; pushes it to `ttl.sh`; then generates a bootable ISO. Result is copied to `build/palette-edge-installer.iso`. 10–15 minutes depending on Docker cache state + network.
 
-The resulting ISO is copied to `build/palette-edge-installer.iso`. This step can take 5–10 minutes depending on network speed and Docker cache state.
+### 5.6 SSH key pair for BCM integration
 
-#### 4.6 Generate an SSH key pair
+`ssh-keygen -t ed25519 -f build/bcm-kairos-key -N "" -C "kairos-node@bcm"`. The private key is baked into the Kairos cloud-config (for the on-node BCM integration scripts); the public key is pushed to BCM's `authorized_keys` during stage 4 deploy-dd.
 
-An ed25519 SSH key pair is generated (`build/bcm-kairos-key` + `.pub`). This key is used for authenticated communication between the Kairos compute node and the BCM head node — the private key is baked into the Kairos cloud-config, and the public key is added to BCM's `authorized_keys` during deployment.
+### 5.7 Render cloud-config.yaml
 
-#### 4.7 Render the cloud-config
+`roles/kairos_build/templates/cloud-config.yaml.j2` → `build/cloud-config.yaml`. Key sections:
 
-The template `roles/kairos_build/templates/cloud-config.yaml.j2` is rendered to `build/cloud-config.yaml`. This is a Kairos cloud-config that controls the node's behavior at install time and on every subsequent boot. Key sections:
+- **`install:`** — `auto: true`, `poweroff: true`. The in-VM kairos-agent installs and powers off without user interaction.
+- **`stylus.site:`** — `paletteEndpoint`, optional `edgeHostToken` (if `palette_token` is set), one of `projectName`/`projectUid`, optional `caCerts:` block (PEM from `palette_ca_cert`), tags marking this as a Palette control-plane node.
+- **`stylus.installationMode` + `.managementMode`** — from `palette_installation_mode` + `palette_management_mode`.
+- **`users:`** — creates a `kairos` user with `sudo ALL NOPASSWD` and `lock_passwd: false`.
+- **`stages.initramfs:`** — if `palette_api_key` + `palette_project_uid` are set, writes `/oem/palette-admin.env` (mode 0600) with `APIKEY=`, `PROJECTUID=`, `ENDPOINT=`. This is what `palette-cleanup-stale.sh` reads.
+- **`stages.boot:`** — every boot:
+  1. Set the `kairos` user password to `kairos` (POC convenience; swap for a real secret in production).
+  2. Write `/etc/ssh/sshd_config.d/99-kairos-test.conf` with `PasswordAuthentication yes` + `PermitRootLogin yes`; restart sshd; disable fail2ban.
+  3. Install the BCM SSH key to `/var/lib/bcm/bcm-key` (0600).
+  4. **BCM integration** (conditional on `bcm_ssh_key_content` being set):
+     - Wait up to 5 min for network + ping to `$bcm_internal_ip`.
+     - Query BCM via `cmsh device list | grep $MAC` to find this node's registered name; set hostname to match; write `/oem/91_palette_name.yaml` so the Palette dashboard matches.
+     - Fetch BCM's root public key and append to `/root/.ssh/authorized_keys` (enables BCM → Kairos SSH).
+     - Set the node's `installmode` to `NOSYNC` in cmsh so BCM doesn't try to re-image the freshly-installed Kairos node on next PXE.
+     - NFS-mount `/cm/images/default-image` read-only at `/var/lib/cm/rootfs`. Copy `/cm/local/apps/cmd/etc` out into `/var/lib/cm/cmd-etc`, rewrite `Master = master` → `Master = $bcm_internal_ip`, SCP the per-node cert + key from BCM.
+     - `unshare --mount --fork` a child that bind-mounts cmd-etc + proc + sys + tmpfs, and `chroot` into the NFS image to run `/cm/local/apps/cmd/sbin/cmd -s -n` — BCM's cluster daemon, in a chroot of the BCM default image, so the Kairos node reports back into cmsh as a managed compute node.
 
-- **Install directives**: `auto: true` and `poweroff: true` — the Kairos agent will install automatically and power off when done.
-- **Stylus (Palette agent) configuration**: Palette endpoint URL, edge host token, and project UID for cluster registration.
-- **User setup**: Creates a `kairos` user with sudo access and password authentication enabled.
-- **Boot stages** (run on every boot):
-  1. Sets the kairos user password
-  2. Enables SSH password auth and disables fail2ban
-  3. Installs the BCM SSH private key to `/var/lib/bcm/bcm-key`
-  4. Runs BCM integration logic:
-     - Waits for network connectivity to the BCM head node (up to 5 minutes, pinging `10.141.255.254`)
-     - Queries BCM's cmsh for the node's registered name based on its MAC address
-     - Sets the hostname to match BCM's node name
-     - Writes a Palette site name config (`/oem/91_palette_name.yaml`) so the Palette dashboard shows the BCM node name
-     - Retrieves BCM's root SSH public key and adds it to `authorized_keys` (enables BCM to SSH into the compute node)
-     - Sets the node's install mode to `NOSYNC` in BCM (prevents BCM from trying to re-image the node)
-     - Mounts the BCM default-image via NFS
-     - Copies the cmd daemon config and node certificates
-     - Launches the BCM `cmd` daemon in a chroot of the mounted NFS image (this makes the Kairos node report back to BCM as a managed compute node)
+### 5.8 CIDATA user-data image
 
-#### 4.8 Create the user-data image
+4 MB FAT32 labeled `CIDATA` containing `cloud-config.yaml` copied in as `user-data`:
 
-A 4MB FAT32 image labeled `CIDATA` is created and the cloud-config is copied into it as `user-data`. This image is attached as a secondary drive when QEMU runs the Kairos installer.
+```
+dd if=/dev/zero of=build/userdata.img bs=1M count=4
+mkfs.vfat -n CIDATA build/userdata.img
+mcopy -i build/userdata.img build/cloud-config.yaml ::user-data
+```
 
-#### 4.9 Run kairos-agent install in QEMU
+### 5.9 Run `kairos-agent install` under **OVMF (UEFI)**
 
-A blank 80GB raw disk is created with `truncate -s 81920M`. QEMU is launched headless with SeaBIOS (the default QEMU BIOS, not UEFI):
+A blank 80 GB raw disk is created with `truncate -s 81920M`. QEMU is launched headless with **OVMF firmware loaded as a pflash pair** (read-only `OVMF_CODE_4M.fd`, RW copy of `OVMF_VARS_4M.fd`):
 
 ```
 qemu-system-x86_64 \
-  -enable-kvm -m 4096 -smp 2 -cpu host -display none \
+  -enable-kvm -m 4096 -smp 2 -cpu host -machine q35 \
+  -drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE \
+  -drive if=pflash,format=raw,file=build/ovmf-vars.fd \
+  -display none \
+  -chardev socket,id=ser0,path=build/.qemu-install.sock,server=on,wait=off \
+  -serial chardev:ser0 \
   -drive if=virtio,format=raw,media=disk,file=build/kairos-disk.raw \
   -drive if=virtio,format=raw,readonly=on,file=build/userdata.img \
   -drive format=raw,media=cdrom,readonly=on,file=build/palette-edge-installer.iso \
-  -boot d -daemonize
+  -boot d -pidfile build/.qemu-install.pid -daemonize
 ```
 
-**Why SeaBIOS?** Kairos-agent detects the firmware type and installs the appropriate bootloader. With SeaBIOS, it installs GRUB-pc (BIOS MBR bootloader), which makes the raw image bootable on both BIOS and EFI systems. Using OVMF (UEFI) would produce an EFI-only image.
+**Why OVMF / UEFI (not SeaBIOS).** kairos-agent autodetects the firmware type and installs the matching bootloader. Under OVMF it installs **GRUB-EFI into a real ESP** with `\EFI\BOOT\bootx64.efi`. Physical Dell / HPE / Supermicro servers that ship with UEFI firmware need this; a SeaBIOS-built image would produce a GRUB-pc MBR bootloader that won't boot on a modern UEFI-only server. BIOS-only platforms would need a separately-built image.
 
-After QEMU boots, commands are sent via the serial console socket using `nc`:
-1. Mount the user-data drive and copy the cloud-config to `/oem/90_custom.yaml` and `/tmp/99_bcm.yaml`
-2. Run `kairos-agent --debug install` which partitions the raw disk, installs the OS, and configures the bootloader
-3. Copy the BCM cloud-config to the OEM partition (`/oem/99_bcm.yaml`)
-4. Power off
+After QEMU boots, a background `nc -U <sock>` feeds commands into the serial console:
 
-The host waits for the QEMU PID to disappear (up to 60 minutes).
+```
+mount /dev/vdb /mnt 2>/dev/null && cp /mnt/user-data /oem/90_custom.yaml && cp /mnt/user-data /tmp/99_bcm.yaml
+kairos-agent --debug install 2>&1; mount /dev/vda2 /oem; cp /tmp/99_bcm.yaml /oem/99_bcm.yaml; poweroff
+```
 
-#### 4.10 Fix ext4 metadata_csum
+Host polls the QEMU PID every 10 s (up to 60 min) for exit.
 
-After the QEMU install completes, the raw disk's ext4 partitions are loop-mounted and the `metadata_csum` feature is removed using `tune2fs -O ^metadata_csum`. This is a GRUB compatibility fix — older GRUB versions cannot read ext4 filesystems with this feature enabled, which would cause boot failures.
+### 5.10 Post-install raw-disk patching
 
-#### 4.11 Patch bootargs and network config
+kairos-agent writes the image but a few things need fixing before this disk can be `dd`'d onto different hardware:
 
-The raw disk contains multiple squashfs-like images inside partitions (active, passive, recovery). Each one is loop-mounted and patched:
-- `etc/cos/bootargs.cfg`: `net.ifnames=1` is changed to `net.ifnames=0 biosdevname=0` for stable NIC naming
-- `etc/network/interfaces.d/ifcfg-eth0` is created if missing (DHCP on eth0)
+1. **Fix ext4 metadata_csum** — loop-mount partitions 2–5, `e2fsck -fy` + `tune2fs -O ^metadata_csum`. Older GRUB versions in some BCM-installer initrds can't read ext4 with this feature on.
+2. **Patch squashfs-like images for stable NIC naming** — `cOS/active.img`, `cOS/passive.img`, and `cOS/recovery.img` are loop-mounted in turn. Inside each:
+   - `etc/cos/bootargs.cfg`: `net.ifnames=1` → `net.ifnames=0 biosdevname=0`.
+   - `etc/network/interfaces.d/ifcfg-eth0` is created (`auto eth0 / iface eth0 inet dhcp`) if missing.
+   This guarantees every Kairos boot mode (active / passive / recovery) uses `eth0`.
+3. **GRUB timeout** — patch `grub2/grub.cfg` and `grub/grub.cfg` on the BIOS boot partition to `set timeout=5` so unattended boots don't stall at the menu.
+4. **Sparse trim** — `fallocate --dig-holes build/kairos-disk.raw` converts zero-filled regions into holes (80 GB file shrinks to 3–5 GB of real bytes on disk).
+5. **Checksum** — `sha256sum kairos-disk.raw > kairos-disk.raw.sha256`.
 
-This ensures every boot mode (active, passive, recovery) uses `eth0` instead of unpredictable interface names.
-
-#### 4.12 Set GRUB timeout
-
-The GRUB config on the raw disk is patched to set `timeout=5` (5 seconds). This prevents the GRUB menu from waiting indefinitely for user input during unattended boots.
-
-#### 4.13 Trim and checksum
-
-`fallocate --dig-holes` converts zero-filled regions of the raw file into sparse holes, dramatically reducing actual disk usage (the 80GB file may only use 3–5GB of real space). A SHA256 checksum is generated for integrity verification.
+At the end, `build/` ownership is restored to the invoking user (ansible.cfg has `become=true` globally).
 
 ---
 
-## 5. Stage 4 — Deploy DD
+## 6. Stage 4 — Deploy DD
 
-**Role:** `roles/deploy_dd/tasks/main.yml`  
-**Templates:** `deploy-dd.sh.j2`, `install-kairos.sh.j2`  
-**Duration:** ~3 minutes  
+**Role:** `roles/deploy_dd/tasks/main.yml`
+**Templates:** `deploy-dd.sh.j2`, `install-kairos.sh.j2`
+**Produces:** on BCM: populated `kairos-installer` software image, `kairos` category, target device in FULL install mode, `/cm/shared/kairos/disk.raw.lz4`, `kairos-http.service`, DHCP/NFS/rsyncd config, NAT rule. Locally: `build/deploy-dd.sh`, `build/install-kairos.sh`, `build/.bcm-ssh-config`
+**Duration:** ~3–5 minutes
+**Mode:** both. This is the stage where remote-BCM and local-KVM diverge in policy (safety flags) but share the same template.
 
-### What this stage does
+Rendered scripts do all the work. `deploy-dd.sh` runs on the build host and SSHes to BCM through the per-run config (§1.3). `install-kairos.sh` is SCP'd into the kairos-installer software image and runs later on the compute node during PXE boot.
 
-This stage uploads the Kairos raw disk image to the BCM head node, configures BCM to provision compute nodes with a custom installer image that writes Kairos to disk via `dd`, and sets up all the supporting infrastructure (HTTP server, PXE boot, node registration, NFS exports, DHCP, rsyncd).
+### 6.1 BCM readiness gate
 
-### Step-by-step
+Verify SSH works. Wait for `cmfirstboot` not to be `active` or `activating`. Wait for a clean shell (`echo CLEAN`). Wait for `cmd` + `cmsh` to be responsive (5 min timeout).
 
-All operations are performed by `deploy-dd.sh`, which runs on the host and executes commands on BCM via SSH (`sshpass -p <password> ssh -p 10022 root@localhost`).
-
-#### 5.1 Wait for BCM readiness
-
-The script verifies SSH connectivity, then waits for:
-- `cmfirstboot` to finish (polls `systemctl is-active cmfirstboot`)
-- A clean shell (sends `echo CLEAN`, verifies output)
-- cmd service active and cmsh responsive (polls every 5s, 5-minute timeout)
-
-#### 5.2 Configure DNS forwarders
-
-Sets the BCM cluster's nameserver to the QEMU DNS forwarder (`10.0.2.3`) via cmsh, then restarts the `named` service. This allows compute nodes to resolve external DNS names through the BCM head node.
+### 6.2 DNS forwarders *(gated by `bcm_manage_dns`)*
 
 ```
-echo -e 'partition\nuse base\nset nameservers 10.0.2.3\ncommit' | cmsh
+{% if bcm_manage_dns | default(true) %}
+echo -e 'partition\nuse base\nset nameservers $bcm_external_dns\ncommit' | cmsh
 systemctl restart named
+{% else %}
+info "Skipping DNS management — leaving site's existing resolver untouched"
+{% endif %}
 ```
 
-#### 5.3 Enable IP forwarding and NAT
+**Default `true` historically, but remote-BCM deploys must set `bcm_manage_dns: false`** (discover-bcm.yml writes this as the suggested default). Rewriting the cluster nameservers on a customer BCM would break every non-kairos node on the site.
 
-Compute nodes are on the internal network (10.141.0.0/16) with no direct internet access. BCM acts as their gateway:
+### 6.3 IP forwarding + MASQUERADE NAT
+
+Enabled unconditionally (harmless on a customer BCM that already has NAT configured):
 
 ```
 echo 1 > /proc/sys/net/ipv4/ip_forward
 sysctl -w net.ipv4.ip_forward=1
-iptables -t nat -A POSTROUTING -o eth1 -j MASQUERADE
+# persist in /etc/sysctl.conf
+EXT_IF=$(ip route | awk '/^default/ {print $5; exit}')
+iptables -t nat -C POSTROUTING -o $EXT_IF -j MASQUERADE \
+  || iptables -t nat -A POSTROUTING -o $EXT_IF -j MASQUERADE
 ```
 
-This persists the sysctl setting and adds an iptables MASQUERADE rule so traffic from the internal network is NAT'd through eth1 to the QEMU user-mode NAT, which provides internet access.
+Interface name is derived from the default route — works whether BCM's external NIC is `eth1` (local-KVM) or `ens192` / `enp3s0` (customer hardware).
 
-#### 5.4 SSH key exchange
+### 6.4 SSH key exchange
 
-The ed25519 key pair generated during Stage 3 is distributed:
-- The public key is added to BCM's `/root/.ssh/authorized_keys`
-- The private key was already baked into the Kairos cloud-config
+`build/bcm-kairos-key.pub` (generated in stage 3) is appended to `/root/.ssh/authorized_keys` on BCM if not already present. Private key is already baked into `/var/lib/bcm/bcm-key` inside the Kairos image. Closes the passwordless loop needed by the cloud-config's BCM-integration boot stage.
 
-This enables passwordless SSH from Kairos nodes to BCM for cmd integration.
+### 6.5 NFS exports
 
-#### 5.5 Configure NFS exports
+Appended to `/etc/exports` if not already present, scoped to `$bcm_internal_cidr`:
 
-Four NFS exports are added to BCM's `/etc/exports`:
-- `/cm/images/default-image` — BCM's default software image (Kairos nodes mount this to run the cmd daemon in a chroot)
-- `/cm/shared` — shared storage
-- `/cm/images/kairos-installer` — the installer image (used during PXE boot)
+```
+/cm/images/default-image   <cidr>(ro,no_subtree_check,no_root_squash,async)
+/cm/shared                 <cidr>(rw,no_subtree_check,no_root_squash,async)
+/cm/images/kairos-installer <cidr>(ro,no_subtree_check,no_root_squash,async)
+exportfs -ra
+```
 
-All exports use `no_subtree_check`, `no_root_squash`, and `async` for performance.
+### 6.6 DHCP authoritative + pool range
 
-#### 5.6 Fix DHCP configuration
+`sed 's/not authoritative/authoritative/'` on `/etc/dhcpd.conf`; rewrite the `range` line so the pool fits inside $bcm_internal_cidr (e.g. `.16` through `.250` when CIDR is /24). `systemctl restart dhcpd`.
 
-Two DHCP adjustments:
-1. Change `not authoritative` to `authoritative` in `/etc/dhcpd.conf` — this makes BCM the definitive DHCP server on the network, preventing delays when compute nodes request addresses.
-2. Adjust the DHCP pool range to exclude BCM's own IP. If BCM is at `10.141.255.254`, the pool end becomes `10.141.255.253`.
+### 6.7 rsyncd
 
-DHCP is restarted after these changes.
+`/etc/rsyncd.conf` is overwritten with read-only modules `kairos-installer` and `default-image` pointing at `/cm/images/*`. `systemctl enable --now rsync`.
 
-#### 5.7 Configure rsyncd
+### 6.8 Compress + upload (idempotent)
 
-An rsyncd configuration is written with two modules:
-- `[kairos-installer]` → `/cm/images/kairos-installer`
-- `[default-image]` → `/cm/images/default-image`
-
-The rsync service is enabled and restarted. This allows compute nodes to sync the installer image during PXE boot.
-
-#### 5.8 Compress and upload the raw image
-
-The 80GB raw disk image is compressed with lz4 (fast compression, suitable for streaming decompression):
 ```
 lz4 -f build/kairos-disk.raw build/kairos-disk.raw.lz4
 ```
 
-The compressed file is uploaded to BCM via SCP:
-```
-scp -P 10022 build/kairos-disk.raw.lz4 root@localhost:/cm/shared/kairos/disk.raw.lz4
-```
+Only re-compresses if `.lz4` is older than `.raw`. Then compares local vs remote file size (`stat -c %s /cm/shared/kairos/disk.raw.lz4`) — if they match and are non-zero, skips the SCP entirely. This makes re-runs of `make deploy-dd` through a slow jumphost fast.
 
-#### 5.9 Start the HTTP server
+### 6.9 HTTP server
 
-A systemd service (`kairos-http.service`) is created on BCM that runs a Python HTTP server on port 8888 serving `/cm/shared/kairos/`. This is how the compute node's installer will download the compressed raw image during the dd process. The script verifies the server is running by sending a HEAD request.
+Installs `kairos-http.service` on BCM — a Python `http.server` on port 8888 serving `/cm/shared/kairos/`. This is how the compute node's installer fetches the compressed image during PXE boot. `systemctl enable --now` and verify with a HEAD request.
 
-#### 5.10 Create the kairos-installer software image
+### 6.10 `kairos-installer` software image
 
-BCM manages compute nodes using "software images" — filesystem trees that are synced to nodes. The script clones BCM's `default-image` to create `kairos-installer`:
+Clone BCM's `default-image` to `kairos-installer`:
 
 ```
 cmsh -c "softwareimage; clone default-image kairos-installer; commit"
 ```
 
-It then waits (up to 120 seconds) for the image filesystem to appear at `/cm/images/kairos-installer/usr`.
+Wait up to 120 s for `/cm/images/kairos-installer/usr` to appear (BCM provisions this asynchronously). Ensure `lz4` is installed on BCM (`apt-get install -y lz4` if missing); copy it into the image at `/usr/local/bin/lz4`.
 
-#### 5.11 Install the dd service into the installer image
+### 6.11 Install `install-kairos.sh` + systemd unit
 
-This is the critical piece. The `install-kairos.sh` script (rendered from `install-kairos.sh.j2`) is placed into the kairos-installer image at `/usr/local/sbin/install-kairos.sh`. A systemd service (`kairos-install.service`) is created to run it on boot, after network is available, with a 10-second delay and 30-minute timeout.
+SCP `build/install-kairos.sh` (rendered from `install-kairos.sh.j2`) to `${IMAGE_ROOT}/usr/local/sbin/install-kairos.sh`. Create a systemd unit inside the image:
 
-The `lz4` binary is also copied into the image at `/usr/local/bin/lz4`.
+```
+[Unit]
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStartPre=/bin/bash -c 'sleep 10'
+ExecStart=/usr/local/sbin/install-kairos.sh
+TimeoutStartSec=1800
+```
 
-DHCP configuration for both `eth0` and `ens3` is added to the image's `/etc/network/interfaces` to handle both naming schemes.
+Enable it (`chroot $IMAGE_ROOT systemctl enable kairos-install.service` with a symlink fallback). Add DHCP stanzas for both `eth0` and `ens3` in the image's `/etc/network/interfaces` (covers both naming schemes on physical hardware).
 
-**What install-kairos.sh does** (this runs inside the compute node during PXE boot):
+**What install-kairos.sh does on the compute node** (rendered with `$bcm_internal_ip`, `$kairos_target_disk`, `$kairos_wipe_disks`):
 
-1. **Stage binaries to RAM** — Copies `bash`, `curl`, `lz4`, `dd`, `sync`, `sleep`, `sgdisk` and all their library dependencies to `/dev/shm/kinstall/`. This is critical because the dd operation will overwrite the filesystem these binaries live on — everything must be in RAM.
+1. **HTTP probe** — poll `HEAD http://$HEAD_IP:8888/disk.raw.lz4` every 10 s for up to 10 minutes. Abort if unreachable.
+2. **Stage binaries to RAM** (`/dev/shm/kinstall/`) — `bash curl lz4 dd sync sleep sgdisk wipefs dmsetup efibootmgr partprobe blkid` and all `ldd` dependencies. This is required because the dd will overwrite the filesystem these binaries currently live on.
+3. **Enable sysrq** — `echo 1 > /proc/sys/kernel/sysrq`.
+4. **Write a run-dd.sh with shebang `#!/dev/shm/kinstall/bash`**, then `exec` it — the parent process is replaced with a RAM-resident one. From here on nothing touches the target disk's filesystem.
+5. **Wipe sibling disks** — for every name in `$WIPE_DISKS`, `dmsetup remove_all; wipefs -a -f /dev/<name>`. Clears LVM PV / DRBD / old filesystem signatures so Kairos's persistent-partition logic doesn't see stale metadata.
+6. **Stream + dd** — `curl --fail -s $RAW_URL | lz4 -d - - | dd of=$DISK bs=4M oflag=direct`. `oflag=direct` bypasses the page cache (critical — without it an 80 GB write can drive an LVM thin pool into overflow on a tight-RAM server).
+7. **Fix GPT backup header** — `sgdisk -e $DISK; partprobe $DISK`. The raw image was created on an 80 GB disk; the target disk is usually larger, so GPT's backup header ends up at the wrong offset. `sgdisk -e` moves it to the correct location.
+8. **Create a UEFI boot entry** (new — guards physical UEFI deploys):
+   ```
+   if [ -d /sys/firmware/efi/efivars ] && [ -x efibootmgr ]; then
+       # delete any existing 'Kairos' entries so re-installs don't stack
+       for n in $(efibootmgr | grep 'Kairos$' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//'); do
+           efibootmgr -b $n -B
+       done
+       efibootmgr --create --disk $DISK --part 1 --label Kairos --loader '\EFI\BOOT\bootx64.efi'
+       # move new entry to front of BootOrder
+   fi
+   ```
+   Without this, physical UEFI firmware keeps booting stale `BootXXXX` entries tied to the *previous* install's GPT UUIDs and never discovers the freshly-dd'd Kairos bootloader. Guarded by presence of `efivars` so it's a no-op on legacy BIOS.
+9. **Drop page cache + sync** — `echo 3 > /proc/sys/vm/drop_caches; sync`.
+10. **SysRq poweroff** — `echo o > /proc/sysrq-trigger`. Instant hard poweroff because the filesystem is destroyed and normal `poweroff` would fail.
 
-2. **Enable sysrq** — Writes `1` to `/proc/sys/kernel/sysrq` to enable magic SysRq commands for emergency poweroff.
+### 6.12 PXE template + syslinux modules
 
-3. **Create and exec a self-contained dd script** — A script at `/dev/shm/kinstall/run-dd.sh` is created with a shebang pointing to the RAM-resident bash (`#!/dev/shm/kinstall/bash`). The parent script then `exec`s this script, completely replacing the running process with the RAM-resident one. This script:
-   - Streams the compressed image: `curl | lz4 -d | dd of=/dev/vda bs=4M oflag=direct`
-   - `oflag=direct` bypasses the page cache, preventing the 80GB write from consuming all available memory
-   - Runs `sgdisk -e` to fix the GPT backup header (it's at the wrong offset because the raw image was created on a different-sized disk)
-   - Drops the page cache (`echo 3 > /proc/sys/vm/drop_caches`) to prevent stale writeback
-   - Triggers an immediate poweroff via `echo o > /proc/sysrq-trigger` (SysRq because the filesystem is destroyed — normal `poweroff` would fail)
+Patch `/tftpboot/pxelinux.cfg/template` (and the x86_64/bios variant): `IPAPPEND 3` → `IPAPPEND 2` (prevents duplicate IP assignment). Ensure `menu.c32`, `libutil.c32`, `ldlinux.c32`, `libcom32.c32` exist at `/tftpboot/` (copy from `x86_64/bios/` or `/usr/lib/syslinux/modules/bios/` if missing).
 
-#### 5.12 Configure PXE boot
+### 6.13 Create the `kairos` category (cloned from `bcm_source_category`)
 
-The PXE template is patched to use `IPAPPEND 2` instead of `IPAPPEND 3` (prevents duplicate IP assignment issues). Required syslinux modules (`menu.c32`, `libutil.c32`, `ldlinux.c32`, `libcom32.c32`) are copied to `/tftpboot/` if missing.
+```
+cmsh -c "category; list" | grep -q '^kairos\b' \
+  || cmsh -c "category; clone \"{{ bcm_source_category | default('default') }}\" kairos; commit"
+```
 
-#### 5.13 Configure the kairos category and register node001
+On **local-KVM** this clones `default`. On **remote BCM** it clones whatever the site already uses — e.g. `"Partner Lab"` — so the `kairos` category inherits disksetup, mon templates, interface layout, and FinalizeXML that match the target hardware. Creating an empty category and hand-copying config would re-invent site-specific behavior that's already correct.
 
-A BCM "category" named `kairos` is created by cloning the `default` category. It is configured with:
-- `softwareimage`: `kairos-installer` (the image with the dd script)
-- `installmode`: `FULL` (complete re-image on next boot)
-- `newnodeinstallmode`: `FULL`
-- `installbootrecord`: `yes` (write bootloader to disk)
-- `kernelparameters`: `console=ttyS0,115200n8 net.ifnames=0 biosdevname=0`
-- Default category for the `base` partition
+Configure:
 
-The kernel version in the kairos-installer software image is detected and set in cmsh so BCM generates the correct ramdisk.
+```
+set softwareimage kairos-installer
+set installmode FULL
+set newnodeinstallmode FULL
+set installbootrecord yes
+set kernelparameters "console=ttyS0,115200n8 net.ifnames=0 biosdevname=0"
+```
 
-A compute node `node001` is registered in cmsh with:
-- Explicit IP address: `10.141.255.10` (avoids BCM auto-assigning the gateway IP)
-- MAC address: `52:54:00:00:02:01` (matches the QEMU compute VM's NIC)
-- Category: `kairos`
+Strip `fsmounts` for `/cm/shared` and `/home` from the `kairos` category — Kairos is an immutable OS; it uses `COS_PERSISTENT` bind-mounts for `/home` and doesn't mount `/cm/shared`. Leaving these entries produces permanent "fsmounts" health-check failures with no functional meaning.
 
-#### 5.14 Regenerate the ramdisk
+### 6.14 Category-scoped `nodeexecutionfilters`
+
+```
+for CHECK in mounts interfaces ntp; do
+    cmsh -c "monitoring setup; use $CHECK; nodeexecutionfilters; \
+             add category exclude-kairos; \
+             set filteroperation Exclude; \
+             set categories kairos; \
+             commit"
+done
+```
+
+Scopes the exclusion to `category=kairos` only — these checks still apply to every other category on the BCM. Rationale:
+- `mounts` — Kairos mounts root read-only and uses COS bind-mounts, not `/etc/fstab` entries BCM understands.
+- `interfaces` — Kairos NIC is `eth0` (we forced `net.ifnames=0`) not BCM's expected `BOOTIF`.
+- `ntp` — Kairos uses systemd-timesyncd, not chronyd/ntpd.
+
+After this the `kairos` category reports clean `[ UP ]` in cmsh.
+
+### 6.15 Cluster-wide defaults *(gated by `bcm_manage_cluster_defaults`)*
+
+```
+{% if bcm_manage_cluster_defaults | default(false) %}
+cmsh -c "partition; use base; set defaultcategory kairos; commit"
+cmsh -c "partition; use base; set nodebasename node; set nodedigits 3; commit"
+{% endif %}
+```
+
+**Default `false`.** Remote-BCM must keep it `false` — flipping `defaultcategory` cluster-wide would make every newly-PXE'd compute node on the site try to install Kairos. Only set `true` for a fresh/local BCM where the whole cluster is yours.
+
+### 6.16 Target device assignment
+
+Two modes share the same template, branched on whether `bcm_target_node` is defined:
+
+**Remote BCM** (`bcm_target_node` set) — move the existing device:
+```
+cmsh -c "device; use $bcm_target_node; \
+         set category kairos; \
+         set softwareimage kairos-installer; \
+         set installmode FULL; \
+         commit"
+```
+Also sets `softwareimage` at the device level because device-level overrides beat category values on existing BCMs (customers' devices often have device-level overrides for site-specific software images).
+
+**Local KVM** (`bcm_target_node` empty) — register node001:
+```
+cmsh -c "device; remove node001; commit"   # idempotent
+cmsh -c "device; add physicalnode node001 <prefix>.10 eth0; \
+         set category kairos; \
+         set mac $kairos_vm_mac; \
+         commit"
+```
+
+Verifies the category's softwareimage is still `kairos-installer` (BCM sometimes resets this when cloning from certain source categories).
+
+### 6.17 Regenerate ramdisk
 
 ```
 cmsh -c "softwareimage; use kairos-installer; createramdisk -w"
 ```
 
-This generates the PXE boot ramdisk (initramfs) for the kairos-installer image. The `-w` flag means "wait until complete." After regeneration, the script re-verifies that the category's softwareimage is still set to `kairos-installer` (ramdisk generation can sometimes reset it).
+`-w` waits until complete. After regeneration, re-commits the category's `softwareimage` and verifies — rare races where ramdisk generation drops the value.
+
+At this point BCM is fully configured. The target node will pick up the `kairos-installer` image on its next PXE boot and `install-kairos.sh` will run inside it.
 
 ---
 
-## 6. Stage 5 — Kairos VM
+## 7. Stage 5 — Kairos VM *(local-KVM only)*
 
-**Role:** `roles/kairos_vm/tasks/main.yml`  
-**Produces:** `build/kairos-compute.qcow2` (persistent disk), running Kairos VM  
-**Duration:** ~10 minutes  
+**Role:** `roles/kairos_vm/tasks/main.yml`
+**Produces:** `build/kairos-compute.qcow2` + a running Kairos VM
+**Duration:** ~10 minutes
+**Mode:** local-KVM only. On remote-BCM deploys, the equivalent is a power-cycle of the target node via iDRAC / IPMI / Redfish (manual).
 
-### What this stage does
+### 7.1 Preparation
 
-This stage launches a compute node VM that PXE boots from the BCM head node, receives the kairos-installer image, runs the dd script to write Kairos to disk, powers off, and then reboots from the installed disk into a fully operational Kairos node with Palette agent registration.
+- Kill any existing Kairos VM (PID file + pgrep).
+- Reset `node001`'s `installmode` to `FULL` in cmsh (may have been set to `NOSYNC` by a prior successful run).
+- Create a fresh `build/kairos-compute.qcow2` (default 80 GB), overwriting any existing one.
 
-### Step-by-step
-
-#### 6.1 Preparation
-
-- Any existing Kairos VM is killed (by PID file and by process name)
-- `node001`'s install mode is reset to `FULL` in cmsh (in case it was changed to `NOSYNC` by a previous boot)
-- A fresh qcow2 disk is created (default 80GB), deleting any existing one
-
-#### 6.2 PXE boot
-
-QEMU is launched with boot order `cn` (network first, then disk):
+### 7.2 Launch with PXE boot
 
 ```
 qemu-system-x86_64 \
-  -enable-kvm -m 4096 -smp 2 -cpu host \
+  -enable-kvm -m $kairos_vm_ram -smp $kairos_vm_cpus -cpu host \
   -drive file=build/kairos-compute.qcow2,format=qcow2,if=virtio \
   -netdev socket,id=intnet,connect=:31337 \
-  -device virtio-net-pci,netdev=intnet,mac=52:54:00:00:02:01 \
+  -device virtio-net-pci,netdev=intnet,mac=$kairos_vm_mac \
   -chardev socket,id=ser0,host=localhost,port=4321,server=on,wait=off,telnet=on,logfile=logs/kairos-serial.log \
   -serial chardev:ser0 \
   -boot order=cn -daemonize
 ```
 
-Key differences from the BCM VM:
-- **Single NIC**: Only the internal network (`connect=:31337` — connects to BCM's socket listener). No direct internet access; routes through BCM's NAT.
-- **PXE boot**: `-boot order=cn` tries network boot first. The NIC's PXE ROM requests an IP from BCM's DHCP, gets a TFTP boot path, downloads the PXE config, kernel, and ramdisk, and boots into the kairos-installer image.
-- **MAC address**: `52:54:00:00:02:01` matches the registered `node001` in BCM, so BCM assigns the correct IP (`10.141.255.10`) and uses the `kairos` category configuration.
-- **Telnet serial console**: The serial port is exposed as a telnet socket on port 4321 for live debugging.
+Key differences from BCM VM:
+- **Single NIC** on socket network (`connect=:31337` connects to BCM's listen) — no direct internet, routes through BCM's NAT.
+- **`-boot order=cn`** — network first, then disk. PXE ROM requests DHCP from BCM, pulls the PXE config + kernel + ramdisk over TFTP.
+- **MAC matches registered node001** (`52:54:00:00:02:01` by default) so BCM assigns the expected IP and the `kairos` category.
+- **Telnet serial on port 4321** — attach with `telnet localhost 4321` for live debugging.
 
-#### 6.3 The PXE boot and dd process (what happens inside the VM)
+### 7.3 What happens inside the VM (orchestrated by BCM)
 
-This is orchestrated entirely by BCM and the kairos-installer image — no Ansible involvement:
+No Ansible involvement in this part:
 
-1. **PXE DHCP**: The VM gets IP `10.141.255.10` from BCM's DHCP server
-2. **TFTP download**: PXE downloads the kernel and ramdisk from BCM's TFTP server
-3. **Boot into kairos-installer**: The node boots the BCM-provided Linux kernel and kairos-installer ramdisk
-4. **Network init**: The installer image configures eth0 via DHCP
-5. **kairos-install.service starts**: After a 10-second delay, the systemd service runs `install-kairos.sh`
-6. **Binaries staged to RAM**: bash, curl, lz4, dd, sgdisk, and their libraries are copied to `/dev/shm/kinstall/`
-7. **exec to RAM-resident script**: The process replaces itself with the RAM-based script
-8. **dd pipeline**: `curl http://10.141.255.254:8888/disk.raw.lz4 | lz4 -d | dd of=/dev/vda bs=4M oflag=direct`
-9. **GPT fix**: `sgdisk -e /dev/vda` relocates the backup GPT header to the correct position
-10. **Cache drop**: `echo 3 > /proc/sys/vm/drop_caches`
-11. **SysRq poweroff**: `echo o > /proc/sysrq-trigger` — the VM powers off immediately
+1. DHCP from BCM → IP `<prefix>.10`.
+2. TFTP kernel + ramdisk from BCM (the regenerated `kairos-installer` ramdisk).
+3. Systemd boots; `kairos-install.service` fires 10 s after `network-online.target`.
+4. `install-kairos.sh` stages binaries, execs into RAM-resident bash, curls + lz4-decompresses + dds, fixes GPT, creates EFI entry (no-op here — SeaBIOS on the compute VM), drops cache, SysRq poweroff.
 
-#### 6.4 Wait for poweroff
+### 7.4 Wait for poweroff
 
-Ansible polls the QEMU PID every 10 seconds for up to 30 minutes. When the dd script triggers SysRq poweroff, the QEMU process exits.
+Poll QEMU PID every 10 s for up to 30 min.
 
-#### 6.5 Reboot from disk
+### 7.5 Reboot from disk
 
-A new QEMU instance is launched with `-boot c` (disk only, no PXE):
+New QEMU with the same args except `-boot c`. GRUB loads Kairos kernel from the freshly-dd'd disk.
 
-```
-qemu-system-x86_64 \
-  ... (same params as above) ...
-  -boot c
-```
+### 7.6 Wait for Kairos boot
 
-The qcow2 disk now contains the Kairos raw image that was written by dd. The VM boots into GRUB, loads the Kairos kernel, and starts the OS.
+`wait-kairos-boot.sh.j2` runs on the host and probes through BCM:
 
-#### 6.6 Wait for Kairos boot
+1. Check BCM's ARP table for the compute VM's MAC to get its current IP.
+2. SSH via BCM (`sshpass | ssh BCM "ssh root@<kairos-ip> cat /etc/kairos-release"`), retrying every 10 s for up to 10 min.
 
-The script `wait-kairos-boot.sh.j2` runs on the host and checks for the compute node's availability by SSHing through BCM as a jump host:
-
-1. Checks BCM's ARP table for the compute node's MAC address to find its IP
-2. Attempts SSH to the compute node (via BCM) and checks for `/etc/kairos-release`
-3. Retries every 10 seconds for up to 10 minutes
-
-During this time, the Kairos cloud-config boot stages are executing:
-- Setting user passwords
-- Enabling SSH
-- Querying BCM for the node name
-- Setting hostname
-- Configuring Palette site name
-- Exchanging SSH keys with BCM
-- Setting NOSYNC install mode
-- Mounting BCM's NFS image
-- Starting the cmd daemon in a chroot
+During this window the Kairos boot stages (§5.7) run: hostname, Palette site name, BCM key exchange, NOSYNC install mode, NFS mount, cmd daemon chroot — all via the `bcm-kairos-key` SSH key.
 
 ---
 
-## 7. Stage 6 — Validate
+## 8. Stage 6 — Validate
 
-**Role:** `roles/validate/tasks/main.yml`  
-**Template:** `roles/validate/templates/validate.sh.j2`  
-**Duration:** ~15 seconds  
+**Role:** `roles/validate/tasks/main.yml`
+**Template:** `roles/validate/templates/validate.sh.j2`
+**Duration:** ~15 seconds
+**Mode:** both. The template is parameterized by `bcm_target_node` (defaulting to `node001` for local-KVM) and by the same jumphost SSH config pattern as deploy-dd.
 
-### What this stage does
+Runs a comprehensive health check across BCM and the Kairos compute node. Reuses `build/.bcm-ssh-config` (from deploy-dd, or regenerated here), so `ProxyCommand` works transparently.
 
-Runs a comprehensive health check across both the BCM head node and the Kairos compute node, producing a PASS/WARN/FAIL report. The validation script connects to BCM via SSH and reaches the Kairos node through BCM as a jump host.
+### 8.1 Connecting to the Kairos node
 
-### Checks performed
+The template discovers the Kairos IP by reading BCM's ARP table for the compute node's MAC (obtained from `cmsh device use $TARGET_NODE get mac`), falling back to `cmsh device get ip`. Then tries SSH two ways, **from BCM** (using BCM as a jump host into the provisioning network):
+1. `ssh root@$KAIROS_IP` (key-based, via the SSH key pair exchanged during the Kairos boot stages).
+2. `sshpass -p kairos ssh kairos@$KAIROS_IP` (password-based fallback to the POC user).
 
-#### BCM Head Node (18 checks)
+### 8.2 BCM checks (roughly 18, all through the same `bcm-target` SSH alias)
 
-**Connectivity:**
-- SSH access to BCM on the forwarded port
+**Connectivity:** SSH reachability.
 
-**Services:**
-- `cmd` systemd service is active
-- `dhcpd` is active (DHCP server for compute nodes)
-- `named` is active (DNS server)
-- `nfs-server` is active
-- rsyncd listening on port 873
-- HTTP server listening on port 8888 (Kairos image server)
+**Services:** `cmd`, `dhcpd`, `named`, `nfs-server` all `is-active`; `ss -tlnp` shows `:873` (rsyncd) and `:8888` (HTTP image server) listening.
 
 **Network:**
-- Ping localhost
-- eth0 has the correct internal IP (10.141.255.254)
-- eth1 has an external IP (any — assigned by QEMU DHCP)
-- IP forwarding is enabled (`/proc/sys/net/ipv4/ip_forward` = 1)
+- BCM internal IP present on any interface (match by IP, not NIC name — works for `eth0` or `ens*`/`enp*`).
+- Under `bcm_manage_dns=true`: `eth1` has an IP (local-KVM NAT NIC). Under `bcm_manage_dns=false`: default-route interface exists — i.e. BCM has outbound routing, whatever the NIC happens to be called.
+- `/proc/sys/net/ipv4/ip_forward == 1`.
 
-**DNS & Internet:**
-- External DNS resolution (`host google.com`)
-- Internet access (HTTPS to google.com returns 200 or 301)
+**DNS / internet:** `host google.com` resolves; `curl -s -w "%{http_code}" https://google.com` returns 200 or 301.
 
-**Cluster state:**
-- cmsh `device; list` shows head node as UP
-- `node001` is registered
-- `node001` has correct IP
-- `node001` category is `kairos`
-- kairos-installer image directory exists
-- Kairos raw image (`disk.raw.lz4`) exists
+**Cluster state:** `cmsh device list` shows head as `UP`; `$TARGET_NODE` is registered; IP + category = `kairos`; `/cm/images/kairos-installer/` exists; `/cm/shared/kairos/disk.raw.lz4` exists.
 
-#### Kairos Compute Node (21 checks)
+### 8.3 Kairos checks (roughly 22, via BCM → Kairos SSH)
 
-The script first discovers the Kairos node's IP from BCM's ARP table (falling back to cmsh), then tries SSH both as root (key-based, via the BCM SSH key exchange) and as kairos user (password-based).
+**Connectivity:** SSH + ping.
 
-**OS:**
-- OS version (PRETTY_NAME from `/etc/os-release`)
-- Kairos version (from `/etc/kairos-release`)
-- kairos-agent version
-- Kernel version
+**OS:** `/etc/os-release`'s `PRETTY_NAME`; `/etc/kairos-release` `KAIROS_VERSION`; `kairos-agent version`; kernel.
 
-**Network:**
-- IP address assigned
-- Default gateway present
-- DNS resolver configured
-- External DNS resolution (ping google.com)
-- Internet access (HTTPS to google.com)
+**Network:** IP address assigned; default gateway; DNS resolver in `/etc/resolv.conf`; ping to google.com; `curl` to https://google.com returns 200/301.
 
-**Services:**
-- stylus-agent (Palette edge agent) is active
-- Palette registration attempt logged in journalctl
+**Services:** `stylus-agent is-active`; `journalctl -u stylus-agent | grep -c "registering edge host"` is > 0.
 
-**Boot:**
-- `net.ifnames=0` present in `/proc/cmdline`
-- Kairos boot chain markers (`rd.immucore` or `rd.cos`) in cmdline
+**Boot:** `/proc/cmdline` contains `net.ifnames=0`; contains `rd.immucore` or `rd.cos` (Kairos boot-chain markers).
 
-**Disk / Partitions:**
-- COS_OEM partition exists (OEM configuration)
-- COS_RECOVERY partition exists (recovery image)
-- COS_STATE partition exists (active/passive OS images)
-- COS_PERSISTENT partition exists (persistent user data)
-- Root filesystem is mounted read-only (immutable)
-- Disk free space reported
+**Disk / partitions:** `blkid -L` finds `COS_OEM`, `COS_RECOVERY`, `COS_STATE`, `COS_PERSISTENT`; root is mounted read-only; `df -h /` reports free space.
 
-**Cloud Config:**
-- OEM yaml files exist in `/oem/`
+**Cloud config:** `/oem/*.yaml` files exist.
 
-### Output format
+### 8.4 Output format
 
-Each check prints `[PASS]`, `[WARN]`, or `[FAIL]` with a description and optional detail. The final line summarizes:
+Each check prints `[PASS]`, `[WARN]`, or `[FAIL]` with an optional detail. Final line:
+
 ```
-PASS: 35/39  WARN: 3/39  FAIL: 1/39
+PASS: 35/40  WARN: 4/40  FAIL: 1/40
 ```
 
-The script exits with code 1 if any checks FAIL, which causes the Ansible playbook to fail.
+Script `exit 1` if any `FAIL`, which fails the Ansible playbook.
 
 ---
 
-## 8. Network Topology
+## 9. Cross-cutting design points
+
+### 9.1 Additive, reversible changes on customer BCMs
+
+Two safety flags in `inventory/group_vars/all.yml` gate the only operations that would be cluster-wide:
+
+- `bcm_manage_dns` (default in discover output: `false`) — §6.2 — when false, the cmsh DNS-nameserver rewrite + `systemctl restart named` is skipped entirely. Rewriting this on a customer BCM would break every non-Kairos node on the site.
+- `bcm_manage_cluster_defaults` (default: `false`) — §6.15 — when false, `partition base set defaultcategory`/`nodebasename` is skipped. Flipping defaultcategory would make every newly-added compute node on the customer's BCM try to install Kairos.
+
+Beyond these flags, `deploy-dd` is additive: it creates a *new* `kairos` category (cloned from `bcm_source_category`, inheriting site-specific disksetup / FinalizeXML) and moves exactly one device — `bcm_target_node` — into it. Moving the device back to its original category and re-PXE'ing reverts it to standard HPC provisioning.
+
+When modifying `deploy_dd/templates/deploy-dd.sh.j2`, preserve both properties: no cluster-wide writes outside the two gates, and the only cmsh device touched is `bcm_target_node`.
+
+### 9.2 UEFI raw image + post-`dd` efibootmgr
+
+Stage 3 uses **OVMF firmware** (§5.9) so the raw image has a real ESP with `\EFI\BOOT\bootx64.efi`. Stage 4 `install-kairos.sh` (§6.11 step 8) runs `efibootmgr --create --disk $DISK --part 1 --label Kairos --loader '\EFI\BOOT\bootx64.efi'` after `dd` so UEFI firmware boots the freshly-written disk on next power-up — no manual OneTimeBoot via iDRAC required.
+
+Three invariants any change to the boot path must preserve:
+
+1. **ESP is partition 1** — `efibootmgr --part 1` assumes this, and the CanvOS raw image layout puts the ESP there. If you change kairos-agent install flags, verify the ESP is still `/dev/$DISK`p1.
+2. **Delete old `Kairos` entries before creating a new one** — re-installs shouldn't stack duplicate NVRAM entries.
+3. **Guard on `/sys/firmware/efi/efivars`** — the same script runs on both UEFI hardware and the local-KVM compute VM (which boots SeaBIOS). No efivars means no-op, not a failure.
+
+### 9.3 Palette pre-registration hook
+
+`files/canvos/overlay/files/usr/bin/palette-cleanup-stale.sh` is baked into the image in §5.3 and runs via `systemd ExecStartPre` before `stylus-agent`. Full behavior:
+
+1. **Gate on registration mode** — exits as no-op if `/proc/cmdline` doesn't contain `stylus.registration` AND `/oem/.stylus-state` already has an `authToken`. Post-registration re-boots skip the hook entirely.
+2. **Load admin creds** from `/oem/palette-admin.env` (written by cloud-config initramfs stage §5.7 from `palette_api_key` + `palette_project_uid` + `palette_endpoint`). Missing file = skip.
+3. **Auto-mint an edgeHostToken if missing** — inspect `/oem/90_custom.yaml` for `edgeHostToken:`. If empty, `POST /v1/edgehosts/tokens` (tenant-scoped — no `ProjectUid` header), fetch the created token by UID, and inject it into the userdata yaml (replace existing line, or insert after `site:`).
+4. **Delete stale edge-host record** — compute `edge-<smbios-uuid>`. `GET /v1/edgehosts/<uid>` (project-scoped — `ProjectUid` header). On 200 → `DELETE /v1/edgehosts/<uid>`. On 404 → proceed. On 401/403 → log + continue. Without this, re-imaging a previously-registered node fails with "UID already registered".
+5. **Fail-open on every error path** — `set +e`; the script's final `exit 0` is unconditional. A bug here must not block stylus-agent.
+
+When modifying this script, preserve all five properties. The "reimage a node with one command" UX depends on steps 3 + 4 being automatic and step 5 being bulletproof.
+
+### 9.4 Category-scoped health-check suppression
+
+See §6.14. BCM's `mounts`, `interfaces`, and `ntp` measurables don't match Kairos's architecture (immutable read-only root, no `/etc/fstab` BCM would recognize, no `ntp.conf`, stable `eth0` not `BOOTIF`). The `nodeexecutionfilters` on each measurable are scoped `Exclude + categories=kairos` so every other category on the BCM is unaffected.
+
+Idempotent: the check against `exclude-kairos` in the existing filters means re-runs don't add duplicates.
+
+### 9.5 Jumphost-aware SSH everywhere
+
+See §1.3. Every BCM-side operation in deploy-dd, validate, and discover-bcm uses a per-run SSH config with `ProxyCommand`. `bcm_ssh_proxy_key` is expanded via `lookup('env','HOME')` at template-render time (not at SSH time) because OpenSSH doesn't reliably expand `~` inside `ProxyCommand`. New code that needs BCM access must reuse this config — `-J` flags scattered ad-hoc will silently skip the jumphost.
+
+### 9.6 Other install-kairos.sh details worth knowing
+
+- **lz4 not gzip** — decompression is faster than the `dd` write speed, so the pipeline is write-bound, not CPU-bound.
+- **`oflag=direct`** — bypasses the page cache. Without it, writing an 80 GB image can push an LVM thin pool into overflow before the sync completes.
+- **Staging binaries to `/dev/shm/kinstall` + exec before dd** — the dd overwrites the filesystem hosting the currently-running binaries; without RAM-staging + exec, the script would SIGBUS partway through. The shebang on `run-dd.sh` points at `/dev/shm/kinstall/bash`.
+- **sgdisk -e + partprobe** — the raw image was created on an 80 GB virtual disk; target disks are typically larger, so the GPT backup header is at the wrong offset after dd. `sgdisk -e` relocates it; `partprobe` re-reads the corrected partition table.
+
+---
+
+## 10. Network topology
+
+### 10.1 Remote BCM (customer site)
+
+```
+┌────────────────────┐         ┌────────────────────────────────────┐
+│ Build host          │  SSH    │ Customer network                   │
+│ (this repo)         │──►(via)─┤                                    │
+│  ansible-playbook   │  jump   │ ┌─────────────┐   provisioning VLAN│
+│  sshpass | ssh -F   │  host   │ │ Jumphost    │  (BCM's "internalnet")
+│                     │         │ │ ProxyCommand│                    │
+└────────────────────┘         │ └──────┬──────┘                    │
+                                │        │                            │
+                                │        ▼                            │
+                                │   ┌─────────────────────────┐       │
+                                │   │ BCM head node           │       │
+                                │   │  IP: $bcm_internal_ip   │       │
+                                │   │  cmd, dhcpd, named, nfs │       │
+                                │   │  HTTP :8888 (kairos img)│       │
+                                │   └──────┬──────────────────┘       │
+                                │          │ PXE + HTTP                │
+                                │          ▼                            │
+                                │   ┌─────────────────────────┐        │
+                                │   │ Compute node (bare metal)│       │
+                                │   │  $bcm_target_node        │       │
+                                │   │  UEFI → Kairos           │       │
+                                │   │  stylus-agent → Palette  │       │
+                                │   └─────────┬────────────────┘       │
+                                │             │ HTTPS                  │
+                                └─────────────┼────────────────────────┘
+                                              ▼
+                                       Palette ($palette_endpoint)
+                                       SaaS or on-prem
+```
+
+The build host never sees the provisioning VLAN directly — every BCM operation tunnels through the jumphost via `ProxyCommand`. The compute node reaches Palette once Kairos is up; egress path is site-specific (either via BCM NAT or via site routing; `bcm_manage_dns=false` ensures we don't override whatever the site has).
+
+### 10.2 Local KVM (dev / demo)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        Host Machine                                  │
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐    │
-│  │              Internal Network (QEMU socket :31337)            │    │
+│  │   QEMU socket net :31337  (flat L2, "internalnet")            │    │
 │  │                                                               │    │
-│  │  ┌─────────────────────┐      ┌──────────────────────────┐   │    │
-│  │  │  BCM Head Node       │      │  Kairos Compute Node      │   │    │
-│  │  │  eth0: 10.141.255.254│◄────►│  eth0: 10.141.255.10      │   │    │
-│  │  │                      │      │  (DHCP from BCM)           │   │    │
-│  │  │  Services:           │      │                            │   │    │
-│  │  │  - DHCP (dhcpd)      │      │  Services:                 │   │    │
-│  │  │  - DNS (named)       │      │  - stylus-agent (Palette)  │   │    │
-│  │  │  - PXE/TFTP          │      │  - cmd (BCM chroot)        │   │    │
-│  │  │  - NFS               │      │  - k3s                     │   │    │
-│  │  │  - rsyncd            │      │                            │   │    │
-│  │  │  - HTTP :8888        │      └──────────────────────────┘   │    │
-│  │  │  - cmd               │                                     │    │
-│  │  └──────────┬───────────┘                                     │    │
-│  │             │                                                  │    │
-│  └─────────────┼──────────────────────────────────────────────────┘    │
-│                │                                                      │
-│  ┌─────────────┼──────────────────────────────────────────────────┐    │
-│  │  External   │  Network (QEMU user-mode NAT)                    │    │
-│  │             │                                                  │    │
-│  │  BCM eth1: 10.0.2.15 (DHCP from QEMU)                        │    │
-│  │  Gateway: 10.0.2.2 (QEMU)                                     │    │
-│  │  DNS: 10.0.2.3 (QEMU)                                         │    │
-│  │                                                                │    │
-│  │  IP forwarding + iptables MASQUERADE:                          │    │
-│  │    Compute nodes → BCM eth0 → NAT → eth1 → Internet           │    │
-│  └────────────────────────────────────────────────────────────────┘    │
+│  │   ┌─────────────────────┐       ┌──────────────────────────┐  │    │
+│  │   │ BCM head node VM    │       │ Kairos compute node VM   │  │    │
+│  │   │  eth0 → listen      │◄──────┤  eth0 → connect          │  │    │
+│  │   │  $bcm_internal_ip   │       │  DHCP from BCM            │  │    │
+│  │   │  cmd + dhcpd + nfs +│       │  stylus-agent + k3s       │  │    │
+│  │   │  named + HTTP :8888 │       │  cmd (BCM chroot)         │  │    │
+│  │   └─────────┬───────────┘       └──────────────────────────┘  │    │
+│  │             │                                                   │    │
+│  └─────────────┼───────────────────────────────────────────────────┘    │
+│                ▼                                                       │
+│      QEMU user-mode NAT (extnet)                                       │
+│        BCM eth1: 10.0.2.15 / GW 10.0.2.2 / DNS 10.0.2.3              │
+│        Compute → BCM eth0 → NAT → eth1 → Internet                    │
 │                                                                      │
-│  Port Forwards (host → BCM):                                         │
-│    localhost:10022 → BCM:22   (SSH)                                  │
-│    localhost:10443 → BCM:443  (HTTPS / BCM Web UI)                   │
-│                                                                      │
+│  Host port forwards (→ BCM VM):                                      │
+│    localhost:$bcm_ssh_port  → 22   (SSH)                             │
+│    localhost:$bcm_https_port → 443 (BCM Web UI)                      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Why two separate networks?
-
-BCM's DHCP server on the internal network must be the only DHCP server visible to compute nodes. If both BCM and QEMU's user-mode NAT responded to DHCP requests, compute nodes could get the wrong IP and gateway. The socket-based L2 network provides a clean, isolated broadcast domain for provisioning, while the user-mode NAT provides internet access exclusively through BCM's IP forwarding.
+**Why two separate networks.** BCM's DHCP must be the only DHCP visible to compute nodes — if QEMU's user-mode NAT also answered DHCP, compute VMs could get the wrong gateway. The socket-based L2 network is a clean isolated broadcast domain for provisioning; the user-mode NAT provides internet exclusively via BCM's IP-forwarding + MASQUERADE rule.
