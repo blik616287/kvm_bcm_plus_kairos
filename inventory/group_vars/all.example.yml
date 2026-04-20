@@ -87,6 +87,24 @@ bcm_target_node:     "edge-4c4c454400485610804bc3c04f4e4434"
 # for the target hardware. Must exist on BCM.
 bcm_source_category: "S-AI Partner Lab"
 
+# OPTIONAL: MAC address of the compute node's provisioning NIC. When set,
+# deploy-dd.sh.j2's "target existing device" block adds `set mac <value>` to
+# the cmsh commit on bcm_target_node. This makes the deploy self-contained —
+# the MAC mapping doesn't have to be pre-configured on the device via cmsh.
+# Useful when bcm_target_node already exists but was registered without a MAC
+# (or with a stale one from previous hardware). Leave unset/empty to keep
+# whatever MAC cmsh already has on the device. Format: lowercase, colon-
+# separated, e.g. "4c:4c:45:44:00:48".
+# kairos_target_mac:   ""
+
+# OPTIONAL: IP address to assign to the compute node on the provisioning
+# network. When set, deploy-dd.sh.j2 adds `set ip <value>` to the same cmsh
+# commit. Parallel to kairos_target_mac — lets this deploy own the IP mapping
+# instead of relying on whatever cmsh already has. Must be inside
+# bcm_internal_cidr and outside the DHCP pool range (the pool is
+# .16–.250 within the CIDR). Leave unset/empty to keep the existing IP.
+# kairos_target_ip:    ""
+
 # OS disk on the compute node that `dd` will overwrite with the Kairos raw
 # image. Consumed by install-kairos.sh.j2 as $DISK. Pinned — not
 # auto-detected, because picking the wrong disk bricks the node. Use

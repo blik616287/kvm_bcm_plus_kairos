@@ -544,9 +544,11 @@ cmsh -c "device; use $bcm_target_node; \
          set category kairos; \
          set softwareimage kairos-installer; \
          set installmode FULL; \
+         [set mac $kairos_target_mac;] \
+         [set ip  $kairos_target_ip;]  \
          commit"
 ```
-Also sets `softwareimage` at the device level because device-level overrides beat category values on existing BCMs (customers' devices often have device-level overrides for site-specific software images).
+Also sets `softwareimage` at the device level because device-level overrides beat category values on existing BCMs (customers' devices often have device-level overrides for site-specific software images). `set mac` and `set ip` lines are emitted only when `kairos_target_mac` / `kairos_target_ip` are defined in inventory — mirrors the local-KVM path (where `device add physicalnode <name> <ip> eth0; set mac …` takes the same two fields at registration time), so deploy-dd owns the MAC + IP mapping rather than relying on the device having been registered with the right values previously. When either variable is absent, the device keeps whatever value cmsh already has (the common case — customers have registered the hardware via BCM's normal workflow, `nodeidentityhelper`, or manual cmsh earlier). We deliberately do *not* `remove` + `add physicalnode` like the local-KVM path does — that would wipe site-specific device-level overrides (hostname, interfaces, disksetup) that aren't ours to touch.
 
 **Local KVM** (`bcm_target_node` empty) — register node001:
 ```
