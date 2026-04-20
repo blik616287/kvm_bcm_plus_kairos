@@ -48,7 +48,6 @@ bcm_ssh_proxy_key:   "~/.ssh/sai"                    # jumphost private key; `~`
 #   - roles/kairos_build/templates/cloud-config.yaml.j2 (NFS mount source +
 #     cert-fetch host in the Kairos first-boot cloud-config)
 bcm_internal_ip:      "192.168.98.2"
-bcm_internal_netmask: "24"                           # used by local-KVM bcm_prepare only
 # Full CIDR of the provisioning network. Consumed by deploy-dd.sh.j2 to scope
 # NFS exports for /cm/shared to this network, and to derive the NET_PREFIX
 # used when the script allocates IPs for newly-added compute nodes.
@@ -181,14 +180,23 @@ palette_ca_cert: |
 # ---------------------------------------------------------------------------
 
 # ==== Local-KVM BCM VM sizing (stages 1 & 2) ====
-# bcm_hostname:       "bcm11-headnode"
-# bcm_timezone:       "America/Los_Angeles"
-# bcm_external_gateway: "10.0.2.2"                   # used when bcm_manage_dns=true
-# bcm_external_dns:     "1.1.1.1"                    # used when bcm_manage_dns=true
-# bcm_vm_ram:           8192
+# bcm_hostname:         "bcm11-headnode"     # BCM hostname; baked into build-config.xml
+# bcm_timezone:         "America/Los_Angeles"
+# bcm_external_gateway: "10.0.2.2"           # rendered into build-config.xml by bcm_prepare
+#
+# bcm_external_dns is consumed by bcm_prepare (baked into build-config.xml) AND
+# by deploy-dd.sh.j2's DNS-forwarders block when bcm_manage_dns=true. On a
+# remote-BCM deploy with bcm_manage_dns=false it's unused.
+# bcm_external_dns:     "1.1.1.1"
+#
+# bcm_internal_netmask is consumed only by bcm_prepare's bcm-autoinstall.sh to
+# configure eth0 + DHCP mask on the installed BCM. Unused on remote-BCM.
+# bcm_internal_netmask: "24"
+#
+# bcm_vm_ram:           8192                 # MB
 # bcm_vm_cpus:          4
 # bcm_vm_disk_size:     "100G"
-# bcm_https_port:       10443                        # QEMU host-port forward to BCM:443
+# bcm_https_port:       10443                # QEMU host-port forward to BCM:443 (web UI)
 
 # ==== JFrog (BCM ISO download, only for bcm-prepare) ====
 # jfrog_token:    ""
@@ -203,5 +211,6 @@ palette_ca_cert: |
 # kairos_vm_disk_size: "80G"
 
 # ==== Kairos build (usually leave defaults) ====
-# kairos_kernel_version:     "6.8.0-87-generic"
+# Temporary container registry used by CanvOS during kairos-build. ttl.sh is
+# anonymous and expires images after a few hours — fine for one-shot builds.
 # kairos_container_registry: "ttl.sh"
