@@ -233,9 +233,6 @@
           bcm_manage_dns:              false
           bcm_manage_cluster_defaults: false
 
-          # --- Kairos Build ---
-          kairos_kernel_version: "{{ disc.KERNEL | default('NEEDS_MANUAL_CONFIG') }}"
-
     - name: Display discovery results
       vars:
         node_header: "NAME | MAC | IP | CATEGORY | SOFTWAREIMAGE"
