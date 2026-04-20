@@ -28,7 +28,7 @@ setup: ## Verify prerequisites (ansible, qemu, docker, sshpass, etc.)
 	@command -v xorriso >/dev/null || { echo "MISSING: xorriso"; exit 1; }
 	@command -v lz4 >/dev/null || { echo "MISSING: lz4"; exit 1; }
 	@command -v jq >/dev/null || { echo "MISSING: jq"; exit 1; }
-	@test -f inventory/group_vars/all || { echo "MISSING: inventory/group_vars/all (copy from all.example)"; exit 1; }
+	@test -f inventory/group_vars/all.yml || { echo "MISSING: inventory/group_vars/all.yml (copy from all.example.yml)"; exit 1; }
 	@echo "All prerequisites OK"
 
 .PHONY: install-deps
