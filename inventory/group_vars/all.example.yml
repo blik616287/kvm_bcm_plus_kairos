@@ -1,0 +1,85 @@
+# ---------------------------------------------------------------------------
+# Example inventory for a remote-BCM deployment (skips stages 1 & 2 — bcm-prepare
+# and bcm-vm). Use when you're targeting an already-running BCM head node and
+# want to kairos-build + deploy-dd against it.
+#
+# Copy to inventory/group_vars/all.yml (which is gitignored) and fill in values.
+# ---------------------------------------------------------------------------
+
+# ==== BCM connection ====
+bcm_password:        ""                              # root SSH password on the BCM head node
+bcm_ssh_host:        "192.168.98.2"                  # BCM's IP on the provisioning network
+bcm_ssh_port:        22
+bcm_ssh_proxy_jump:  "partner@100.90.255.42"         # jumphost in user@host form; empty if BCM is directly reachable
+bcm_ssh_proxy_key:   "~/.ssh/sai"                    # path to the jumphost SSH key; `~` is expanded at render time
+
+# ==== BCM provisioning network ====
+bcm_internal_ip:      "192.168.98.2"                 # BCM's IP as seen by compute nodes (baked into install-kairos.sh as the HTTP source)
+bcm_internal_netmask: "24"
+bcm_internal_cidr:    "192.168.98.0/24"              # used for NFS exports
+
+# Don't rewrite BCM's cluster-wide DNS — leave the site's resolver alone.
+# Set to true ONLY on a fresh BCM where you own the DNS config.
+bcm_manage_dns: false
+
+# Don't flip cluster-wide defaults (defaultcategory / nodebasename).
+# Set to true ONLY on a fresh BCM where the whole cluster is yours.
+bcm_manage_cluster_defaults: false
+
+# ==== Target compute node on that BCM ====
+bcm_target_node:     "edge-4c4c454400485610804bc3c04f4e4434"   # existing cmsh device name to re-image
+bcm_source_category: "S-AI Partner Lab"                        # existing BCM category to clone for the `kairos` category
+kairos_target_disk:  "/dev/nvme0n1"                            # OS disk on the compute node (overwritten by dd)
+kairos_wipe_disks:   "nvme1n1 nvme2n1 nvme3n1 nvme4n1"         # sibling disks to wipefs before dd (LVM/DRBD residue cleanup)
+
+# ==== Palette ====
+palette_endpoint:          "s-ai.lan"                          # Palette API hostname
+palette_project_name:      "Default"
+palette_project_uid:       "69a81eb07122277de95c3b1f"          # Palette project UID (used by the node's admin-side cleanup + token auto-gen)
+palette_api_key:           ""                                  # Palette admin key with edgeToken.create + edgehost.delete permissions
+palette_installation_mode: "connected"
+palette_management_mode:   "central"
+
+# Self-signed CA that signs the palette endpoint's cert. Only required for
+# Palette instances using non-public certs. Paste the CA PEM block here.
+palette_ca_cert: |
+  -----BEGIN CERTIFICATE-----
+  ...
+  -----END CERTIFICATE-----
+
+# OPTIONAL: a pre-minted project-scoped edge-host registration token.
+# If omitted and palette_api_key + palette_project_uid are set, the on-node
+# palette-cleanup-stale.sh will mint one via the Palette admin API on first boot.
+# palette_token: ""
+
+# ---------------------------------------------------------------------------
+# The rest of these are NOT consumed on a remote-BCM deploy — they're only
+# used by stages 1 (bcm-prepare), 2 (bcm-vm), or 5 (kairos-vm) of the local-KVM
+# pipeline. Kept here for completeness / documentation only.
+# ---------------------------------------------------------------------------
+
+# ==== Local-KVM BCM VM sizing (stages 1 & 2) ====
+# bcm_hostname:       "bcm11-headnode"
+# bcm_timezone:       "America/Los_Angeles"
+# bcm_external_gateway: "10.0.2.2"                   # used when bcm_manage_dns=true
+# bcm_external_dns:     "1.1.1.1"                    # used when bcm_manage_dns=true
+# bcm_vm_ram:           8192
+# bcm_vm_cpus:          4
+# bcm_vm_disk_size:     "100G"
+# bcm_https_port:       10443                        # QEMU host-port forward to BCM:443
+
+# ==== JFrog (BCM ISO download, only for bcm-prepare) ====
+# jfrog_token:    ""
+# jfrog_instance: "insightsoftmax.jfrog.io"
+# jfrog_repo:     "iso-releases"
+# iso_filename:   "bcm-11.0-ubuntu2404.iso"
+
+# ==== Local-KVM Kairos compute VM (only for kairos-vm stage) ====
+# kairos_vm_mac:       "52:54:00:00:02:01"
+# kairos_vm_ram:       4096
+# kairos_vm_cpus:      2
+# kairos_vm_disk_size: "80G"
+
+# ==== Kairos build (usually leave defaults) ====
+# kairos_kernel_version:     "6.8.0-87-generic"
+# kairos_container_registry: "ttl.sh"

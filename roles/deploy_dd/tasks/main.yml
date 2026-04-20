@@ -2,6 +2,12 @@
 # deploy_dd — Upload raw image to BCM, configure installer + kairos category.
 # Runs on localhost, SSHes to BCM via port-forwarded SSH.
 
+- name: Capture invoking user (to restore build/ ownership at end; ansible.cfg become=true)
+  ansible.builtin.command: whoami
+  register: invoking_user
+  become: false
+  changed_when: false
+
 - name: Set BCM connection facts
   ansible.builtin.set_fact:
     ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
@@ -31,3 +37,12 @@
     PATH: "{{ ansible_facts['env']['PATH'] }}"
   async: 3600
   poll: 15
+
+- name: Restore ownership of build artifacts to invoking user
+  ansible.builtin.file:
+    path: "{{ build_dir }}"
+    state: directory
+    owner: "{{ invoking_user.stdout }}"
+    group: "{{ invoking_user.stdout }}"
+    recurse: true
+  become: true
