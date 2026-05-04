@@ -13,9 +13,9 @@
     ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
     bcm_ssh_port: "{{ bcm_ssh_port }}"
 
-- name: Verify raw disk image exists
+- name: Verify raw disk image exists for the configured profile
   ansible.builtin.stat:
-    path: "{{ build_dir }}/kairos-disk.raw"
+    path: "{{ build_dir }}/{{ kairos_profile }}-disk.raw"
   register: raw_image
   failed_when: not raw_image.stat.exists
 

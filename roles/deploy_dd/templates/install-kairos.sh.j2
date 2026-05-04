@@ -3,7 +3,7 @@ set -euo pipefail
 LOG="/dev/shm/kairos-install.log"
 exec > >(tee -a "$LOG") 2>&1
 HEAD_IP="{{ bcm_internal_ip }}"
-RAW_URL="http://${HEAD_IP}:8888/disk.raw.lz4"
+RAW_URL="http://${HEAD_IP}:8888/{{ kairos_profile }}/disk.raw.lz4"
 {% if kairos_target_disk is defined and kairos_target_disk | length > 0 %}
 DISK="{{ kairos_target_disk }}"
 {% else %}

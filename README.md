@@ -162,10 +162,21 @@ Single source of truth: `inventory/group_vars/all.yml` (copied from `all.example
 
 | Variable | Description |
 |----------|-------------|
-| `bcm_target_node` | Existing cmsh device name to move into the `kairos` category (e.g. `edge-4c4c454400485610804bc3c04f4e4434`) |
-| `bcm_source_category` | Existing BCM category to clone when creating `kairos` (carries over disksetup, mon templates, etc.) |
+| `bcm_target_node` | Existing cmsh device name to move into the profile's category (e.g. `edge-4c4c454400485610804bc3c04f4e4434`) |
+| `bcm_source_category` | Existing BCM category to clone when creating the profile category (carries over disksetup, mon templates, etc.) |
 | `kairos_target_disk` | Disk device on the node to `dd` onto (e.g. `/dev/nvme0n1` or `/dev/sda`). Pinned — not auto-detected |
 | `kairos_wipe_disks` | Space-separated list of sibling disks to `wipefs -a -f` before `dd` (cleans LVM/DRBD residue from previous installs) |
+| `kairos_target_mac` | **Optional.** Provisioning-NIC MAC; when set, deploy-dd does `set mac` on `bcm_target_node` so the deploy owns the MAC mapping rather than relying on prior cmsh registration |
+| `kairos_target_ip` | **Optional.** IP for the device on `bcm_internal_cidr`; when set, deploy-dd does `set ip` on `bcm_target_node`. Must be outside the DHCP pool (`.16`–`.250`) |
+
+### Kairos profile + build customization
+
+| Variable | Description |
+|----------|-------------|
+| `kairos_profile` | **Default `default-kairos`.** Namespaces the local artifact (`build/<profile>-disk.raw`), the BCM upload (`/cm/shared/kairos/<profile>/disk.raw.lz4`), the `<profile>-installer` software image, the `<profile>` cmsh category, and the `exclude-<profile>` health-check filter. Multiple profiles coexist on the same BCM |
+| `kairos_canvos_args` | **Open-ended dict** merged over `roles/kairos_build/defaults/main.yml`. Override any subset of CanvOS `.arg` keys (e.g. `OS_VERSION`, `UPDATE_KERNEL`, `CIS_HARDENING`, `UBUNTU_PRO_KEY`, `IMAGE_REGISTRY`, `CUSTOM_TAG`); arbitrary new keys flow through to `.arg` verbatim |
+| `kairos_extra_apt_packages` | **Open-ended list.** Extra apt packages installed in the Kairos image via a Dockerfile RUN block. Empty list = no extra packages |
+| `kairos_user_data` | **Open-ended raw YAML block.** Written to `/oem/99_userdata.yaml` inside the built image, layered on top of `/oem/90_custom.yaml` (which carries BCM/Palette integration). Empty string = no extra userdata file |
 
 ### Palette
 
@@ -190,7 +201,22 @@ See `inventory/group_vars/all.example.yml` for the complete list with inline com
 
 ### Additive, reversible changes to BCM
 
-`deploy-dd` **never** flips cluster-wide BCM settings on a customer's head node. The `kairos` category is cloned from `bcm_source_category` (inheriting disksetup and mon templates); only the target device from `bcm_target_node` is moved into it. Existing categories, nodes, and cluster defaults are untouched. Move the device back to its original category and it reverts to standard HPC provisioning on next PXE boot.
+`deploy-dd` **never** flips cluster-wide BCM settings on a customer's head node. The profile's category (default `default-kairos`) is cloned from `bcm_source_category` (inheriting disksetup and mon templates); only the target device from `bcm_target_node` is moved into it. Existing categories, nodes, and cluster defaults are untouched. Move the device back to its original category and it reverts to standard HPC provisioning on next PXE boot.
+
+### Multiple profiles on one BCM
+
+Build artifact + BCM-side state are namespaced by `kairos_profile`. To stand up a second profile:
+
+```bash
+# Build profile A
+make kairos-build deploy-dd                                    # uses default-kairos
+
+# Build profile B
+ANSIBLE_ARGS="-e kairos_profile=gpu-kairos -e 'kairos_canvos_args={\"OS_VERSION\":\"22.04\",\"UPDATE_KERNEL\":\"true\"}'" \
+    make kairos-build deploy-dd
+```
+
+Both `default-kairos` and `gpu-kairos` categories, software images, image directories, and `/cm/shared/kairos/<profile>/` upload trees coexist on BCM. Each device is assigned to one profile (its `category` in cmsh).
 
 ### UEFI raw image + post-`dd` boot entry
 

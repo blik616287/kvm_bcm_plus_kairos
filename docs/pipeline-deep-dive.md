@@ -222,7 +222,7 @@ At the end, BCM is fully operational: DHCP, DNS, NFS, PXE, cluster management al
 ## 5. Stage 3 — Kairos Build
 
 **Role:** `roles/kairos_build/tasks/main.yml`
-**Produces:** `build/palette-edge-installer.iso`, `build/kairos-disk.raw`, `build/kairos-disk.raw.sha256`, `build/bcm-kairos-key{,.pub}`
+**Produces:** `build/palette-edge-installer.iso`, `build/{{ kairos_profile }}-disk.raw`, `build/{{ kairos_profile }}-disk.raw.sha256`, `build/bcm-kairos-key{,.pub}` (artifact name namespaced by `kairos_profile`, default `default-kairos`)
 **Duration:** ~30 minutes (10–15 min CanvOS build + ~15 min OVMF kairos-agent install)
 **Mode:** both (runs in parallel with stage 2 in local-KVM mode — no dependency on BCM being up)
 
@@ -234,16 +234,39 @@ If `CanvOS/` doesn't exist, clone `https://github.com/spectrocloud/CanvOS.git`. 
 
 ### 5.2 Generate the `.arg` file
 
-`files/canvos/.arg.template` is a Jinja2 template rendered to `CanvOS/.arg`:
+`files/canvos/.arg.template` is a one-line Jinja2 loop that emits one `KEY=VALUE` per entry of `kairos_canvos_args_effective` — a dict computed at task time as `kairos_canvos_defaults | combine(kairos_canvos_args | default({}))`.
 
-| Variable | Value |
-|----------|-------|
-| `CUSTOM_TAG` | `bcm-test` |
-| `IMAGE_REGISTRY` | `$kairos_container_registry` (default `ttl.sh` — temporary registry) |
-| `OS_DISTRIBUTION` / `OS_VERSION` | `ubuntu` / `22.04` |
-| `K8S_DISTRIBUTION` | `k3s` |
-| `ISO_NAME` | `palette-edge-installer` |
-| `ARCH` | `amd64` |
+`roles/kairos_build/defaults/main.yml` carries the upstream-CanvOS-aligned defaults:
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `CUSTOM_TAG` | `bcm-test` | image tag |
+| `IMAGE_REGISTRY` | `ttl.sh` | temporary registry; override via `kairos_canvos_args.IMAGE_REGISTRY` |
+| `OS_DISTRIBUTION` / `IMAGE_REPO` | `ubuntu` / `ubuntu` | set both when switching to `ubuntu-pro` |
+| `OS_VERSION` | `"22.04"` | also `"20.04"`, `"24.04"` per upstream CanvOS |
+| `K8S_DISTRIBUTION` | `k3s` | |
+| `ISO_NAME` | `palette-edge-installer` | pipeline-load-bearing — used to find the built ISO |
+| `ARCH` | `amd64` | pipeline-load-bearing — passed to `earthly.sh +iso --ARCH=` |
+| `HTTPS_PROXY` / `HTTP_PROXY` | `""` | populated for proxied build environments |
+| `UPDATE_KERNEL` | `"false"` | when `"true"`, CanvOS unholds kernel packages so apt upgrades pull HWE |
+| `CIS_HARDENING` | `"false"` | when `"true"`, CanvOS runs `/cis-harden/harden.sh` during build |
+| `CLUSTERCONFIG` | `spc.tgz` | upstream default |
+| `EDGE_CUSTOM_CONFIG` | `.edge-custom-config.yaml` | upstream default |
+| `FORCE_INTERACTIVE_INSTALL` | `"false"` | upstream default |
+| `UBUNTU_PRO_KEY` | `""` | when set, CanvOS `pro attach`es during build then `pro detach`es post-build |
+
+User overrides via `inventory/group_vars/all.yml`:
+
+```yaml
+kairos_canvos_args:
+  OS_VERSION: "22.04"
+  UPDATE_KERNEL: "true"
+  CIS_HARDENING: "false"
+  UBUNTU_PRO_KEY: ""
+  # arbitrary new keys are forward-compatible — they're appended to .arg verbatim
+```
+
+Anything in the merged dict surfaces in `CanvOS/.arg` as `KEY=VALUE`. The role pulls `iso_name` and `arch` back out of the merged dict so the rest of the pipeline (CanvOS build, ISO copy) sees the same values rendered into `.arg`.
 
 ### 5.3 Copy the overlay
 
@@ -259,8 +282,9 @@ All three are marked executable; failure to chmod is ignored (the Dockerfile pat
 
 ### 5.4 Patch Earthfile and Dockerfile
 
-- **Earthfile** — `apt-get install --no-install-recommends kbd` is replaced with `… wget ifupdown nfs-common kbd` so the image has the BCM-integration tools. A dracut conf is added that sets `omit_dracutmodules+=" nfit "` to avoid dracut build failures on hosts without NVDIMM support.
-- **Dockerfile** — inserted `COPY` + `RUN chmod +x` for the three overlay scripts so they end up at `/usr/bin/` in the image with executable bits.
+- **Earthfile** — `apt-get install --no-install-recommends kbd` is replaced with `… wget ifupdown nfs-common kbd` so the image has the BCM-integration tools (NFS mount of `/cm/images`, `ifupdown` for the eth0 ifcfg patch). A dracut conf is added that sets `omit_dracutmodules+=" nfit "` to avoid dracut build failures on hosts without NVDIMM support. These are pipeline-load-bearing — they're not user-extensible.
+- **Dockerfile (BCM scripts)** — inserted `COPY` + `RUN chmod +x` for the three overlay scripts so they end up at `/usr/bin/` in the image with executable bits.
+- **Dockerfile (user extras, gated by `kairos_extra_apt_packages`)** — when the inventory list is non-empty, a separate `RUN apt-get update && apt-get install -y --no-install-recommends <packages>` block is appended via `blockinfile` after the BCM-scripts block. Empty list ⇒ task is skipped, Dockerfile unchanged. Going through the Dockerfile (instead of the Earthfile) keeps user packages cleanly bisected as their own layer for debugging, and avoids cache invalidation of the OS-base layer when the user list churns.
 
 ### 5.5 Run the CanvOS build
 
@@ -297,13 +321,16 @@ Earthly builds a container image based on Ubuntu 22.04 with the Kairos framework
 
 ### 5.8 CIDATA user-data image
 
-4 MB FAT32 labeled `CIDATA` containing `cloud-config.yaml` copied in as `user-data`:
+4 MB FAT32 labeled `CIDATA` containing one or two files. The base `user-data` is always present; an `extra-userdata` file is added when `kairos_user_data` is set in inventory.
 
 ```
 dd if=/dev/zero of=build/userdata.img bs=1M count=4
 mkfs.vfat -n CIDATA build/userdata.img
 mcopy -i build/userdata.img build/cloud-config.yaml ::user-data
+[ -f build/extra-userdata.yaml ] && mcopy -i build/userdata.img build/extra-userdata.yaml ::extra-userdata
 ```
+
+The role first writes `build/extra-userdata.yaml` from the inventory variable (or removes it if the variable is empty), so the FAT32 image always reflects the current inventory.
 
 ### 5.9 Run `kairos-agent install` under **OVMF (UEFI)**
 
@@ -328,9 +355,16 @@ qemu-system-x86_64 \
 After QEMU boots, a background `nc -U <sock>` feeds commands into the serial console:
 
 ```
-mount /dev/vdb /mnt 2>/dev/null && cp /mnt/user-data /oem/90_custom.yaml && cp /mnt/user-data /tmp/99_bcm.yaml
-kairos-agent --debug install 2>&1; mount /dev/vda2 /oem; cp /tmp/99_bcm.yaml /oem/99_bcm.yaml; poweroff
+mount /dev/vdb /mnt && cp /mnt/user-data /oem/90_custom.yaml && cp /mnt/user-data /tmp/99_bcm.yaml \
+    && { [ -f /mnt/extra-userdata ] && cp /mnt/extra-userdata /tmp/99_userdata.yaml; true; }
+kairos-agent --debug install 2>&1
+mount /dev/vda2 /oem
+cp /tmp/99_bcm.yaml /oem/99_bcm.yaml
+{ [ -f /tmp/99_userdata.yaml ] && cp /tmp/99_userdata.yaml /oem/99_userdata.yaml; true; }
+poweroff
 ```
+
+The `[ -f ]` guards mean the `99_userdata.yaml` copy is a no-op when `kairos_user_data` was empty in inventory — empty inventory still produces today's `/oem/` layout exactly. When set, the user's YAML lands at `/oem/99_userdata.yaml`, layered after `/oem/90_custom.yaml` (BCM/Palette base) and `/oem/99_bcm.yaml` (a copy of the base for fallback).
 
 Host polls the QEMU PID every 10 s (up to 60 min) for exit.
 
@@ -355,11 +389,13 @@ At the end, `build/` ownership is restored to the invoking user (ansible.cfg has
 
 **Role:** `roles/deploy_dd/tasks/main.yml`
 **Templates:** `deploy-dd.sh.j2`, `install-kairos.sh.j2`
-**Produces:** on BCM: populated `kairos-installer` software image, `kairos` category, target device in FULL install mode, `/cm/shared/kairos/disk.raw.lz4`, `kairos-http.service`, DHCP/NFS/rsyncd config, NAT rule. Locally: `build/deploy-dd.sh`, `build/install-kairos.sh`, `build/.bcm-ssh-config`
+**Produces:** on BCM: populated `<profile>-installer` software image, `<profile>` cmsh category, target device in FULL install mode, `/cm/shared/kairos/<profile>/disk.raw.lz4`, `kairos-http.service` (single, profile-agnostic, serves `/cm/shared/kairos/`), DHCP/NFS/rsyncd config, NAT rule. Locally: `build/deploy-dd.sh`, `build/install-kairos.sh`, `build/.bcm-ssh-config`
 **Duration:** ~3–5 minutes
 **Mode:** both. This is the stage where remote-BCM and local-KVM diverge in policy (safety flags) but share the same template.
 
-Rendered scripts do all the work. `deploy-dd.sh` runs on the build host and SSHes to BCM through the per-run config (§1.3). `install-kairos.sh` is SCP'd into the kairos-installer software image and runs later on the compute node during PXE boot.
+`<profile>` everywhere below is the value of inventory's `kairos_profile` (default `default-kairos`). Multiple profiles coexist on the same BCM — running deploy-dd for `gpu-kairos` does not alter the state of `default-kairos` (or any other profile). Each profile gets its own software image, its own category, its own `/cm/shared/kairos/<profile>/` upload directory, its own `exclude-<profile>` health-check filter. Rsyncd modules and NFS exports are added additively — neither is rewritten in a way that would remove other profiles' state.
+
+Rendered scripts do all the work. `deploy-dd.sh` runs on the build host and SSHes to BCM through the per-run config (§1.3). `install-kairos.sh` is SCP'd into the `<profile>-installer` software image and runs later on the compute node during PXE boot.
 
 ### 6.1 BCM readiness gate
 
@@ -402,11 +438,13 @@ Interface name is derived from the default route — works whether BCM's externa
 Appended to `/etc/exports` if not already present, scoped to `$bcm_internal_cidr`:
 
 ```
-/cm/images/default-image   <cidr>(ro,no_subtree_check,no_root_squash,async)
-/cm/shared                 <cidr>(rw,no_subtree_check,no_root_squash,async)
-/cm/images/kairos-installer <cidr>(ro,no_subtree_check,no_root_squash,async)
+/cm/images/default-image          <cidr>(ro,no_subtree_check,no_root_squash,async)
+/cm/shared                        <cidr>(rw,no_subtree_check,no_root_squash,async)
+/cm/images/<profile>-installer    <cidr>(ro,no_subtree_check,no_root_squash,async)
 exportfs -ra
 ```
+
+Each profile adds its own `<profile>-installer` export; existing profiles' lines are untouched.
 
 ### 6.6 DHCP authoritative + pool range
 
@@ -414,29 +452,29 @@ exportfs -ra
 
 ### 6.7 rsyncd
 
-`/etc/rsyncd.conf` is overwritten with read-only modules `kairos-installer` and `default-image` pointing at `/cm/images/*`. `systemctl enable --now rsync`.
+`/etc/rsyncd.conf` is *additive*: a base config with the global section + `[default-image]` module is written if `/etc/rsyncd.conf` is missing or doesn't already contain `[default-image]`. Then a per-profile module (`[<profile>-installer]` → `/cm/images/<profile>-installer`) is appended only if not already present. Other profiles' modules are untouched. `systemctl enable --now rsync`.
 
 ### 6.8 Compress + upload (idempotent)
 
 ```
-lz4 -f build/kairos-disk.raw build/kairos-disk.raw.lz4
+lz4 -f build/<profile>-disk.raw build/<profile>-disk.raw.lz4
 ```
 
-Only re-compresses if `.lz4` is older than `.raw`. Then compares local vs remote file size (`stat -c %s /cm/shared/kairos/disk.raw.lz4`) — if they match and are non-zero, skips the SCP entirely. This makes re-runs of `make deploy-dd` through a slow jumphost fast.
+Only re-compresses if `.lz4` is older than `.raw`. Then compares local vs remote file size (`stat -c %s /cm/shared/kairos/<profile>/disk.raw.lz4`) — if they match and are non-zero, skips the SCP entirely. This makes re-runs of `make deploy-dd` through a slow jumphost fast. The remote profile subdirectory is created with `mkdir -p` so multiple profiles' uploads coexist as `/cm/shared/kairos/<profile>/disk.raw.lz4`.
 
 ### 6.9 HTTP server
 
-Installs `kairos-http.service` on BCM — a Python `http.server` on port 8888 serving `/cm/shared/kairos/`. This is how the compute node's installer fetches the compressed image during PXE boot. `systemctl enable --now` and verify with a HEAD request.
+Installs `kairos-http.service` on BCM (single shared unit, profile-agnostic) — a Python `http.server` on port 8888 with `WorkingDirectory=/cm/shared/kairos`. This serves the entire profile tree at `http://<bcm>:8888/<profile>/disk.raw.lz4` without a per-profile unit. The HEAD-request health check confirms the current profile's image is reachable.
 
-### 6.10 `kairos-installer` software image
+### 6.10 `<profile>-installer` software image
 
-Clone BCM's `default-image` to `kairos-installer`:
+Clone BCM's `default-image` to `<profile>-installer`:
 
 ```
-cmsh -c "softwareimage; clone default-image kairos-installer; commit"
+cmsh -c "softwareimage; clone default-image <profile>-installer; commit"
 ```
 
-Wait up to 120 s for `/cm/images/kairos-installer/usr` to appear (BCM provisions this asynchronously). Ensure `lz4` is installed on BCM (`apt-get install -y lz4` if missing); copy it into the image at `/usr/local/bin/lz4`.
+Wait up to 120 s for `/cm/images/<profile>-installer/usr` to appear (BCM provisions this asynchronously). Ensure `lz4` is installed on BCM (`apt-get install -y lz4` if missing); copy it into the image at `/usr/local/bin/lz4`. Existing `<profile>-installer` is detected and reused — re-running deploy-dd for the same profile doesn't re-clone.
 
 ### 6.11 Install `install-kairos.sh` + systemd unit
 
@@ -455,9 +493,9 @@ TimeoutStartSec=1800
 
 Enable it (`chroot $IMAGE_ROOT systemctl enable kairos-install.service` with a symlink fallback). Add DHCP stanzas for both `eth0` and `ens3` in the image's `/etc/network/interfaces` (covers both naming schemes on physical hardware).
 
-**What install-kairos.sh does on the compute node** (rendered with `$bcm_internal_ip`, `$kairos_target_disk`, `$kairos_wipe_disks`):
+**What install-kairos.sh does on the compute node** (rendered with `$bcm_internal_ip`, `$kairos_profile`, `$kairos_target_disk`, `$kairos_wipe_disks`):
 
-1. **HTTP probe** — poll `HEAD http://$HEAD_IP:8888/disk.raw.lz4` every 10 s for up to 10 minutes. Abort if unreachable.
+1. **HTTP probe** — poll `HEAD http://$HEAD_IP:8888/<profile>/disk.raw.lz4` every 10 s for up to 10 minutes. Abort if unreachable.
 2. **Stage binaries to RAM** (`/dev/shm/kinstall/`) — `bash curl lz4 dd sync sleep sgdisk wipefs dmsetup efibootmgr partprobe blkid` and all `ldd` dependencies. This is required because the dd will overwrite the filesystem these binaries currently live on.
 3. **Enable sysrq** — `echo 1 > /proc/sys/kernel/sysrq`.
 4. **Write a run-dd.sh with shebang `#!/dev/shm/kinstall/bash`**, then `exec` it — the parent process is replaced with a RAM-resident one. From here on nothing touches the target disk's filesystem.
@@ -483,56 +521,56 @@ Enable it (`chroot $IMAGE_ROOT systemctl enable kairos-install.service` with a s
 
 Patch `/tftpboot/pxelinux.cfg/template` (and the x86_64/bios variant): `IPAPPEND 3` → `IPAPPEND 2` (prevents duplicate IP assignment). Ensure `menu.c32`, `libutil.c32`, `ldlinux.c32`, `libcom32.c32` exist at `/tftpboot/` (copy from `x86_64/bios/` or `/usr/lib/syslinux/modules/bios/` if missing).
 
-### 6.13 Create the `kairos` category (cloned from `bcm_source_category`)
+### 6.13 Create the `<profile>` category (cloned from `bcm_source_category`)
 
 ```
-cmsh -c "category; list" | grep -q '^kairos\b' \
-  || cmsh -c "category; clone \"{{ bcm_source_category | default('default') }}\" kairos; commit"
+cmsh -c "category; list" | grep -q '^<profile>\b' \
+  || cmsh -c "category; clone \"{{ bcm_source_category | default('default') }}\" <profile>; commit"
 ```
 
-On **local-KVM** this clones `default`. On **remote BCM** it clones whatever the site already uses — e.g. `"S-AI Partner Lab"` — so the `kairos` category inherits disksetup, mon templates, interface layout, and FinalizeXML that match the target hardware. Creating an empty category and hand-copying config would re-invent site-specific behavior that's already correct.
+On **local-KVM** this clones `default`. On **remote BCM** it clones whatever the site already uses — e.g. `"S-AI Partner Lab"` — so the `<profile>` category inherits disksetup, mon templates, interface layout, and FinalizeXML that match the target hardware. Creating an empty category and hand-copying config would re-invent site-specific behavior that's already correct.
 
 Configure:
 
 ```
-set softwareimage kairos-installer
+set softwareimage <profile>-installer
 set installmode FULL
 set newnodeinstallmode FULL
 set installbootrecord yes
 set kernelparameters "console=ttyS0,115200n8 net.ifnames=0 biosdevname=0"
 ```
 
-Strip `fsmounts` for `/cm/shared` and `/home` from the `kairos` category — Kairos is an immutable OS; it uses `COS_PERSISTENT` bind-mounts for `/home` and doesn't mount `/cm/shared`. Leaving these entries produces permanent "fsmounts" health-check failures with no functional meaning.
+Strip `fsmounts` for `/cm/shared` and `/home` from the `<profile>` category — Kairos is an immutable OS; it uses `COS_PERSISTENT` bind-mounts for `/home` and doesn't mount `/cm/shared`. Leaving these entries produces permanent "fsmounts" health-check failures with no functional meaning.
 
 ### 6.14 Category-scoped `nodeexecutionfilters`
 
 ```
 for CHECK in mounts interfaces ntp; do
     cmsh -c "monitoring setup; use $CHECK; nodeexecutionfilters; \
-             add category exclude-kairos; \
+             add category exclude-<profile>; \
              set filteroperation Exclude; \
-             set categories kairos; \
+             set categories <profile>; \
              commit"
 done
 ```
 
-Scopes the exclusion to `category=kairos` only — these checks still apply to every other category on the BCM. Rationale:
+One filter per check, named `exclude-<profile>` and scoped to the `<profile>` category only — these checks still apply to every other category on the BCM, including other Kairos profiles (each profile's deploy-dd installs its own `exclude-<profile>` filter). Rationale:
 - `mounts` — Kairos mounts root read-only and uses COS bind-mounts, not `/etc/fstab` entries BCM understands.
 - `interfaces` — Kairos NIC is `eth0` (we forced `net.ifnames=0`) not BCM's expected `BOOTIF`.
 - `ntp` — Kairos uses systemd-timesyncd, not chronyd/ntpd.
 
-After this the `kairos` category reports clean `[ UP ]` in cmsh.
+After this the `<profile>` category reports clean `[ UP ]` in cmsh.
 
 ### 6.15 Cluster-wide defaults *(gated by `bcm_manage_cluster_defaults`)*
 
 ```
 {% if bcm_manage_cluster_defaults | default(false) %}
-cmsh -c "partition; use base; set defaultcategory kairos; commit"
+cmsh -c "partition; use base; set defaultcategory <profile>; commit"
 cmsh -c "partition; use base; set nodebasename node; set nodedigits 3; commit"
 {% endif %}
 ```
 
-**Default `false`.** Remote-BCM must keep it `false` — flipping `defaultcategory` cluster-wide would make every newly-PXE'd compute node on the site try to install Kairos. Only set `true` for a fresh/local BCM where the whole cluster is yours.
+**Default `false`.** Remote-BCM must keep it `false` — flipping `defaultcategory` cluster-wide would make every newly-PXE'd compute node on the site try to install whatever Kairos profile is most recently set as default. Only set `true` for a fresh/local BCM where the whole cluster is yours.
 
 ### 6.16 Target device assignment
 
@@ -541,8 +579,8 @@ Two modes share the same template, branched on whether `bcm_target_node` is defi
 **Remote BCM** (`bcm_target_node` set) — move the existing device:
 ```
 cmsh -c "device; use $bcm_target_node; \
-         set category kairos; \
-         set softwareimage kairos-installer; \
+         set category <profile>; \
+         set softwareimage <profile>-installer; \
          set installmode FULL; \
          [set mac $kairos_target_mac;] \
          [set ip  $kairos_target_ip;]  \
