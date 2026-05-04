@@ -1,0 +1,46 @@
+---
+# Defaults for roles/kairos_build. Inventory values in
+# inventory/group_vars/all.yml override anything set here.
+
+# Profile name — namespaces the local build artifact, the BCM-side software
+# image, the BCM cmsh category, the upload directory under /cm/shared/kairos/,
+# and the HTTP URL the compute node fetches from. Multiple builds with
+# different kairos_profile values can coexist on the same BCM.
+kairos_profile: "default-kairos"
+
+# Effective contents of CanvOS/.arg. Defaults reproduce the keys the pipeline
+# previously hardcoded; user overrides via inventory's `kairos_canvos_args`
+# dict are merged on top, and arbitrary new keys (e.g. anything else CanvOS
+# accepts) flow through to the rendered .arg verbatim.
+kairos_canvos_defaults:
+  CUSTOM_TAG: "bcm-test"
+  IMAGE_REGISTRY: "ttl.sh"
+  OS_DISTRIBUTION: "ubuntu"
+  IMAGE_REPO: "ubuntu"
+  OS_VERSION: "22.04"
+  K8S_DISTRIBUTION: "k3s"
+  ISO_NAME: "palette-edge-installer"
+  ARCH: "amd64"
+  HTTPS_PROXY: ""
+  HTTP_PROXY: ""
+  UPDATE_KERNEL: "false"
+  CLUSTERCONFIG: "spc.tgz"
+  CIS_HARDENING: "false"
+  EDGE_CUSTOM_CONFIG: ".edge-custom-config.yaml"
+  FORCE_INTERACTIVE_INSTALL: "false"
+  UBUNTU_PRO_KEY: ""
+
+# Open-ended user dict, merged over kairos_canvos_defaults. Any key the user
+# adds appears in CanvOS/.arg as KEY=VALUE.
+kairos_canvos_args: {}
+
+# Extra apt packages installed in the Kairos image via a Dockerfile RUN block.
+# Empty list = no extra packages installed (image is byte-identical to the
+# pre-customization build).
+kairos_extra_apt_packages: []
+
+# Raw cloud-config YAML written to /oem/99_userdata.yaml inside the built
+# image, layered on top of /oem/90_custom.yaml. Empty string = no extra
+# userdata file is written. Must NOT redefine the kairos user or the install
+# block — those are owned by the base 90_custom.yaml.
+kairos_user_data: ""
