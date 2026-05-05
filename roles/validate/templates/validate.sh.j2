@@ -150,7 +150,30 @@ fi
 if [[ -z "$KAIROS_IP" ]]; then
     KAIROS_IP=$(${BCM_SSH} "cmsh -c 'device; use ${TARGET_NODE}; get ip' 2>/dev/null" 2>/dev/null | filter_motd)
 fi
+# Device-level `get ip` returns 0.0.0.0 when the device's Network field doesn't
+# match the BOOTIF interface's network (common on multi-VLAN BCMs, e.g. when a
+# tenant-net device synthesizes 0.0.0.0 at the device level). Fall back to the
+# actual BOOTIF interface IP, which is where cmsh stores the real address.
+if [[ -z "$KAIROS_IP" || "$KAIROS_IP" == "0.0.0.0" ]]; then
+    KAIROS_IP=$(${BCM_SSH} "cmsh -c 'device; use ${TARGET_NODE}; interfaces; use BOOTIF; get ip' 2>/dev/null" 2>/dev/null | filter_motd | tr -d '[:space:]')
+fi
 echo "Kairos IP: ${KAIROS_IP}"
+
+# Defensive: refuse to proceed if KAIROS_IP would route to BCM itself or to the
+# loopback. Without this guard, the next ssh hop ends up being root@localhost on
+# BCM (because OpenSSH treats 0.0.0.0 as INADDR_ANY → localhost) and every
+# subsequent "Kairos OS" check actually reports BCM's own state.
+case "$KAIROS_IP" in
+    "" | "0.0.0.0" | "127.0.0.1" | "::1" | "${BCM_INTERNAL_IP}")
+        check "Kairos IP lookup" "FAIL" "got '${KAIROS_IP:-empty}' — would loop back to BCM. Check ${TARGET_NODE}'s BOOTIF interface IP in cmsh."
+        echo ""
+        TOTAL=$((PASS+FAIL+WARN))
+        echo "============================================"
+        echo " PASS: ${PASS}/${TOTAL}  WARN: ${WARN}/${TOTAL}  FAIL: ${FAIL}/${TOTAL}"
+        echo "============================================"
+        exit 1
+        ;;
+esac
 
 # Try SSH to Kairos
 KAIROS_SSH=""

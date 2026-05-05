@@ -118,14 +118,43 @@ fi
 PUBKEY=$(cat "${BCM_KEY}.pub")
 ${SSH_CMD} "grep -qF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null || echo '${PUBKEY}' >> /root/.ssh/authorized_keys" 2>/dev/null || true
 
-# NFS exports (persistent via /etc/exports) — scoped to discovered CIDR.
+# Build the list of CIDRs that need NFS access. Always includes the BCM
+# provisioning CIDR (DISCOVERED_CIDR). On remote-BCM deploys, the target
+# device's BOOTIF interface may live on a *different* internal network
+# (e.g. a tenant VLAN reached via DHCP relay): query cmsh for that
+# network's CIDR and add it. Without this the cloud-config's NFS mount
+# of /cm/images/default-image fails for tenant-net devices and the
+# cmd-in-chroot heartbeat never reaches BCM (BCM stays on
+# INSTALLER_UNREACHABLE indefinitely).
+EXPORT_CIDRS="${DISCOVERED_CIDR}"
+{% if bcm_target_node is defined and bcm_target_node | length > 0 %}
+TARGET_NET=$(${SSH_CMD} "cmsh -c 'device; use \"{{ bcm_target_node }}\"; interfaces; use BOOTIF; get network' 2>/dev/null" 2>/dev/null | filter_motd | tr -d '[:space:]')
+if [ -n "${TARGET_NET}" ]; then
+    TARGET_BASE=$(${SSH_CMD} "cmsh -c 'network; use ${TARGET_NET}; get baseaddress' 2>/dev/null" 2>/dev/null | filter_motd | tr -d '[:space:]')
+    TARGET_BITS=$(${SSH_CMD} "cmsh -c 'network; use ${TARGET_NET}; get netmaskbits' 2>/dev/null" 2>/dev/null | filter_motd | tr -d '[:space:]')
+    if [ -n "${TARGET_BASE}" ] && [ -n "${TARGET_BITS}" ]; then
+        TARGET_CIDR="${TARGET_BASE}/${TARGET_BITS}"
+        if [ "${TARGET_CIDR}" != "${DISCOVERED_CIDR}" ]; then
+            EXPORT_CIDRS="${EXPORT_CIDRS} ${TARGET_CIDR}"
+            info "Adding NFS export for target's network ${TARGET_NET} = ${TARGET_CIDR}"
+        fi
+    fi
+fi
+{% endif %}
+
+# NFS exports (persistent via /etc/exports) — one entry per CIDR per filesystem.
 # Each profile's installer image is exported separately so multiple profiles
-# can coexist; the /cm/shared export is shared across profiles.
-# Unquoted heredoc: local shell expands ${DISCOVERED_CIDR} before sending to remote.
+# can coexist; the /cm/shared export is shared across profiles. Each network
+# (e.g. managementnet, tenant-net) gets its own export ACL line so cmd-in-chroot
+# can NFS-mount /cm/images/default-image regardless of which subnet the device
+# lives on.
+# Unquoted heredoc: local shell expands ${EXPORT_CIDRS} before sending to remote.
 ${SSH_CMD} bash -s << EOF | filter_motd
-grep -qF "default-image ${DISCOVERED_CIDR}" /etc/exports 2>/dev/null || echo "/cm/images/default-image ${DISCOVERED_CIDR}(ro,no_subtree_check,no_root_squash,async)" >> /etc/exports
-grep -qF "/cm/shared ${DISCOVERED_CIDR}" /etc/exports 2>/dev/null || echo "/cm/shared ${DISCOVERED_CIDR}(rw,no_subtree_check,no_root_squash,async)" >> /etc/exports
-grep -qF "{{ kairos_profile }}-installer ${DISCOVERED_CIDR}" /etc/exports 2>/dev/null || echo "/cm/images/{{ kairos_profile }}-installer ${DISCOVERED_CIDR}(ro,no_subtree_check,no_root_squash,async)" >> /etc/exports
+for cidr in ${EXPORT_CIDRS}; do
+  grep -qF "/cm/images/default-image \$cidr" /etc/exports 2>/dev/null || echo "/cm/images/default-image \$cidr(ro,no_subtree_check,no_root_squash,async)" >> /etc/exports
+  grep -qF "/cm/shared \$cidr" /etc/exports 2>/dev/null || echo "/cm/shared \$cidr(rw,no_subtree_check,no_root_squash,async)" >> /etc/exports
+  grep -qF "/cm/images/{{ kairos_profile }}-installer \$cidr" /etc/exports 2>/dev/null || echo "/cm/images/{{ kairos_profile }}-installer \$cidr(ro,no_subtree_check,no_root_squash,async)" >> /etc/exports
+done
 exportfs -ra
 
 # Fix DHCP authoritative
