@@ -162,10 +162,21 @@ Single source of truth: `inventory/group_vars/all.yml` (copied from `all.example
 
 | Variable | Description |
 |----------|-------------|
-| `bcm_target_node` | Existing cmsh device name to move into the `kairos` category (e.g. `edge-4c4c454400485610804bc3c04f4e4434`) |
-| `bcm_source_category` | Existing BCM category to clone when creating `kairos` (carries over disksetup, mon templates, etc.) |
+| `bcm_target_node` | Existing cmsh device name to move into the profile's category (e.g. `edge-4c4c454400485610804bc3c04f4e4434`) |
+| `bcm_source_category` | Existing BCM category to clone when creating the profile category (carries over disksetup, mon templates, etc.) |
 | `kairos_target_disk` | Disk device on the node to `dd` onto (e.g. `/dev/nvme0n1` or `/dev/sda`). Pinned — not auto-detected |
 | `kairos_wipe_disks` | Space-separated list of sibling disks to `wipefs -a -f` before `dd` (cleans LVM/DRBD residue from previous installs) |
+| `kairos_target_mac` | **Optional.** Provisioning-NIC MAC; when set, deploy-dd does `set mac` on `bcm_target_node` so the deploy owns the MAC mapping rather than relying on prior cmsh registration |
+| `kairos_target_ip` | **Optional.** IP for the device on `bcm_internal_cidr`; when set, deploy-dd does `set ip` on `bcm_target_node`. Must be outside the DHCP pool (`.16`–`.250`) |
+
+### Kairos profile + build customization
+
+| Variable | Description |
+|----------|-------------|
+| `kairos_profile` | **Default `default-kairos`.** Namespaces the local artifact (`build/<profile>-disk.raw`), the BCM upload (`/cm/shared/kairos/<profile>/disk.raw.lz4`), the `<profile>-installer` software image, the `<profile>` cmsh category, and the `exclude-<profile>` health-check filter. Multiple profiles coexist on the same BCM |
+| `kairos_canvos_args` | **Open-ended dict** merged over `roles/kairos_build/defaults/main.yml`. Override any subset of CanvOS `.arg` keys (e.g. `OS_VERSION`, `UPDATE_KERNEL`, `CIS_HARDENING`, `UBUNTU_PRO_KEY`, `IMAGE_REGISTRY`, `CUSTOM_TAG`); arbitrary new keys flow through to `.arg` verbatim |
+| `kairos_extra_apt_packages` | **Open-ended list.** Extra apt packages installed in the Kairos image via a Dockerfile RUN block. Empty list = no extra packages |
+| `kairos_user_data` | **Open-ended raw YAML block.** Written to `/oem/99_userdata.yaml` inside the built image, layered on top of `/oem/90_custom.yaml` (which carries BCM/Palette integration). Empty string = no extra userdata file |
 
 ### Palette
 
@@ -190,7 +201,22 @@ See `inventory/group_vars/all.example.yml` for the complete list with inline com
 
 ### Additive, reversible changes to BCM
 
-`deploy-dd` **never** flips cluster-wide BCM settings on a customer's head node. The `kairos` category is cloned from `bcm_source_category` (inheriting disksetup and mon templates); only the target device from `bcm_target_node` is moved into it. Existing categories, nodes, and cluster defaults are untouched. Move the device back to its original category and it reverts to standard HPC provisioning on next PXE boot.
+`deploy-dd` **never** flips cluster-wide BCM settings on a customer's head node. The profile's category (default `default-kairos`) is cloned from `bcm_source_category` (inheriting disksetup and mon templates); only the target device from `bcm_target_node` is moved into it. Existing categories, nodes, and cluster defaults are untouched. Move the device back to its original category and it reverts to standard HPC provisioning on next PXE boot.
+
+### Multiple profiles on one BCM
+
+Build artifact + BCM-side state are namespaced by `kairos_profile`. To stand up a second profile:
+
+```bash
+# Build profile A
+make kairos-build deploy-dd                                    # uses default-kairos
+
+# Build profile B
+ANSIBLE_ARGS="-e kairos_profile=gpu-kairos -e 'kairos_canvos_args={\"OS_VERSION\":\"22.04\",\"UPDATE_KERNEL\":\"true\"}'" \
+    make kairos-build deploy-dd
+```
+
+Both `default-kairos` and `gpu-kairos` categories, software images, image directories, and `/cm/shared/kairos/<profile>/` upload trees coexist on BCM. Each device is assigned to one profile (its `category` in cmsh).
 
 ### UEFI raw image + post-`dd` boot entry
 
@@ -211,6 +237,18 @@ This makes reimaging a previously-provisioned node a one-command operation (`mak
 
 BCM's `mounts`, `interfaces`, and `ntp` measurables flag Kairos's immutable-OS architecture as health failures (read-only root, no `/etc/fstab` in the expected form, no `ntp.conf`). `deploy-dd` installs `nodeexecutionfilters` with `Exclude + category=kairos` for those three measurables so the `kairos` category reports clean `[ UP ]` in cmsh without affecting any other category.
 
+### NFS exports auto-scoped to the target node's network
+
+`deploy-dd` queries cmsh for `bcm_target_node`'s BOOTIF interface network and adds NFS export ACLs for that CIDR — in addition to `bcm_internal_cidr`. Required when target devices live on a separate provisioning VLAN (e.g. tenant-net) reached via DHCP relay; the cloud-config's `mount -t nfs /cm/images/default-image` would otherwise be rejected by the kernel NFS server. Existing managementnet ACLs are left intact.
+
+### Last-partition auto-grow after `dd`
+
+Right after `sgdisk -e` fixes the GPT backup header, `install-kairos.sh` deletes and recreates the **last** GPT partition (typically `COS_PERSISTENT`) from its current start sector to the disk end, then `partprobe` + `partx -u` + `e2fsck -fy` + `resize2fs`. Without this, a Kairos image dd'd from an 80 GB build VM onto a 400+ GB physical disk leaves `COS_PERSISTENT` capped at the original 30 GB (Kairos's own `Grow persistent` boot stage has a math bug that silently skips the grow on disks much larger than the source image).
+
+### Dynamic Palette label push
+
+`metadata.name` on Palette edge hosts is locked to the SMBIOS-UUID-derived `edge-<uuid>` (Palette uses it to track the box across re-deploys). For a friendly hostname, the cloud-config's BCM-integration boot stage queries cmsh for the device's BCM-side name + category + service tag and `PUT`s them as `metadata.labels` on the edge-host record via the Palette admin API. Runs in the background after stylus has registered, polling for the edge-host to exist before the PUT. No build-time bake-in of node-specific values — same image deploys to many hosts, each registers in Palette with its own labels.
+
 ### Other details
 
 - **lz4** compression (not gzip) — faster decompression than the dd write
@@ -219,6 +257,7 @@ BCM's `mounts`, `interfaces`, and `ntp` measurables flag Kairos's immutable-OS a
 - **`sgdisk -e` + `partprobe`** — fixes the GPT backup header after `dd` onto a differently-sized disk, then re-reads the partition table
 - **Squashfs patching** — `net.ifnames=0 biosdevname=0` + `ifcfg-eth0` injected into active/passive/recovery images for BCM compatibility
 - **Jumphost-aware tooling** — `deploy-dd`, `validate`, and `discover` all build a per-run SSH config file with a `ProxyCommand` line when `bcm_ssh_proxy_jump` is set
+- **Validate IP-lookup hardening** — `validate.sh` falls back to `cmsh device interfaces use BOOTIF get ip` when the device-level IP is `0.0.0.0` (common when the BOOTIF lives on a different network than the device's `Network` field), and refuses to probe if the lookup resolves to `0.0.0.0`, `127.0.0.1`, or BCM's own IP (which OpenSSH would otherwise treat as localhost, silently probing BCM and reporting BCM's state as the "Kairos" half of the report)
 
 ## File Layout
 

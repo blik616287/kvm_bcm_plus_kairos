@@ -122,17 +122,17 @@ NODE_IP=$(${BCM_SSH} "cmsh -c 'device; use ${TARGET_NODE}; get ip' 2>/dev/null" 
 check "${TARGET_NODE} IP" "PASS" "$NODE_IP"
 
 NODE_CAT=$(${BCM_SSH} "cmsh -c 'device; use ${TARGET_NODE}; get category' 2>/dev/null" 2>/dev/null | filter_motd)
-[[ "$NODE_CAT" == "kairos" ]] && check "${TARGET_NODE} category" "PASS" "$NODE_CAT" || check "${TARGET_NODE} category" "FAIL" "$NODE_CAT"
+[[ "$NODE_CAT" == "{{ kairos_profile }}" ]] && check "${TARGET_NODE} category" "PASS" "$NODE_CAT" || check "${TARGET_NODE} category" "FAIL" "$NODE_CAT (expected {{ kairos_profile }})"
 
 # Derive the real MAC from cmsh — for local-KVM this equals kairos_vm_mac,
 # for remote it's the physical NIC MAC BCM has recorded.
 COMPUTE_MAC=$(${BCM_SSH} "cmsh -c 'device; use ${TARGET_NODE}; get mac' 2>/dev/null" 2>/dev/null | filter_motd | tr -d '[:space:]')
 
-INSTALLER_IMG=$(${BCM_SSH} "test -d /cm/images/kairos-installer && echo exists" 2>/dev/null | filter_motd)
-[[ "$INSTALLER_IMG" == "exists" ]] && check "kairos-installer image" "PASS" "" || check "kairos-installer image" "FAIL" ""
+INSTALLER_IMG=$(${BCM_SSH} "test -d /cm/images/{{ kairos_profile }}-installer && echo exists" 2>/dev/null | filter_motd)
+[[ "$INSTALLER_IMG" == "exists" ]] && check "{{ kairos_profile }}-installer image" "PASS" "" || check "{{ kairos_profile }}-installer image" "FAIL" ""
 
-RAW_IMG=$(${BCM_SSH} "test -f /cm/shared/kairos/disk.raw.lz4 && echo exists" 2>/dev/null | filter_motd)
-[[ "$RAW_IMG" == "exists" ]] && check "Kairos raw image" "PASS" "/cm/shared/kairos/disk.raw.lz4" || check "Kairos raw image" "FAIL" ""
+RAW_IMG=$(${BCM_SSH} "test -f /cm/shared/kairos/{{ kairos_profile }}/disk.raw.lz4 && echo exists" 2>/dev/null | filter_motd)
+[[ "$RAW_IMG" == "exists" ]] && check "Kairos raw image" "PASS" "/cm/shared/kairos/{{ kairos_profile }}/disk.raw.lz4" || check "Kairos raw image" "FAIL" "/cm/shared/kairos/{{ kairos_profile }}/disk.raw.lz4"
 
 # =============================================
 # KAIROS COMPUTE NODE
@@ -150,7 +150,30 @@ fi
 if [[ -z "$KAIROS_IP" ]]; then
     KAIROS_IP=$(${BCM_SSH} "cmsh -c 'device; use ${TARGET_NODE}; get ip' 2>/dev/null" 2>/dev/null | filter_motd)
 fi
+# Device-level `get ip` returns 0.0.0.0 when the device's Network field doesn't
+# match the BOOTIF interface's network (common on multi-VLAN BCMs, e.g. when a
+# tenant-net device synthesizes 0.0.0.0 at the device level). Fall back to the
+# actual BOOTIF interface IP, which is where cmsh stores the real address.
+if [[ -z "$KAIROS_IP" || "$KAIROS_IP" == "0.0.0.0" ]]; then
+    KAIROS_IP=$(${BCM_SSH} "cmsh -c 'device; use ${TARGET_NODE}; interfaces; use BOOTIF; get ip' 2>/dev/null" 2>/dev/null | filter_motd | tr -d '[:space:]')
+fi
 echo "Kairos IP: ${KAIROS_IP}"
+
+# Defensive: refuse to proceed if KAIROS_IP would route to BCM itself or to the
+# loopback. Without this guard, the next ssh hop ends up being root@localhost on
+# BCM (because OpenSSH treats 0.0.0.0 as INADDR_ANY → localhost) and every
+# subsequent "Kairos OS" check actually reports BCM's own state.
+case "$KAIROS_IP" in
+    "" | "0.0.0.0" | "127.0.0.1" | "::1" | "${BCM_INTERNAL_IP}")
+        check "Kairos IP lookup" "FAIL" "got '${KAIROS_IP:-empty}' — would loop back to BCM. Check ${TARGET_NODE}'s BOOTIF interface IP in cmsh."
+        echo ""
+        TOTAL=$((PASS+FAIL+WARN))
+        echo "============================================"
+        echo " PASS: ${PASS}/${TOTAL}  WARN: ${WARN}/${TOTAL}  FAIL: ${FAIL}/${TOTAL}"
+        echo "============================================"
+        exit 1
+        ;;
+esac
 
 # Try SSH to Kairos
 KAIROS_SSH=""
