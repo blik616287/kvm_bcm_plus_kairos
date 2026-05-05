@@ -3,7 +3,7 @@ set -euo pipefail
 LOG="/dev/shm/kairos-install.log"
 exec > >(tee -a "$LOG") 2>&1
 HEAD_IP="{{ bcm_internal_ip }}"
-RAW_URL="http://${HEAD_IP}:8888/disk.raw.lz4"
+RAW_URL="http://${HEAD_IP}:8888/{{ kairos_profile }}/disk.raw.lz4"
 {% if kairos_target_disk is defined and kairos_target_disk | length > 0 %}
 DISK="{{ kairos_target_disk }}"
 {% else %}
@@ -20,7 +20,7 @@ done
 echo "[$(date)] Staging binaries to RAM..."
 RAMDIR="/dev/shm/kinstall"
 mkdir -p "$RAMDIR/lib"
-for bin in bash curl lz4 dd sync sleep sgdisk wipefs dmsetup efibootmgr partprobe blkid; do
+for bin in bash curl lz4 dd sync sleep sgdisk wipefs dmsetup efibootmgr partprobe blkid awk e2fsck resize2fs partx; do
     BIN_PATH=$(which "$bin" 2>/dev/null) && cp "$BIN_PATH" "$RAMDIR/" || true
 done
 for b in "$RAMDIR"/*; do
@@ -52,6 +52,32 @@ echo "[\$(date)] Writing to ${DISK}..."
 echo "[\$(date)] Fixing GPT backup header..."
 /dev/shm/kinstall/sgdisk -e ${DISK} 2>&1 || true
 /dev/shm/kinstall/partprobe ${DISK} 2>&1 || true
+# Grow the LAST GPT partition (typically COS_PERSISTENT, the 5th partition in
+# Kairos cOS layout) to fill any unused space at the end of the target disk.
+# Required because the raw image was sized to its build VM's disk (~80 GiB)
+# but the physical target is usually much larger. Kairos's own grow-persistent
+# stage at boot has a known math bug on disks much larger than the source image
+# (it asks for "need NNN MiB, available NNN MiB" with the numbers swapped) and
+# leaves COS_PERSISTENT at the original size. Doing it here in the installer
+# environment — partition is offline, kernel re-reads the table cleanly.
+if [ -x /dev/shm/kinstall/sgdisk ] && [ -x /dev/shm/kinstall/resize2fs ]; then
+    echo "[\$(date)] Growing last partition + ext4 to fill disk..."
+    LAST_NUM=\$(/dev/shm/kinstall/sgdisk -p ${DISK} 2>/dev/null | /dev/shm/kinstall/awk '/^[ ]+[0-9]+/{n=\$1} END{print n}')
+    LAST_INFO=\$(/dev/shm/kinstall/sgdisk -i \$LAST_NUM ${DISK} 2>/dev/null)
+    LAST_START=\$(echo "\$LAST_INFO" | /dev/shm/kinstall/awk '/First sector:/{print \$3}')
+    LAST_TYPE=\$(echo "\$LAST_INFO" | /dev/shm/kinstall/awk '/Partition GUID code:/{print \$4}')
+    LAST_LABEL=\$(echo "\$LAST_INFO" | grep "name:" | sed -e "s/.*name: //; s/^.\\\\(.*\\\\).\$/\\\\1/")
+    if [ -n "\$LAST_NUM" ] && [ -n "\$LAST_START" ]; then
+        /dev/shm/kinstall/sgdisk -d \$LAST_NUM -n \$LAST_NUM:\$LAST_START:0 -t \$LAST_NUM:\$LAST_TYPE -c \$LAST_NUM:"\$LAST_LABEL" ${DISK} 2>&1 || true
+        /dev/shm/kinstall/partprobe ${DISK} 2>&1 || true
+        /dev/shm/kinstall/partx -u --nr \$LAST_NUM ${DISK} 2>&1 || true
+        # ext2/ext3/ext4 — Kairos cOS uses ext2 for active.img but COS_PERSISTENT is ext4
+        /dev/shm/kinstall/e2fsck -fy ${DISK}p\$LAST_NUM 2>&1 | tail -3 || true
+        /dev/shm/kinstall/resize2fs ${DISK}p\$LAST_NUM 2>&1 | tail -3 || true
+    else
+        echo "[\$(date)] WARN: couldn't detect last partition, skipping grow"
+    fi
+fi
 # Create a UEFI boot entry pointing at our new ESP (partition 1 of the target disk).
 # Without this, physical UEFI firmwares keep booting stale BootXXXX entries tied to the
 # previous install's GPT UUIDs and never discover our freshly-dd'd Kairos bootloader.

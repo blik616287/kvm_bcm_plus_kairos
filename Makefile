@@ -110,8 +110,9 @@ clean-dist: ## Remove downloaded ISOs (dist/)
 	ansible localhost -m file -a "path=$(E2E_DIR)/dist state=absent" --become
 
 .PHONY: clean-canvos
-clean-canvos: ## Remove cloned CanvOS repo
+clean-canvos: ## Remove cloned CanvOS repo + per-profile raw build artifacts
 	ansible localhost -m file -a "path=$(E2E_DIR)/CanvOS state=absent" --become
+	@find $(E2E_DIR)/build -maxdepth 1 -type f \( -name '*-disk.raw' -o -name '*-disk.raw.lz4' -o -name '*-disk.raw.sha256' \) -delete 2>/dev/null || true
 
 .PHONY: clean-all
 clean-all: stop clean clean-dist clean-canvos ## Stop VMs + remove everything

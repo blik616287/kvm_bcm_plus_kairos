@@ -1,6 +1,7 @@
 ---
 # kairos_build — Build Kairos ISO via CanvOS + generate raw disk image via local QEMU.
-# Uses SeaBIOS for BIOS+EFI bootable image. Patches squashfs for stable NIC naming.
+# OVMF (UEFI) build for UEFI hardware. The build artifact is namespaced by
+# `kairos_profile` so multiple profiles can coexist on the build host.
 
 - name: Capture invoking user (ansible.cfg has become=true, so most tasks run as root;
         we need the original user to chown artifacts back at the end)
@@ -9,15 +10,16 @@
   become: false
   changed_when: false
 
-- name: Set CanvOS variables
+- name: Resolve effective CanvOS .arg dict (defaults | user overrides)
   ansible.builtin.set_fact:
     canvos_dir: "{{ e2e_dir }}/CanvOS"
-    iso_name: "palette-edge-installer"
-    os_distribution: "ubuntu"
-    os_version: "22.04"
-    k8s_distribution: "k3s"
-    custom_tag: "bcm-test"
-    arch: "amd64"
+    kairos_canvos_args_effective: "{{ kairos_canvos_defaults | combine(kairos_canvos_args | default({})) }}"
+
+- name: Derive pipeline-load-bearing facts from the merged .arg dict
+  ansible.builtin.set_fact:
+    iso_name: "{{ kairos_canvos_args_effective.ISO_NAME }}"
+    arch:     "{{ kairos_canvos_args_effective.ARCH }}"
+    raw_disk_path: "{{ build_dir }}/{{ kairos_profile }}-disk.raw"
 
 # ---- Clone CanvOS if missing ----
 
@@ -48,18 +50,10 @@
 - name: Build Kairos ISO
   when: not kairos_iso_stat.stat.exists
   block:
-    - name: Generate .arg file
+    - name: Generate .arg file from merged dict
       ansible.builtin.template:
         src: "{{ e2e_dir }}/files/canvos/.arg.template"
         dest: "{{ canvos_dir }}/.arg"
-      vars:
-        CUSTOM_TAG: "{{ custom_tag }}"
-        IMAGE_REGISTRY: "{{ kairos_container_registry }}"
-        OS_DISTRIBUTION: "{{ os_distribution }}"
-        OS_VERSION: "{{ os_version }}"
-        K8S_DISTRIBUTION: "{{ k8s_distribution }}"
-        ISO_NAME: "{{ iso_name }}"
-        ARCH: "{{ arch }}"
 
     - name: Copy overlay files into CanvOS
       ansible.builtin.shell: cp -rp {{ e2e_dir }}/files/canvos/overlay/* {{ canvos_dir }}/overlay/ 2>/dev/null || true
@@ -98,6 +92,15 @@
           COPY overlay/files/usr/bin/palette-cleanup-stale.sh /usr/bin/palette-cleanup-stale.sh
           RUN chmod +x /usr/bin/bcm-compat-fixes.sh /usr/bin/bcm-sync-userdata.sh /usr/bin/palette-cleanup-stale.sh
 
+    - name: Patch Dockerfile — install user-supplied apt packages
+      ansible.builtin.blockinfile:
+        path: "{{ canvos_dir }}/Dockerfile"
+        insertafter: "BCM compat scripts END"
+        marker: "# {mark} user extra packages"
+        block: |
+          RUN apt-get update && apt-get install -y --no-install-recommends {{ kairos_extra_apt_packages | join(' ') }} && rm -rf /var/lib/apt/lists/*
+      when: kairos_extra_apt_packages | default([]) | length > 0
+
     - name: Run CanvOS build
       ansible.builtin.shell: |
         cd {{ canvos_dir }}
@@ -115,7 +118,7 @@
 
 - name: Check if raw disk exists
   ansible.builtin.stat:
-    path: "{{ build_dir }}/kairos-disk.raw"
+    path: "{{ raw_disk_path }}"
   register: raw_disk_stat
 
 - name: Generate raw disk image via QEMU
@@ -146,14 +149,33 @@
         dest: "{{ build_dir }}/cloud-config.yaml"
         mode: "0644"
 
+    # User-supplied additional cloud-config YAML, layered into /oem/99_userdata.yaml.
+    # Only written when kairos_user_data is non-empty; the FAT32 image and the
+    # nc-over-serial cp commands check for the file's presence before acting.
+    - name: Write user extra-userdata.yaml (when kairos_user_data is set)
+      ansible.builtin.copy:
+        content: "{{ kairos_user_data }}"
+        dest: "{{ build_dir }}/extra-userdata.yaml"
+        mode: "0644"
+      when: kairos_user_data | default('') | length > 0
+
+    - name: Remove stale extra-userdata.yaml (when kairos_user_data is unset)
+      ansible.builtin.file:
+        path: "{{ build_dir }}/extra-userdata.yaml"
+        state: absent
+      when: kairos_user_data | default('') | length == 0
+
     - name: Create user-data FAT32 image
       ansible.builtin.shell: |
         dd if=/dev/zero of={{ build_dir }}/userdata.img bs=1M count=4 status=none
         mkfs.vfat -n CIDATA {{ build_dir }}/userdata.img >/dev/null
         mcopy -i {{ build_dir }}/userdata.img {{ build_dir }}/cloud-config.yaml "::user-data"
+        if [ -f {{ build_dir }}/extra-userdata.yaml ]; then
+          mcopy -i {{ build_dir }}/userdata.img {{ build_dir }}/extra-userdata.yaml "::extra-userdata"
+        fi
 
     - name: Create blank raw disk
-      ansible.builtin.shell: truncate -s 81920M {{ build_dir }}/kairos-disk.raw
+      ansible.builtin.shell: truncate -s 81920M {{ raw_disk_path }}
 
     # OVMF (UEFI) so kairos-agent detects UEFI and installs GRUB-EFI into an ESP.
     # The resulting raw image is bootable on UEFI hardware (physical Dell servers etc.).
@@ -175,7 +197,7 @@
           -display none \
           -chardev socket,id=ser0,path="$SOCK",server=on,wait=off \
           -serial chardev:ser0 \
-          -drive if=virtio,format=raw,media=disk,file={{ build_dir }}/kairos-disk.raw \
+          -drive if=virtio,format=raw,media=disk,file={{ raw_disk_path }} \
           -drive if=virtio,format=raw,readonly=on,file={{ build_dir }}/userdata.img \
           -drive format=raw,media=cdrom,readonly=on,file={{ build_dir }}/{{ iso_name }}.iso \
           -boot d \
@@ -185,9 +207,13 @@
         sleep 90
         (
           sleep 2
-          printf 'mount /dev/vdb /mnt 2>/dev/null && cp /mnt/user-data /oem/90_custom.yaml && cp /mnt/user-data /tmp/99_bcm.yaml\r\n'
+          # Mount CIDATA, copy the base cloud-config to /oem/90_custom.yaml,
+          # stash the optional extra-userdata to /tmp for after the install.
+          printf 'mount /dev/vdb /mnt 2>/dev/null && cp /mnt/user-data /oem/90_custom.yaml && cp /mnt/user-data /tmp/99_bcm.yaml && { [ -f /mnt/extra-userdata ] && cp /mnt/extra-userdata /tmp/99_userdata.yaml; true; }\r\n'
           sleep 3
-          printf 'kairos-agent --debug install 2>&1; mount /dev/vda2 /oem 2>/dev/null; cp /tmp/99_bcm.yaml /oem/99_bcm.yaml; poweroff\r\n'
+          # Run kairos-agent install, then re-mount the OEM partition on the new
+          # raw disk and drop both 99_bcm.yaml and (if present) 99_userdata.yaml in.
+          printf 'kairos-agent --debug install 2>&1; mount /dev/vda2 /oem 2>/dev/null; cp /tmp/99_bcm.yaml /oem/99_bcm.yaml; { [ -f /tmp/99_userdata.yaml ] && cp /tmp/99_userdata.yaml /oem/99_userdata.yaml; true; }; poweroff\r\n'
           sleep 600
         ) | nc -U "$SOCK" > {{ e2e_dir }}/logs/qemu-install.log 2>&1 &
         SERIAL_PID=$!
@@ -199,7 +225,7 @@
 
     - name: Fix ext4 metadata_csum for GRUB compatibility
       ansible.builtin.shell: |
-        LOOP=$(losetup -fP --show {{ build_dir }}/kairos-disk.raw)
+        LOOP=$(losetup -fP --show {{ raw_disk_path }})
         for p in ${LOOP}p2 ${LOOP}p3 ${LOOP}p4 ${LOOP}p5; do
           [ -b "$p" ] || continue
           e2fsck -fy "$p" >/dev/null 2>&1
@@ -210,7 +236,7 @@
 
     - name: Patch bootargs and network config for stable interface naming
       ansible.builtin.shell: |
-        LOOP=$(losetup -fP --show {{ build_dir }}/kairos-disk.raw)
+        LOOP=$(losetup -fP --show {{ raw_disk_path }})
         mkdir -p /tmp/kairos-patch-state /tmp/kairos-patch-img
         for part_label in p4:cOS/active.img p4:cOS/passive.img p3:cOS/recovery.img; do
           PART="${LOOP}${part_label%%:*}"
@@ -238,7 +264,7 @@
 
     - name: Set GRUB timeout for unattended boot
       ansible.builtin.shell: |
-        LOOP=$(losetup -fP --show {{ build_dir }}/kairos-disk.raw)
+        LOOP=$(losetup -fP --show {{ raw_disk_path }})
         mkdir -p /tmp/kairos-patch-grub
         # Partition 1 is the BIOS boot/grub partition
         for p in ${LOOP}p1 ${LOOP}p2; do
@@ -262,13 +288,13 @@
       become: true
 
     - name: Trim sparse zeros
-      ansible.builtin.shell: fallocate --dig-holes {{ build_dir }}/kairos-disk.raw
+      ansible.builtin.shell: fallocate --dig-holes {{ raw_disk_path }}
       failed_when: false
 
     - name: Generate checksum
       ansible.builtin.shell: |
         cd {{ build_dir }}
-        sha256sum kairos-disk.raw > kairos-disk.raw.sha256
+        sha256sum {{ kairos_profile }}-disk.raw > {{ kairos_profile }}-disk.raw.sha256
 
 - name: Restore ownership of build artifacts to invoking user
   ansible.builtin.file:

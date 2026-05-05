@@ -1,177 +1,201 @@
 # ---------------------------------------------------------------------------
-# Example inventory for a remote-BCM deployment (skips stages 1 & 2 — bcm-prepare
-# and bcm-vm). Use when you're targeting an already-running BCM head node and
-# want to kairos-build + deploy-dd against it.
+# Example inventory. Copy to inventory/group_vars/all.yml (gitignored) and
+# fill in real values. Use `make discover` against an existing BCM to harvest
+# most of these (BCM internal IP, CIDR, internal NIC, external DNS, etc.) into
+# bcm-discovery-<bcm-hostname>.yml, then paste the suggested values here.
 #
-# Copy to inventory/group_vars/all.yml (which is gitignored) and fill in values.
+# Two deploy modes share this file:
+#  - Remote BCM   — typical customer site. Requires bcm_ssh_host + jumphost.
+#                   Stages 3, 4, 6 only. Safety flags must stay false.
+#  - Local KVM    — dev/demo. bcm_ssh_host=localhost, no jumphost. All 6
+#                   stages run; bcm-prepare downloads + remasters BCM ISO.
 # ---------------------------------------------------------------------------
 
 # ==== BCM connection ====
-# How deploy-dd and validate reach the BCM head node. Every SSH/SCP call in
-# roles/deploy_dd and roles/validate goes through these — there is no direct
-# Ansible connection to BCM, only shell tasks on localhost that invoke
-# `sshpass -p $bcm_password ssh -F <per-run ssh config>`.
+# How deploy-dd and validate reach the BCM head node. Every SSH/SCP from the
+# build host goes through these via a per-run config file (`build/.bcm-ssh-
+# config`) — there is no Ansible delegate_to; tasks run on localhost and shell
+# out with `sshpass -p $bcm_password ssh -F <config> bcm-target`.
 
-# Root SSH password on BCM. Consumed by:
-#   - roles/deploy_dd/templates/deploy-dd.sh.j2  (every SSH/SCP to BCM during stage 4)
-#   - roles/validate/templates/validate.sh.j2    (remote cmsh queries during stage 6)
-# Stored in inventory because BCM root login is password-based by default.
-bcm_password:        ""
+# Root SSH password on BCM. Used by:
+#   - roles/deploy_dd/templates/deploy-dd.sh.j2  (every BCM call during stage 4)
+#   - roles/validate/templates/validate.sh.j2    (BCM-side checks during stage 6)
+bcm_password:        "ROOT-SSH-PASSWORD"
 
-# BCM's SSH endpoint as seen from THIS host (the build host running ansible).
-# When there's no jumphost this is BCM's reachable IP/hostname; when there IS
-# a jumphost this is the address you'd use on the *far side* of the jumphost
-# (typically BCM's internal IP), because ProxyCommand tunnels us onto that net.
-# Consumed as BCM_HOST in deploy-dd.sh.j2 and validate.sh.j2.
+# BCM's SSH endpoint as seen from the build host. With a jumphost, this is the
+# address valid on the *far side* of the jumphost (typically BCM's internal
+# IP). Without a jumphost, it's BCM's reachable IP/hostname.
 bcm_ssh_host:        "192.168.98.2"
-bcm_ssh_port:        22                              # TCP port for the SSH above
+bcm_ssh_port:        22
 
-# Optional jumphost. Applied via an OpenSSH ProxyCommand line that gets baked
-# into the per-run `.bcm-ssh-config` / `.discover-ssh-config` written by
-# deploy_dd, validate, and discover-bcm.yml. Leave blank for a directly
-# reachable BCM. Format: "user@host". Uses bcm_ssh_proxy_key for auth to the
-# jumphost (the jumphost only forwards — auth to BCM still uses bcm_password).
+# Optional jumphost in `user@host` form. Renders as an OpenSSH ProxyCommand
+# baked into the per-run SSH config used by deploy_dd, validate, discover.
+# Leave blank for a directly reachable BCM. Auth to the jumphost uses
+# bcm_ssh_proxy_key; auth to BCM stays password-based via sshpass.
 bcm_ssh_proxy_jump:  "partner@100.90.255.42"
-bcm_ssh_proxy_key:   "~/.ssh/sai"                    # jumphost private key; `~` expanded at template-render time
+bcm_ssh_proxy_key:   "~/.ssh/sai"          # `~` expanded at template-render time
 
 # ==== BCM provisioning network ====
-# These describe the flat L2 network where BCM runs DHCP/PXE/TFTP/NFS/HTTP and
-# where the compute nodes live. Not the customer's external/corporate net.
+# BCM's IP on the provisioning network — the address compute nodes reach for
+# DHCP/PXE/TFTP/NFS/HTTP. Consumed by:
+#   - roles/deploy_dd/templates/install-kairos.sh.j2  (HEAD_IP, baked in for the
+#     compute node's `curl http://<HEAD_IP>:8888/<profile>/disk.raw.lz4`)
+#   - roles/deploy_dd/templates/deploy-dd.sh.j2       (NFS export CIDR)
+#   - roles/validate/templates/validate.sh.j2         (BCM-internal-IP check)
+#   - roles/kairos_build/templates/cloud-config.yaml.j2  (BCM-integration boot
+#     stage's NFS mount source + cmd-in-chroot Master)
+bcm_internal_ip:     "192.168.98.2"
+bcm_internal_cidr:   "192.168.98.0/24"
 
-# BCM's IP on the provisioning network (the address compute nodes see).
-# Consumed by:
-#   - roles/deploy_dd/templates/install-kairos.sh.j2  (baked in as HEAD_IP —
-#     the HTTP source that compute nodes curl the lz4 image from at :8888)
-#   - roles/deploy_dd/templates/deploy-dd.sh.j2       (used to derive the
-#     synthetic compute-node IP = <prefix>.10 for validation reporting)
-#   - roles/validate/templates/validate.sh.j2         (target of health pings)
-#   - roles/kairos_build/templates/cloud-config.yaml.j2 (NFS mount source +
-#     cert-fetch host in the Kairos first-boot cloud-config)
-bcm_internal_ip:      "192.168.98.2"
-# Full CIDR of the provisioning network. Consumed by deploy-dd.sh.j2 to scope
-# NFS exports for /cm/shared to this network, and to derive the NET_PREFIX
-# used when the script allocates IPs for newly-added compute nodes.
-bcm_internal_cidr:    "192.168.98.0/24"
+# ==== Customer-BCM safety flags ====
+# Two flags that gate the only operations that would be cluster-wide on the
+# BCM. KEEP BOTH FALSE on customer/remote BCMs — flipping them rewrites
+# state shared with every other category on the site.
+#
+# bcm_manage_dns        : when true, deploy-dd issues
+#   `cmsh -c 'partition; use base; set nameservers $bcm_external_dns'` and
+#   restarts named. Rewrites the cluster's DNS forwarders.
+# bcm_manage_cluster_defaults : when true, deploy-dd flips the `base`
+#   partition's `defaultcategory` to the new kairos_profile category and
+#   sets `nodebasename`. Affects every newly-PXE'd node on the site.
+bcm_manage_dns:               false
+bcm_manage_cluster_defaults:  false
 
-# Safety flag: DO NOT rewrite BCM's cluster-wide DNS resolver.
-# Consumed by deploy-dd.sh.j2 and validate.sh.j2 — when false, the DNS
-# reconfiguration block is skipped and the site's existing resolver is left
-# alone. Keep this false on any customer BCM. Set true ONLY on a fresh/local
-# BCM where you own the DNS config (i.e. the local-KVM mode).
-bcm_manage_dns: false
-
-# Safety flag: DO NOT flip cluster-wide defaults (`defaultcategory`,
-# `nodebasename` in cmsh). Consumed by deploy-dd.sh.j2 at the "cluster
-# defaults" block. Keep false on customer BCMs so that new nodes that PXE
-# into this BCM continue to inherit the site's existing defaults, not
-# `kairos`. Set true only when the whole BCM is yours.
-bcm_manage_cluster_defaults: false
-
-# ==== Target compute node on that BCM ====
-# Identifies the specific device we're re-imaging with Kairos this run, and
-# the disk layout on that device.
-
-# Existing cmsh device name. Consumed by deploy-dd.sh.j2's "move target node
-# into kairos category" block: it runs `cmsh device use <name>; set category
-# kairos; set softwareimage kairos-installer; set installmode FULL` on this
-# device and only this device. Must match an already-defined device in BCM
-# (use `make discover` to list them). Also echoed by validate.sh.j2.
+# ==== Target compute node ====
+# Existing cmsh device name to re-image. deploy-dd does
+#   cmsh device use <bcm_target_node>; set category <kairos_profile>; …
+# on this device only. Use `make discover` to enumerate names + MACs.
 bcm_target_node:     "edge-4c4c454400485610804bc3c04f4e4434"
 
-# Existing BCM category to clone when deploy-dd creates the `kairos` category
-# on first run. Consumed by deploy-dd.sh.j2's category-clone step
-# (`cmsh category clone "<source>" kairos`). The clone inherits disksetup,
-# mon templates, interfaces — we then override softwareimage + FinalizeXML.
-# Cloning (rather than creating empty) preserves site-specific disk layout
-# for the target hardware. Must exist on BCM.
+# Existing BCM category to clone when creating the kairos_profile category
+# on first run. The clone inherits disksetup, mon templates, FinalizeXML —
+# preserves the site's per-hardware behavior. Must already exist on BCM.
 bcm_source_category: "S-AI Partner Lab"
 
-# OPTIONAL: MAC address of the compute node's provisioning NIC. When set,
-# deploy-dd.sh.j2's "target existing device" block adds `set mac <value>` to
-# the cmsh commit on bcm_target_node. This makes the deploy self-contained —
-# the MAC mapping doesn't have to be pre-configured on the device via cmsh.
-# Useful when bcm_target_node already exists but was registered without a MAC
-# (or with a stale one from previous hardware). Leave unset/empty to keep
-# whatever MAC cmsh already has on the device. Format: lowercase, colon-
-# separated, e.g. "4c:4c:45:44:00:48".
-# kairos_target_mac:   ""
+# OPTIONAL: write the booting NIC's MAC onto the target device's cmsh record.
+# Mirrors the local-KVM `device add physicalnode … set mac …` pattern, so
+# deploy-dd can own the MAC mapping rather than rely on prior cmsh
+# registration. Useful when bcm_target_node exists but its MAC is empty or
+# stale. Leave unset to keep cmsh's existing MAC.
+# kairos_target_mac:  "e8:9e:49:ca:94:f8"
 
-# OPTIONAL: IP address to assign to the compute node on the provisioning
-# network. When set, deploy-dd.sh.j2 adds `set ip <value>` to the same cmsh
-# commit. Parallel to kairos_target_mac — lets this deploy own the IP mapping
-# instead of relying on whatever cmsh already has. Must be inside
-# bcm_internal_cidr and outside the DHCP pool range (the pool is
-# .16–.250 within the CIDR). Leave unset/empty to keep the existing IP.
-# kairos_target_ip:    ""
+# OPTIONAL: write the BOOTIF interface IP onto the device's cmsh record.
+# Must be inside the device's network's CIDR (cmsh silently rejects mismatches
+# without an error). Note: this only updates cmsh; the physical cabling /
+# DHCP relay still determines which network the box actually PXE-boots on.
+# kairos_target_ip:   "192.168.98.10"
 
-# OS disk on the compute node that `dd` will overwrite with the Kairos raw
-# image. Consumed by install-kairos.sh.j2 as $DISK. Pinned — not
-# auto-detected, because picking the wrong disk bricks the node. Use
-# `/dev/nvme0n1` on NVMe hardware, `/dev/sda` on SAS/SATA.
+# OS disk on the compute node — overwritten by `dd`. Pinned, not auto-detected
+# (picking the wrong disk bricks the box). `/dev/nvme0n1` for NVMe, `/dev/sda`
+# for SAS/SATA. install-kairos.sh.j2 reads this as $DISK and does:
+#   curl <RAW_URL> | lz4 -d | dd of=$DISK bs=4M oflag=direct
+#   sgdisk -e $DISK; partprobe $DISK
+#   <grow-last-partition logic>      (auto-grows COS_PERSISTENT to fill disk)
+#   efibootmgr --create …            (UEFI boot entry for next power-on)
 kairos_target_disk:  "/dev/nvme0n1"
 
-# Space-separated list of sibling disks on the compute node to `wipefs -a -f`
-# before dd-ing kairos_target_disk. Consumed by install-kairos.sh.j2 as
-# $WIPE_DISKS. Needed because previous BCM/HPC installs often leave LVM PVs
-# and DRBD metadata on non-OS disks; if we don't wipe them, Kairos's
-# persistent-partition logic can see stale signatures and refuse to mount.
-# Names are bare device names (no /dev/ prefix).
+# Sibling disks to wipefs before dd. Bare device names, space-separated.
+# Clears LVM PV / DRBD / old filesystem signatures so Kairos's persistent-
+# partition logic doesn't see stale metadata on next boot. Empty = no wipes.
 kairos_wipe_disks:   "nvme1n1 nvme2n1 nvme3n1 nvme4n1"
 
+# ==== Kairos profile (artifact + BCM-state namespacing) ====
+# A profile bundles a build artifact + its BCM-side resources under one name.
+# Multiple profiles can coexist on the same BCM — each gets its own software
+# image, category, image directory, and `exclude-<profile>` health filter.
+#
+# Default `default-kairos`. Pick a different name per build to keep multiple
+# Kairos variants side-by-side (e.g. one with extra apt packages, one
+# CIS-hardened, one with a different OS_VERSION). What this controls:
+#
+#   - local artifact:        build/<profile>-disk.raw[.lz4]
+#   - BCM upload:            /cm/shared/kairos/<profile>/disk.raw.lz4
+#   - HTTP URL:              http://<bcm>:8888/<profile>/disk.raw.lz4
+#   - cmsh software image:   <profile>-installer
+#   - cmsh category:          <profile>
+#   - exclude filter:         exclude-<profile>  (scoped to <profile> category)
+kairos_profile:      "default-kairos"
+
+# ==== Kairos build customization ====
+# Open-ended dict merged over roles/kairos_build/defaults/main.yml's
+# kairos_canvos_defaults. Override any subset of CanvOS .arg keys; arbitrary
+# new keys flow through to .arg verbatim so future CanvOS additions don't
+# require a role change. Defaults reproduce CanvOS upstream defaults plus the
+# four user-facing knobs (OS_VERSION, UPDATE_KERNEL, CIS_HARDENING,
+# UBUNTU_PRO_KEY). Common overrides:
+kairos_canvos_args: {}
+# Example:
+# kairos_canvos_args:
+#   OS_VERSION:      "22.04"      # also "20.04", "24.04"
+#   UPDATE_KERNEL:   "true"       # let apt upgrade the kernel during build
+#   CIS_HARDENING:   "false"      # run /cis-harden/harden.sh during build
+#   UBUNTU_PRO_KEY:  ""            # if set, attaches Ubuntu Pro during build
+#   CUSTOM_TAG:      "site-name"  # image tag in the temporary registry
+
+# Open-ended apt package list. Each name appended to a Dockerfile RUN block
+# in CanvOS, between the BCM-scripts COPY block and CanvOS's other layers.
+# Empty list = unchanged image.
+kairos_extra_apt_packages: []
+# Example:
+# kairos_extra_apt_packages: [htop, tcpdump, jq, lvm2]
+
+# Open-ended raw cloud-config YAML written to /oem/99_userdata.yaml on the
+# built image. Layered on top of /oem/90_custom.yaml (BCM/Palette base). Don't
+# redefine `users:` or `install:` here — those are owned by the base. Empty
+# string = no /oem/99_userdata.yaml is written.
+kairos_user_data: ""
+# Example:
+# kairos_user_data: |
+#   #cloud-config
+#   stages:
+#     boot:
+#       - name: marker
+#         commands:
+#           - "echo CUSTOM_USER_DATA > /var/log/marker"
+
 # ==== Palette ====
-# These are baked into the Kairos image at build time (stage 3, kairos_build)
-# via roles/kairos_build/templates/cloud-config.yaml.j2, NOT applied at
-# deploy-dd time. Changing any of these requires a rebuild
-# (`make clean-canvos && make kairos-build`).
+# Baked into the Kairos image at build time (stage 3) via
+# roles/kairos_build/templates/cloud-config.yaml.j2. Changing any of these
+# requires `make clean-canvos && make kairos-build`.
 
-# Palette API hostname (SaaS `api.spectrocloud.com` or on-prem e.g.
-# `s-ai.lan`). Written into stylus config as `paletteEndpoint` and also
-# referenced by the on-node palette-cleanup-stale.sh pre-registration hook
-# when calling the admin API to delete stale records / mint tokens.
-palette_endpoint:          "s-ai.lan"
+# Palette API hostname. SaaS = api.spectrocloud.com, on-prem = e.g. s-ai.lan.
+# Written into stylus config as paletteEndpoint and consumed by the on-node
+# palette-cleanup-stale.sh + the dynamic Palette-label PUT in cloud-config.
+palette_endpoint:           "s-ai.lan"
 
-# Palette project identity the node registers into. `project_name` is the
-# human-readable label used in stylus config; `project_uid` is the internal
-# ID consumed by the on-node admin-API cleanup + auto-token-minting script.
-# Both are baked into cloud-config.yaml.j2.
-palette_project_name:      "Default"
-palette_project_uid:       "69a81eb07122277de95c3b1f"
+# Palette project identity. project_name is the human label; project_uid is
+# the internal ID consumed by palette-cleanup-stale.sh + the dynamic-label
+# PUT (which uses the admin API project-scoped endpoints).
+palette_project_name:       "Default"
+palette_project_uid:        "69a81eb07122277de95c3b1f"
 
-# Palette ADMIN API key. Required permissions: `edgeToken.create` +
-# `edgehost.delete`. Consumed by palette-cleanup-stale.sh (baked into the
-# image via the CanvOS overlay) to:
-#   1. Delete any stale edge-host record whose UID collides with this node's
-#      SMBIOS-derived UID, making re-deploys safe.
-#   2. Auto-mint a fresh edgeHostToken on first boot if `palette_token`
-#      wasn't baked in (see below).
-# Required unless you bake in a pre-minted `palette_token` AND don't need
-# stale-host cleanup for re-deploys.
-palette_api_key:           ""
+# Palette ADMIN API key. Required permissions:
+#   edgeToken.create   (mint registration token if palette_token is unset)
+#   edgehost.delete    (stale-record cleanup before re-registration)
+#   edgehost.update    (PUT /v1/edgehosts/<uid>/meta to set tags+labels)
+# Required unless palette_token is baked in AND you don't need stale-host
+# cleanup AND you don't want dynamic Palette labels.
+palette_api_key:            ""
 
-# Stylus config toggles. Baked into cloud-config.yaml.j2.
-#   installation_mode: `connected` (node reaches Palette directly) or
-#                      `airgap`    (local Palette / mirrored content).
-#   management_mode:   `central`   (managed from Palette tenant) or
-#                      `local`     (self-managed).
-palette_installation_mode: "connected"
-palette_management_mode:   "central"
+# connected: node reaches Palette directly. airgap: local Palette / mirrored
+# content. central: managed from Palette tenant. local: self-managed.
+palette_installation_mode:  "connected"
+palette_management_mode:    "central"
 
-# PEM block for a private CA that signed the Palette endpoint's TLS cert.
-# Baked into cloud-config.yaml.j2 and installed into the image's trust
-# store at build time. Only required for on-prem Palette with a non-public
-# cert; leave empty/omitted for SaaS Palette with public certs.
+# PEM block for a private CA signing the Palette endpoint's cert. Required for
+# on-prem Palette with non-public certs; leave empty for SaaS Palette.
 palette_ca_cert: |
   -----BEGIN CERTIFICATE-----
   ...
   -----END CERTIFICATE-----
 
 # OPTIONAL: pre-minted, project-scoped edge-host registration token. When
-# present, baked into cloud-config.yaml.j2 as `edgeHostToken` and used
-# verbatim at first boot. When absent, palette-cleanup-stale.sh mints one
-# on first boot via `POST /v1/edgehosts/tokens` using palette_api_key +
-# palette_project_uid. Using the auto-mint path is usually simpler — it
-# avoids token expiry mismatches when an image is built long before deploy.
-# palette_token: ""
+# present, baked into cloud-config.yaml.j2 as edgeHostToken. When absent,
+# palette-cleanup-stale.sh mints one on first boot via
+# `POST /v1/edgehosts/tokens` using palette_api_key + palette_project_uid.
+# Auto-mint avoids token-expiry mismatch when an image is built long before
+# deploy.
+# palette_token:            ""
 
 # ---------------------------------------------------------------------------
 # The rest of these are NOT consumed on a remote-BCM deploy — they're only
@@ -180,25 +204,20 @@ palette_ca_cert: |
 # ---------------------------------------------------------------------------
 
 # ==== Local-KVM BCM VM sizing (stages 1 & 2) ====
-# bcm_hostname:         "bcm11-headnode"     # BCM hostname; baked into build-config.xml
+# bcm_hostname:         "bcm11-headnode"     # baked into build-config.xml
 # bcm_timezone:         "America/Los_Angeles"
-# bcm_external_gateway: "10.0.2.2"           # rendered into build-config.xml by bcm_prepare
-#
-# bcm_external_dns is consumed by bcm_prepare (baked into build-config.xml) AND
-# by deploy-dd.sh.j2's DNS-forwarders block when bcm_manage_dns=true. On a
-# remote-BCM deploy with bcm_manage_dns=false it's unused.
-# bcm_external_dns:     "1.1.1.1"
-#
-# bcm_internal_netmask is consumed only by bcm_prepare's bcm-autoinstall.sh to
-# configure eth0 + DHCP mask on the installed BCM. Unused on remote-BCM.
-# bcm_internal_netmask: "24"
-#
+# bcm_external_gateway: "10.0.2.2"           # only consumed by bcm_prepare;
+#                                              irrelevant on remote BCM
+# bcm_external_dns:     "1.1.1.1"            # consumed by bcm_prepare AND by
+#                                              deploy-dd when bcm_manage_dns=true
+# bcm_internal_netmask: "24"                 # consumed by bcm_prepare's
+#                                              bcm-autoinstall.sh; unused remote
 # bcm_vm_ram:           8192                 # MB
 # bcm_vm_cpus:          4
 # bcm_vm_disk_size:     "100G"
-# bcm_https_port:       10443                # QEMU host-port forward to BCM:443 (web UI)
+# bcm_https_port:       10443                # QEMU host-port forward to BCM:443
 
-# ==== JFrog (BCM ISO download, only for bcm-prepare) ====
+# ==== JFrog (BCM ISO download — only for bcm-prepare) ====
 # jfrog_token:    ""
 # jfrog_instance: "insightsoftmax.jfrog.io"
 # jfrog_repo:     "iso-releases"
@@ -210,7 +229,27 @@ palette_ca_cert: |
 # kairos_vm_cpus:      2
 # kairos_vm_disk_size: "80G"
 
-# ==== Kairos build (usually leave defaults) ====
-# Temporary container registry used by CanvOS during kairos-build. ttl.sh is
-# anonymous and expires images after a few hours — fine for one-shot builds.
+# ==== CanvOS container-build registry (used during kairos-build) ====
+# Temporary ephemeral registry that holds the CanvOS-built container while
+# Earthly assembles the ISO. ttl.sh is anonymous and expires after a few
+# hours — fine for one-shot builds. Override only if your network blocks
+# ttl.sh or you have your own registry.
 # kairos_container_registry: "ttl.sh"
+
+# ---------------------------------------------------------------------------
+# Internal — typically don't override these in inventory.
+# ---------------------------------------------------------------------------
+
+# Computed path facts. The Makefile passes E2E_DIR via environment to ansible-
+# playbook; these inventory entries are fallbacks for invocations that bypass
+# the Makefile. Override only when running from a non-standard layout.
+# e2e_dir:   "{{ playbook_dir | default('.') }}/.."
+# build_dir: "{{ e2e_dir }}/build"
+# dist_dir:  "{{ e2e_dir }}/dist"
+
+# DEPRECATED. Surfaced as a suggestion by older `make discover` output but no
+# longer consumed anywhere — the kairos-installer kernel version is detected
+# at deploy-dd time via `ls /cm/images/<profile>-installer/boot/vmlinuz-*` on
+# BCM. Safe to leave unset. Kept here only because legacy inventories still
+# reference it.
+# kairos_kernel_version: "6.8.0-87-generic"
