@@ -90,7 +90,48 @@ stages:
               2>/dev/null | grep -oE '^[a-zA-Z0-9_-]+$' | tail -1)
           [ -z "${NODE_NAME}" ] && export NODE_NAME=$(hostname)
           hostnamectl set-hostname "${NODE_NAME}" 2>/dev/null || hostname "${NODE_NAME}" 2>/dev/null || true
-          printf '#cloud-config\nstylus:\n  site:\n    name: %s\n' "${NODE_NAME}" > /oem/91_palette_name.yaml
+          # Push BCM-derived labels to the Palette edge-host record via admin
+          # API. Stylus's own cloud-config merge doesn't pick up /oem/*.yaml
+          # files written from stages.boot (kairos-agent's initramfs merge
+          # already snapshotted /run/stylus/userdata before this stage ran),
+          # so direct API write is the only way to surface dynamic tags.
+          # metadata.name stays as the SMBIOS-UID-derived edge-* name (locked
+          # by Palette to track the host across re-deploys); friendly
+          # identifiers go in metadata.labels.
+          SERVICE_TAG=$(dmidecode -s system-serial-number 2>/dev/null | tr -d '[:space:]')
+          BCM_CATEGORY=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 -i /var/lib/bcm/bcm-key \
+              root@{{ bcm_internal_ip }} \
+              "cmsh -c 'device; use ${NODE_NAME}; get category' 2>/dev/null" \
+              2>/dev/null | grep -oE '^[a-zA-Z0-9_.-]+$' | tail -1)
+          SMBIOS_UUID=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null | tr -d '-' | tr 'A-Z' 'a-z')
+          EDGE_UID="edge-${SMBIOS_UUID}"
+          # Wait for stylus to finish first-boot registration (the edge-host
+          # record needs to exist in Palette before we PUT labels onto it).
+          # Then send the PUT in the background (don't block the boot stage).
+          if [ -r /oem/palette-admin.env ]; then
+            (
+              # shellcheck disable=SC1091
+              . /oem/palette-admin.env
+              for i in $(seq 1 60); do
+                code=$(curl -sk -m 15 -H "ApiKey: ${APIKEY}" -H "ProjectUid: ${PROJECTUID}" \
+                    -o /dev/null -w "%{http_code}" \
+                    "https://${ENDPOINT}/v1/edgehosts/${EDGE_UID}")
+                [ "$code" = "200" ] && break
+                sleep 10
+              done
+              [ "$code" = "200" ] || exit 0
+              body=$(printf '{"uid":"%s","metadata":{"uid":"%s","name":"%s","labels":{"palette.ai":"true","palette.ai/control-plane":"true","hostname":"%s","bcm-device":"%s","bcm-category":"%s","bcm-mac":"%s","service-tag":"%s"}}}' \
+                  "$EDGE_UID" "$EDGE_UID" "$EDGE_UID" \
+                  "$NODE_NAME" "$NODE_NAME" "${BCM_CATEGORY:-unknown}" "$NODE_MAC" "${SERVICE_TAG:-unknown}")
+              curl -sk -m 30 -X PUT \
+                  -H "ApiKey: ${APIKEY}" -H "ProjectUid: ${PROJECTUID}" \
+                  -H "Content-Type: application/json" \
+                  -d "$body" \
+                  "https://${ENDPOINT}/v1/edgehosts/${EDGE_UID}/meta" >/dev/null 2>&1 || true
+            ) </dev/null >/dev/null 2>&1 &
+            disown
+          fi
           BCM_ROOT_PUBKEY=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 -i /var/lib/bcm/bcm-key \
               root@{{ bcm_internal_ip }} 'cat /root/.ssh/id_ecdsa.pub' 2>/dev/null)

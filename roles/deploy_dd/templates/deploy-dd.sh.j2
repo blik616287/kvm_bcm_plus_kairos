@@ -1,16 +1,18 @@
 #!/bin/bash
 # deploy-dd.sh — Rendered by Ansible with all variables injected.
-# Uploads raw image to BCM, configures installer + kairos category.
-# KVM variant: connects via port-forwarded SSH, separate internal/external networks.
+# Uploads the raw image to BCM, configures the {{ kairos_profile }}-installer
+# software image and {{ kairos_profile }} category. Profile-namespaced so
+# multiple profiles can coexist on the same BCM.
 set -uo pipefail
 
 BCM_HOST="{{ bcm_ssh_host | default('localhost') }}"
 BCM_PASSWORD="{{ bcm_password }}"
 BCM_SSH_PORT="{{ bcm_ssh_port }}"
 HEAD_NODE_IP="{{ bcm_internal_ip }}"
-COMPUTE_MAC="{{ kairos_vm_mac }}"
+COMPUTE_MAC="{{ kairos_vm_mac | default('') }}"
 BUILD_DIR="{{ build_dir }}"
-RAW_IMAGE="${BUILD_DIR}/kairos-disk.raw"
+KAIROS_PROFILE="{{ kairos_profile }}"
+RAW_IMAGE="${BUILD_DIR}/${KAIROS_PROFILE}-disk.raw"
 
 mkdir -p "${BUILD_DIR}"
 SSH_CONFIG="${BUILD_DIR}/.bcm-ssh-config"
@@ -41,7 +43,7 @@ step()  { echo -e "\033[0;36m\033[1m[STEP]\033[0m $*"; }
 
 [ -f "${RAW_IMAGE}" ] || { err "Raw image not found at ${RAW_IMAGE}"; exit 1; }
 
-step "Checking BCM at ${BCM_HOST}:${BCM_SSH_PORT}..."
+step "Checking BCM at ${BCM_HOST}:${BCM_SSH_PORT} (profile=${KAIROS_PROFILE})..."
 ${SSH_CMD} "echo ok" &>/dev/null || { err "Cannot SSH to BCM"; exit 1; }
 info "BCM reachable"
 
@@ -116,12 +118,43 @@ fi
 PUBKEY=$(cat "${BCM_KEY}.pub")
 ${SSH_CMD} "grep -qF '${PUBKEY}' /root/.ssh/authorized_keys 2>/dev/null || echo '${PUBKEY}' >> /root/.ssh/authorized_keys" 2>/dev/null || true
 
-# NFS exports (persistent via /etc/exports) — scoped to discovered CIDR
-# Unquoted heredoc: local shell expands ${DISCOVERED_CIDR} before sending to remote.
+# Build the list of CIDRs that need NFS access. Always includes the BCM
+# provisioning CIDR (DISCOVERED_CIDR). On remote-BCM deploys, the target
+# device's BOOTIF interface may live on a *different* internal network
+# (e.g. a tenant VLAN reached via DHCP relay): query cmsh for that
+# network's CIDR and add it. Without this the cloud-config's NFS mount
+# of /cm/images/default-image fails for tenant-net devices and the
+# cmd-in-chroot heartbeat never reaches BCM (BCM stays on
+# INSTALLER_UNREACHABLE indefinitely).
+EXPORT_CIDRS="${DISCOVERED_CIDR}"
+{% if bcm_target_node is defined and bcm_target_node | length > 0 %}
+TARGET_NET=$(${SSH_CMD} "cmsh -c 'device; use \"{{ bcm_target_node }}\"; interfaces; use BOOTIF; get network' 2>/dev/null" 2>/dev/null | filter_motd | tr -d '[:space:]')
+if [ -n "${TARGET_NET}" ]; then
+    TARGET_BASE=$(${SSH_CMD} "cmsh -c 'network; use ${TARGET_NET}; get baseaddress' 2>/dev/null" 2>/dev/null | filter_motd | tr -d '[:space:]')
+    TARGET_BITS=$(${SSH_CMD} "cmsh -c 'network; use ${TARGET_NET}; get netmaskbits' 2>/dev/null" 2>/dev/null | filter_motd | tr -d '[:space:]')
+    if [ -n "${TARGET_BASE}" ] && [ -n "${TARGET_BITS}" ]; then
+        TARGET_CIDR="${TARGET_BASE}/${TARGET_BITS}"
+        if [ "${TARGET_CIDR}" != "${DISCOVERED_CIDR}" ]; then
+            EXPORT_CIDRS="${EXPORT_CIDRS} ${TARGET_CIDR}"
+            info "Adding NFS export for target's network ${TARGET_NET} = ${TARGET_CIDR}"
+        fi
+    fi
+fi
+{% endif %}
+
+# NFS exports (persistent via /etc/exports) — one entry per CIDR per filesystem.
+# Each profile's installer image is exported separately so multiple profiles
+# can coexist; the /cm/shared export is shared across profiles. Each network
+# (e.g. managementnet, tenant-net) gets its own export ACL line so cmd-in-chroot
+# can NFS-mount /cm/images/default-image regardless of which subnet the device
+# lives on.
+# Unquoted heredoc: local shell expands ${EXPORT_CIDRS} before sending to remote.
 ${SSH_CMD} bash -s << EOF | filter_motd
-grep -qF "default-image ${DISCOVERED_CIDR}" /etc/exports 2>/dev/null || echo "/cm/images/default-image ${DISCOVERED_CIDR}(ro,no_subtree_check,no_root_squash,async)" >> /etc/exports
-grep -qF "/cm/shared ${DISCOVERED_CIDR}" /etc/exports 2>/dev/null || echo "/cm/shared ${DISCOVERED_CIDR}(rw,no_subtree_check,no_root_squash,async)" >> /etc/exports
-grep -qF "kairos-installer ${DISCOVERED_CIDR}" /etc/exports 2>/dev/null || echo "/cm/images/kairos-installer ${DISCOVERED_CIDR}(ro,no_subtree_check,no_root_squash,async)" >> /etc/exports
+for cidr in ${EXPORT_CIDRS}; do
+  grep -qF "/cm/images/default-image \$cidr" /etc/exports 2>/dev/null || echo "/cm/images/default-image \$cidr(ro,no_subtree_check,no_root_squash,async)" >> /etc/exports
+  grep -qF "/cm/shared \$cidr" /etc/exports 2>/dev/null || echo "/cm/shared \$cidr(rw,no_subtree_check,no_root_squash,async)" >> /etc/exports
+  grep -qF "/cm/images/{{ kairos_profile }}-installer \$cidr" /etc/exports 2>/dev/null || echo "/cm/images/{{ kairos_profile }}-installer \$cidr(ro,no_subtree_check,no_root_squash,async)" >> /etc/exports
+done
 exportfs -ra
 
 # Fix DHCP authoritative
@@ -134,48 +167,52 @@ sed -i 's|range .*|range ${POOL_START} ${POOL_END_IP};|' /etc/dhcpd.conf 2>/dev/
 systemctl restart dhcpd
 EOF
 
-${SSH_CMD} << 'EOF' | filter_motd
-
-# Configure rsyncd
-cat > /etc/rsyncd.conf << 'RCONF'
+# rsyncd module per profile — additive (each new profile adds a new module
+# block, none are removed). Re-running for the same profile is idempotent.
+${SSH_CMD} bash -s << EOF | filter_motd
+RCONF=/etc/rsyncd.conf
+if [ ! -f "\$RCONF" ] || ! grep -q '^\[default-image\]' "\$RCONF" 2>/dev/null; then
+cat > "\$RCONF" << 'RCBASE'
 uid = root
 gid = root
 use chroot = no
 read only = yes
 list = yes
 
-[kairos-installer]
-path = /cm/images/kairos-installer
-comment = Kairos installer image
-
 [default-image]
 path = /cm/images/default-image
 comment = Default image
-RCONF
+RCBASE
+fi
+if ! grep -q '^\[{{ kairos_profile }}-installer\]' "\$RCONF" 2>/dev/null; then
+    printf '\n[{{ kairos_profile }}-installer]\npath = /cm/images/{{ kairos_profile }}-installer\ncomment = Kairos installer image ({{ kairos_profile }})\n' >> "\$RCONF"
+fi
 systemctl enable rsync 2>/dev/null
 systemctl restart rsync
 EOF
 
-step "Deploying Kairos via dd Installer"
+step "Deploying Kairos via dd Installer (profile=${KAIROS_PROFILE})"
 
-# 1. Upload raw image (lz4 compressed)
+# 1. Upload raw image (lz4 compressed) into the profile-scoped directory.
 info "[1/7] Compressing and uploading..."
-${SSH_CMD} "mkdir -p /cm/shared/kairos" | filter_motd
+${SSH_CMD} "mkdir -p /cm/shared/kairos/${KAIROS_PROFILE}" | filter_motd
 COMPRESSED="${RAW_IMAGE}.lz4"
 [ ! -f "$COMPRESSED" ] || [ "$RAW_IMAGE" -nt "$COMPRESSED" ] && lz4 -f "$RAW_IMAGE" "$COMPRESSED"
 # Skip SCP if remote file already matches local size (idempotent re-run through a slow jumphost)
 LOCAL_SZ=$(stat -c %s "${COMPRESSED}" 2>/dev/null || echo 0)
-REMOTE_SZ=$(${SSH_CMD} "stat -c %s /cm/shared/kairos/disk.raw.lz4 2>/dev/null" 2>/dev/null | filter_motd | tr -d '[:space:]' || echo 0)
+REMOTE_SZ=$(${SSH_CMD} "stat -c %s /cm/shared/kairos/${KAIROS_PROFILE}/disk.raw.lz4 2>/dev/null" 2>/dev/null | filter_motd | tr -d '[:space:]' || echo 0)
 if [ "${LOCAL_SZ}" = "${REMOTE_SZ}" ] && [ "${LOCAL_SZ}" != "0" ]; then
     info "Remote image already matches local size (${LOCAL_SZ} bytes) — skipping SCP"
 else
     info "Uploading ${LOCAL_SZ} bytes (remote had ${REMOTE_SZ:-none})..."
-    ${SCP_CMD} "${COMPRESSED}" ${SCP_DEST}:/cm/shared/kairos/disk.raw.lz4
+    ${SCP_CMD} "${COMPRESSED}" ${SCP_DEST}:/cm/shared/kairos/${KAIROS_PROFILE}/disk.raw.lz4
 fi
 
-# 2. HTTP server
+# 2. HTTP server — single shared kairos-http.service serves the entire
+# /cm/shared/kairos/ tree, so each profile's subdirectory is reachable as
+# http://<bcm>:8888/<profile>/disk.raw.lz4 without a per-profile unit.
 info "[2/7] HTTP server..."
-${SSH_CMD} << 'EOF' | filter_motd
+${SSH_CMD} bash -s << EOF | filter_motd
 cat > /etc/systemd/system/kairos-http.service << 'SVC'
 [Unit]
 Description=Kairos image HTTP server
@@ -191,42 +228,42 @@ SVC
 systemctl daemon-reload
 systemctl enable --now kairos-http
 sleep 2
-curl --fail --silent --head http://localhost:8888/disk.raw.lz4 >/dev/null 2>&1 && echo "[OK]" || { echo "[FAIL]"; exit 1; }
+curl --fail --silent --head http://localhost:8888/{{ kairos_profile }}/disk.raw.lz4 >/dev/null 2>&1 && echo "[OK]" || { echo "[FAIL]"; exit 1; }
 EOF
 
-# 3. Installer image
-info "[3/7] Creating installer image..."
-${SSH_CMD} << 'EOF' | filter_motd
-if cmsh -c "softwareimage; use kairos-installer" 2>/dev/null; then
-    echo "kairos-installer already exists, reusing"
+# 3. Installer image (profile-scoped). Cloning is idempotent.
+info "[3/7] Creating installer image {{ kairos_profile }}-installer..."
+${SSH_CMD} bash -s << EOF | filter_motd
+if cmsh -c "softwareimage; use {{ kairos_profile }}-installer" 2>/dev/null; then
+    echo "{{ kairos_profile }}-installer already exists, reusing"
 else
-    cmsh -c "softwareimage; clone default-image kairos-installer; commit" 2>&1
-    echo "[OK] kairos-installer image created"
+    cmsh -c "softwareimage; clone default-image {{ kairos_profile }}-installer; commit" 2>&1
+    echo "[OK] {{ kairos_profile }}-installer image created"
 fi
 TRIES=0
-while [ ! -d /cm/images/kairos-installer/usr ] && [ $TRIES -lt 60 ]; do
-    sleep 2; TRIES=$((TRIES + 1))
+while [ ! -d /cm/images/{{ kairos_profile }}-installer/usr ] && [ \$TRIES -lt 60 ]; do
+    sleep 2; TRIES=\$((TRIES + 1))
 done
-[ -d /cm/images/kairos-installer/usr ] && echo "[OK] Image filesystem ready" || { echo "[FAIL] Image not provisioned after 120s"; exit 1; }
+[ -d /cm/images/{{ kairos_profile }}-installer/usr ] && echo "[OK] Image filesystem ready" || { echo "[FAIL] Image not provisioned after 120s"; exit 1; }
 EOF
 
 # 4. Install dd script + service into the software image
-info "[4/7] Installing dd service into kairos-installer image..."
+info "[4/7] Installing dd service into {{ kairos_profile }}-installer image..."
 # Ensure lz4 is available on BCM (use whatever DNS BCM already has; don't clobber /etc/resolv.conf)
 ${SSH_CMD} "which lz4 >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq lz4 >/dev/null 2>&1; }"
 ${SSH_CMD} "which lz4 >/dev/null 2>&1" || { err "lz4 not available on BCM host — install manually and re-run"; exit 1; }
-${SSH_CMD} "cp \$(which lz4) /cm/images/kairos-installer/usr/local/bin/lz4 && chmod +x /cm/images/kairos-installer/usr/local/bin/lz4"
-${SCP_CMD} "${BUILD_DIR}/install-kairos.sh" ${SCP_DEST}:/cm/images/kairos-installer/usr/local/sbin/install-kairos.sh
-${SSH_CMD} "chmod +x /cm/images/kairos-installer/usr/local/sbin/install-kairos.sh"
+${SSH_CMD} "cp \$(which lz4) /cm/images/{{ kairos_profile }}-installer/usr/local/bin/lz4 && chmod +x /cm/images/{{ kairos_profile }}-installer/usr/local/bin/lz4"
+${SCP_CMD} "${BUILD_DIR}/install-kairos.sh" ${SCP_DEST}:/cm/images/{{ kairos_profile }}-installer/usr/local/sbin/install-kairos.sh
+${SSH_CMD} "chmod +x /cm/images/{{ kairos_profile }}-installer/usr/local/sbin/install-kairos.sh"
 
 # Ensure DHCP is configured for all possible NIC names
-${SSH_CMD} "grep -q 'auto eth0' /cm/images/kairos-installer/etc/network/interfaces 2>/dev/null || \
-  printf '\nauto eth0\niface eth0 inet dhcp\n\nauto ens3\niface ens3 inet dhcp\n' >> /cm/images/kairos-installer/etc/network/interfaces"
+${SSH_CMD} "grep -q 'auto eth0' /cm/images/{{ kairos_profile }}-installer/etc/network/interfaces 2>/dev/null || \
+  printf '\nauto eth0\niface eth0 inet dhcp\n\nauto ens3\niface ens3 inet dhcp\n' >> /cm/images/{{ kairos_profile }}-installer/etc/network/interfaces"
 
-${SSH_CMD} << 'EOF' | filter_motd
-IMAGE_ROOT="/cm/images/kairos-installer"
-mkdir -p "${IMAGE_ROOT}/etc/systemd/system"
-cat > "${IMAGE_ROOT}/etc/systemd/system/kairos-install.service" << 'SERVICE'
+${SSH_CMD} bash -s << EOF | filter_motd
+IMAGE_ROOT="/cm/images/{{ kairos_profile }}-installer"
+mkdir -p "\${IMAGE_ROOT}/etc/systemd/system"
+cat > "\${IMAGE_ROOT}/etc/systemd/system/kairos-install.service" << 'SERVICE'
 [Unit]
 Description=Install Kairos Raw Disk Image
 After=network-online.target
@@ -241,14 +278,14 @@ StandardError=journal+console
 [Install]
 WantedBy=multi-user.target
 SERVICE
-chroot "${IMAGE_ROOT}" systemctl enable kairos-install.service 2>&1 || {
-    mkdir -p "${IMAGE_ROOT}/etc/systemd/system/multi-user.target.wants"
-    ln -sf /etc/systemd/system/kairos-install.service "${IMAGE_ROOT}/etc/systemd/system/multi-user.target.wants/kairos-install.service"
+chroot "\${IMAGE_ROOT}" systemctl enable kairos-install.service 2>&1 || {
+    mkdir -p "\${IMAGE_ROOT}/etc/systemd/system/multi-user.target.wants"
+    ln -sf /etc/systemd/system/kairos-install.service "\${IMAGE_ROOT}/etc/systemd/system/multi-user.target.wants/kairos-install.service"
 }
 echo "[OK] Installer script and service installed in image"
 EOF
 
-# 5. PXE template + syslinux modules
+# 5. PXE template + syslinux modules (cluster-wide, profile-agnostic)
 info "[5/7] PXE template..."
 ${SSH_CMD} << 'EOF' | filter_motd
 for tmpl in /tftpboot/pxelinux.cfg/template /tftpboot/x86_64/bios/pxelinux.cfg/template; do
@@ -262,59 +299,61 @@ for mod in menu.c32 libutil.c32 ldlinux.c32 libcom32.c32; do
 done
 EOF
 
-# 6. Configure category + node registration
-info "[6/7] Configuring BCM..."
-${SSH_CMD} << 'EOF' | filter_motd
-IMAGE_ROOT="/cm/images/kairos-installer"
-ACTUAL_KERNEL=$(ls "${IMAGE_ROOT}/boot/vmlinuz-"* 2>/dev/null | head -1 | sed 's|.*/vmlinuz-||')
-if [ -n "$ACTUAL_KERNEL" ]; then
-    [ ! -d "${IMAGE_ROOT}/lib/modules/${ACTUAL_KERNEL}" ] && mkdir -p "${IMAGE_ROOT}/lib/modules/${ACTUAL_KERNEL}"
-    cmsh -c "softwareimage; use kairos-installer; set kernelversion ${ACTUAL_KERNEL}; commit" 2>&1 || true
+# 6. Configure profile category + node registration
+info "[6/7] Configuring BCM ({{ kairos_profile }} category)..."
+${SSH_CMD} bash -s << EOF | filter_motd
+IMAGE_ROOT="/cm/images/{{ kairos_profile }}-installer"
+ACTUAL_KERNEL=\$(ls "\${IMAGE_ROOT}/boot/vmlinuz-"* 2>/dev/null | head -1 | sed 's|.*/vmlinuz-||')
+if [ -n "\$ACTUAL_KERNEL" ]; then
+    [ ! -d "\${IMAGE_ROOT}/lib/modules/\${ACTUAL_KERNEL}" ] && mkdir -p "\${IMAGE_ROOT}/lib/modules/\${ACTUAL_KERNEL}"
+    cmsh -c "softwareimage; use {{ kairos_profile }}-installer; set kernelversion \${ACTUAL_KERNEL}; commit" 2>&1 || true
 fi
 
-# Create kairos category (clone from configured source — "default" on fresh BCM,
-# a site-specific category like "Partner Lab" on an existing deployment)
-cmsh -c "category; list" 2>/dev/null | grep -q '^kairos\b' \
-  || cmsh -c "category; clone \"{{ bcm_source_category | default('default') }}\" kairos; commit" 2>&1 || true
+# Create the {{ kairos_profile }} category by cloning the configured source
+# ("default" on a fresh BCM, a site-specific category like "Partner Lab"
+# on existing deployments).
+cmsh -c "category; list" 2>/dev/null | grep -q '^{{ kairos_profile }}\b' \
+  || cmsh -c "category; clone \"{{ bcm_source_category | default('default') }}\" {{ kairos_profile }}; commit" 2>&1 || true
 
 # Configure category
-cmsh -c "category; use kairos; set softwareimage kairos-installer; commit" 2>&1 || true
-cmsh -c "category; use kairos; set installmode FULL; commit" 2>&1 || true
-cmsh -c "category; use kairos; set newnodeinstallmode FULL; commit" 2>&1 || true
-cmsh -c "category; use kairos; set installbootrecord yes; commit" 2>&1 || true
-echo -e 'category\nuse kairos\nset kernelparameters "console=ttyS0,115200n8 net.ifnames=0 biosdevname=0"\ncommit' | cmsh 2>&1 || true
+cmsh -c "category; use {{ kairos_profile }}; set softwareimage {{ kairos_profile }}-installer; commit" 2>&1 || true
+cmsh -c "category; use {{ kairos_profile }}; set installmode FULL; commit" 2>&1 || true
+cmsh -c "category; use {{ kairos_profile }}; set newnodeinstallmode FULL; commit" 2>&1 || true
+cmsh -c "category; use {{ kairos_profile }}; set installbootrecord yes; commit" 2>&1 || true
+echo -e 'category\nuse {{ kairos_profile }}\nset kernelparameters "console=ttyS0,115200n8 net.ifnames=0 biosdevname=0"\ncommit' | cmsh 2>&1 || true
 
 # Strip fsmounts that don't apply to Kairos (immutable OS uses COS_PERSISTENT bind-mounts
 # for /home, doesn't mount /cm/shared). Leaving these causes permanent "health check failed"
 # alerts on the node with no functional impact.
 for mp in /cm/shared /home; do
-    if cmsh -c "category; use kairos; fsmounts; list" 2>/dev/null | grep -q " ${mp} "; then
-        echo -e "category\nuse kairos\nfsmounts\nremove ${mp}\ncommit" | cmsh 2>&1 || true
+    if cmsh -c "category; use {{ kairos_profile }}; fsmounts; list" 2>/dev/null | grep -q " \${mp} "; then
+        echo -e "category\nuse {{ kairos_profile }}\nfsmounts\nremove \${mp}\ncommit" | cmsh 2>&1 || true
     fi
 done
 
-# Exclude the `kairos` category from health checks that don't fit an immutable-OS
-# compute node (Kairos names its NIC eth0 not BOOTIF, uses local ext2 loop root not NFS,
-# and uses systemd-timesyncd not chronyd/ntpd). Uses BCM's documented `nodeexecutionfilters`
-# mechanism — category-scoped Exclude, idempotent (commit is a no-op if unchanged).
+# Exclude the {{ kairos_profile }} category from health checks that don't fit an
+# immutable-OS compute node (Kairos names its NIC eth0 not BOOTIF, uses local
+# ext2 loop root not NFS, uses systemd-timesyncd not chronyd/ntpd). One filter
+# per check, named exclude-{{ kairos_profile }}, scoped to this profile only —
+# other profiles get their own filters when their deploys run.
 for CHECK in mounts interfaces ntp; do
-    if ! cmsh -c "monitoring setup; use ${CHECK}; nodeexecutionfilters; list" 2>/dev/null \
-         | grep -q 'exclude-kairos'; then
-        echo -e "monitoring setup\nuse ${CHECK}\nnodeexecutionfilters\nadd category exclude-kairos\nset filteroperation Exclude\nset categories kairos\ncommit" \
+    if ! cmsh -c "monitoring setup; use \${CHECK}; nodeexecutionfilters; list" 2>/dev/null \
+         | grep -q 'exclude-{{ kairos_profile }}'; then
+        echo -e "monitoring setup\nuse \${CHECK}\nnodeexecutionfilters\nadd category exclude-{{ kairos_profile }}\nset filteroperation Exclude\nset categories {{ kairos_profile }}\ncommit" \
             | cmsh 2>&1 | tail -3 || true
     fi
 done
 
 {% if bcm_manage_cluster_defaults | default(false) %}
 # Cluster-wide defaults — only touch on fresh BCMs where we own the whole cluster
-cmsh -c "partition; use base; set defaultcategory kairos; commit" 2>&1 || true
+cmsh -c "partition; use base; set defaultcategory {{ kairos_profile }}; commit" 2>&1 || true
 cmsh -c "partition; use base; set nodebasename node; set nodedigits 3; commit" 2>&1 || true
 {% endif %}
 
 EOF
 
 {% if bcm_target_node is defined and bcm_target_node | length > 0 %}
-# Target an existing BCM device — move into kairos category, FULL installmode.
+# Target an existing BCM device — move into {{ kairos_profile }} category, FULL installmode.
 # Also set softwareimage explicitly at the device level, because device-level
 # overrides (common on existing BCMs) beat the category value.
 # If kairos_target_mac / kairos_target_ip are provided in inventory, set them
@@ -322,38 +361,44 @@ EOF
 # takes name + ip + mac at registration time), so deploy-dd owns the MAC and
 # IP mapping rather than relying on the device having been registered with the
 # right values via cmsh.
-${SSH_CMD} "echo -e 'device\nuse \"{{ bcm_target_node }}\"\nset category kairos\nset softwareimage kairos-installer\nset installmode FULL{% if kairos_target_mac is defined and kairos_target_mac | length > 0 %}\nset mac {{ kairos_target_mac }}{% endif %}{% if kairos_target_ip is defined and kairos_target_ip | length > 0 %}\nset ip {{ kairos_target_ip }}{% endif %}\ncommit' | cmsh 2>&1" 2>/dev/null | filter_motd
+${SSH_CMD} "echo -e 'device\nuse \"{{ bcm_target_node }}\"\nset category {{ kairos_profile }}\nset softwareimage {{ kairos_profile }}-installer\nset installmode FULL{% if kairos_target_mac is defined and kairos_target_mac | length > 0 %}\nset mac {{ kairos_target_mac }}{% endif %}{% if kairos_target_ip is defined and kairos_target_ip | length > 0 %}\nset ip {{ kairos_target_ip }}{% endif %}\ncommit' | cmsh 2>&1" 2>/dev/null | filter_motd
 TARGET_NODE_NAME="{{ bcm_target_node }}"
 {% else %}
-# Fresh BCM — register node001 with explicit IP to avoid BCM auto-assigning gateway
+# Fresh BCM — register node001 with explicit IP to avoid BCM auto-assigning
+# gateway. The provisioning interface is named enp0s2 because the local-KVM
+# compute VM runs under q35+OVMF (PCIe root port slot 2 → kernel/userspace
+# names the virtio NIC enp0s2). Even with `net.ifnames=0` on the kernel
+# cmdline, BCM's installer environment runs systemd-networkd which uses
+# predictable names regardless. Registering as enp0s2 matches what BCM's
+# installer-environment will see at PXE time.
 COMPUTE_NODE_IP="{{ bcm_internal_ip.rsplit('.', 1)[0] }}.10"
 ${SSH_CMD} "echo -e 'device\nremove node001\ncommit' | cmsh 2>/dev/null; \
-    echo -e 'device\nadd physicalnode node001 ${COMPUTE_NODE_IP} eth0\nset category kairos\nset mac ${COMPUTE_MAC}\ncommit' | cmsh 2>&1" 2>/dev/null | filter_motd
+    echo -e 'device\nadd physicalnode node001 ${COMPUTE_NODE_IP} enp0s2\nset category {{ kairos_profile }}\nset softwareimage {{ kairos_profile }}-installer\nset mac ${COMPUTE_MAC}\nset provisioninginterface enp0s2\ncommit' | cmsh 2>&1" 2>/dev/null | filter_motd
 TARGET_NODE_NAME="node001"
 {% endif %}
 
 ${SSH_CMD} bash -s << EOF | filter_motd
-VERIFY_IMG=\$(cmsh -c "category; use kairos; get softwareimage" 2>/dev/null)
-echo "\$VERIFY_IMG" | grep -q "kairos-installer" || { echo "[FAIL] softwareimage is not kairos-installer"; exit 1; }
-echo "[OK] Category configured: FULL install, kairos-installer image"
-echo "[OK] Target node: ${TARGET_NODE_NAME}, category=kairos"
+VERIFY_IMG=\$(cmsh -c "category; use {{ kairos_profile }}; get softwareimage" 2>/dev/null)
+echo "\$VERIFY_IMG" | grep -q "{{ kairos_profile }}-installer" || { echo "[FAIL] softwareimage is not {{ kairos_profile }}-installer"; exit 1; }
+echo "[OK] Category configured: FULL install, {{ kairos_profile }}-installer image"
+echo "[OK] Target node: ${TARGET_NODE_NAME}, category={{ kairos_profile }}"
 EOF
 
 # 7. Regenerate ramdisk
 info "[7/7] Generating ramdisk..."
-${SSH_CMD} << 'EOF' | filter_motd
-cmsh -c "softwareimage; use kairos-installer; createramdisk -w" 2>&1
+${SSH_CMD} bash -s << EOF | filter_motd
+cmsh -c "softwareimage; use {{ kairos_profile }}-installer; createramdisk -w" 2>&1
 echo "[OK] Ramdisk regenerated"
 
 # Re-verify softwareimage after ramdisk
-cmsh -c "category; use kairos; set softwareimage kairos-installer; commit" 2>&1
-FINAL=$(cmsh -c "category; use kairos; get softwareimage" 2>/dev/null)
-if echo "$FINAL" | grep -q "kairos-installer"; then
-    echo "[OK] Category softwareimage confirmed: kairos-installer"
+cmsh -c "category; use {{ kairos_profile }}; set softwareimage {{ kairos_profile }}-installer; commit" 2>&1
+FINAL=\$(cmsh -c "category; use {{ kairos_profile }}; get softwareimage" 2>/dev/null)
+if echo "\$FINAL" | grep -q "{{ kairos_profile }}-installer"; then
+    echo "[OK] Category softwareimage confirmed: {{ kairos_profile }}-installer"
 else
-    echo "[FAIL] Category softwareimage is '$FINAL'"
+    echo "[FAIL] Category softwareimage is '\$FINAL'"
     exit 1
 fi
 EOF
 
-info "BCM configured for Kairos deployment"
+info "BCM configured for Kairos deployment (profile={{ kairos_profile }})"
