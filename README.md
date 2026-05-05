@@ -237,6 +237,18 @@ This makes reimaging a previously-provisioned node a one-command operation (`mak
 
 BCM's `mounts`, `interfaces`, and `ntp` measurables flag Kairos's immutable-OS architecture as health failures (read-only root, no `/etc/fstab` in the expected form, no `ntp.conf`). `deploy-dd` installs `nodeexecutionfilters` with `Exclude + category=kairos` for those three measurables so the `kairos` category reports clean `[ UP ]` in cmsh without affecting any other category.
 
+### NFS exports auto-scoped to the target node's network
+
+`deploy-dd` queries cmsh for `bcm_target_node`'s BOOTIF interface network and adds NFS export ACLs for that CIDR — in addition to `bcm_internal_cidr`. Required when target devices live on a separate provisioning VLAN (e.g. tenant-net) reached via DHCP relay; the cloud-config's `mount -t nfs /cm/images/default-image` would otherwise be rejected by the kernel NFS server. Existing managementnet ACLs are left intact.
+
+### Last-partition auto-grow after `dd`
+
+Right after `sgdisk -e` fixes the GPT backup header, `install-kairos.sh` deletes and recreates the **last** GPT partition (typically `COS_PERSISTENT`) from its current start sector to the disk end, then `partprobe` + `partx -u` + `e2fsck -fy` + `resize2fs`. Without this, a Kairos image dd'd from an 80 GB build VM onto a 400+ GB physical disk leaves `COS_PERSISTENT` capped at the original 30 GB (Kairos's own `Grow persistent` boot stage has a math bug that silently skips the grow on disks much larger than the source image).
+
+### Dynamic Palette label push
+
+`metadata.name` on Palette edge hosts is locked to the SMBIOS-UUID-derived `edge-<uuid>` (Palette uses it to track the box across re-deploys). For a friendly hostname, the cloud-config's BCM-integration boot stage queries cmsh for the device's BCM-side name + category + service tag and `PUT`s them as `metadata.labels` on the edge-host record via the Palette admin API. Runs in the background after stylus has registered, polling for the edge-host to exist before the PUT. No build-time bake-in of node-specific values — same image deploys to many hosts, each registers in Palette with its own labels.
+
 ### Other details
 
 - **lz4** compression (not gzip) — faster decompression than the dd write
@@ -245,6 +257,7 @@ BCM's `mounts`, `interfaces`, and `ntp` measurables flag Kairos's immutable-OS a
 - **`sgdisk -e` + `partprobe`** — fixes the GPT backup header after `dd` onto a differently-sized disk, then re-reads the partition table
 - **Squashfs patching** — `net.ifnames=0 biosdevname=0` + `ifcfg-eth0` injected into active/passive/recovery images for BCM compatibility
 - **Jumphost-aware tooling** — `deploy-dd`, `validate`, and `discover` all build a per-run SSH config file with a `ProxyCommand` line when `bcm_ssh_proxy_jump` is set
+- **Validate IP-lookup hardening** — `validate.sh` falls back to `cmsh device interfaces use BOOTIF get ip` when the device-level IP is `0.0.0.0` (common when the BOOTIF lives on a different network than the device's `Network` field), and refuses to probe if the lookup resolves to `0.0.0.0`, `127.0.0.1`, or BCM's own IP (which OpenSSH would otherwise treat as localhost, silently probing BCM and reporting BCM's state as the "Kairos" half of the report)
 
 ## File Layout
 

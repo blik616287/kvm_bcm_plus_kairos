@@ -313,11 +313,12 @@ Earthly builds a container image based on Ubuntu 22.04 with the Kairos framework
   3. Install the BCM SSH key to `/var/lib/bcm/bcm-key` (0600).
   4. **BCM integration** (conditional on `bcm_ssh_key_content` being set):
      - Wait up to 5 min for network + ping to `$bcm_internal_ip`.
-     - Query BCM via `cmsh device list | grep $MAC` to find this node's registered name; set hostname to match; write `/oem/91_palette_name.yaml` so the Palette dashboard matches.
+     - Query BCM via `cmsh device list | grep $MAC` to find this node's registered name (`$NODE_NAME`); set hostname via `hostnamectl set-hostname $NODE_NAME`.
      - Fetch BCM's root public key and append to `/root/.ssh/authorized_keys` (enables BCM → Kairos SSH).
      - Set the node's `installmode` to `NOSYNC` in cmsh so BCM doesn't try to re-image the freshly-installed Kairos node on next PXE.
      - NFS-mount `/cm/images/default-image` read-only at `/var/lib/cm/rootfs`. Copy `/cm/local/apps/cmd/etc` out into `/var/lib/cm/cmd-etc`, rewrite `Master = master` → `Master = $bcm_internal_ip`, SCP the per-node cert + key from BCM.
      - `unshare --mount --fork` a child that bind-mounts cmd-etc + proc + sys + tmpfs, and `chroot` into the NFS image to run `/cm/local/apps/cmd/sbin/cmd -s -n` — BCM's cluster daemon, in a chroot of the BCM default image, so the Kairos node reports back into cmsh as a managed compute node.
+     - **Push Palette labels asynchronously.** Spawns a background loop that polls `GET /v1/edgehosts/<edge-uid>` (project-scoped) until the edge host exists in Palette (waits for stylus to register), then `PUT /v1/edgehosts/<uid>/meta` with `metadata.labels` populated from the just-collected runtime values: `hostname`, `bcm-device`, `bcm-category` (cmsh `device get category`), `bcm-mac` (booting NIC MAC), `service-tag` (SMBIOS serial). `metadata.name` itself stays as the SMBIOS-UUID-derived `edge-<uuid>` (Palette enforces it as the immutable identity for re-deploy tracking). Credentials come from `/oem/palette-admin.env` (written at initramfs stage); the call uses the same admin API key as `palette-cleanup-stale.sh`. Why Palette API direct rather than via stylus's cloud-config: kairos-agent's initramfs cloud-init merge takes a *snapshot* of `/oem/*.yaml` into `/run/stylus/userdata` before stages.boot runs, and stylus reads only that snapshot — so anything we write to `/oem/91_palette_name.yaml` from stages.boot doesn't reach stylus until the next boot (and even then, only if Kairos's merger picks it up, which by default it doesn't for files outside its built-in glob).
 
 ### 5.8 CIDATA user-data image
 
@@ -435,7 +436,19 @@ Interface name is derived from the default route — works whether BCM's externa
 
 ### 6.5 NFS exports
 
-Appended to `/etc/exports` if not already present, scoped to `$bcm_internal_cidr`:
+Two CIDR sources feed the export ACLs:
+
+1. **`bcm_internal_cidr`** — always exported (the BCM-attached provisioning network, where most local-KVM and same-VLAN remote deploys live).
+2. **The target device's BOOTIF interface network** — auto-discovered when `bcm_target_node` is set. Looked up via:
+   ```
+   TARGET_NET=$(cmsh device use $bcm_target_node; interfaces; use BOOTIF; get network)
+   TARGET_BASE=$(cmsh network use $TARGET_NET; get baseaddress)
+   TARGET_BITS=$(cmsh network use $TARGET_NET; get netmaskbits)
+   TARGET_CIDR=$TARGET_BASE/$TARGET_BITS
+   ```
+   Added to the export list only when it differs from `bcm_internal_cidr`.
+
+For each filesystem, deploy-dd appends one ACL line per CIDR if not already present:
 
 ```
 /cm/images/default-image          <cidr>(ro,no_subtree_check,no_root_squash,async)
@@ -444,7 +457,7 @@ Appended to `/etc/exports` if not already present, scoped to `$bcm_internal_cidr
 exportfs -ra
 ```
 
-Each profile adds its own `<profile>-installer` export; existing profiles' lines are untouched.
+Each profile adds its own `<profile>-installer` export; existing profiles' lines are untouched. **Required for tenant-VLAN devices** (where the host PXE-boots through a DHCP relay onto a network BCM has no direct interface on): without the second ACL, the cloud-config's `mount -t nfs /cm/images/default-image` is rejected by the kernel NFS server and the BCM-integration cmd-in-chroot never starts → BCM stays on `INSTALLER_UNREACHABLE`.
 
 ### 6.6 DHCP authoritative + pool range
 
@@ -496,13 +509,14 @@ Enable it (`chroot $IMAGE_ROOT systemctl enable kairos-install.service` with a s
 **What install-kairos.sh does on the compute node** (rendered with `$bcm_internal_ip`, `$kairos_profile`, `$kairos_target_disk`, `$kairos_wipe_disks`):
 
 1. **HTTP probe** — poll `HEAD http://$HEAD_IP:8888/<profile>/disk.raw.lz4` every 10 s for up to 10 minutes. Abort if unreachable.
-2. **Stage binaries to RAM** (`/dev/shm/kinstall/`) — `bash curl lz4 dd sync sleep sgdisk wipefs dmsetup efibootmgr partprobe blkid` and all `ldd` dependencies. This is required because the dd will overwrite the filesystem these binaries currently live on.
+2. **Stage binaries to RAM** (`/dev/shm/kinstall/`) — `bash curl lz4 dd sync sleep sgdisk wipefs dmsetup efibootmgr partprobe blkid awk e2fsck resize2fs partx` and all `ldd` dependencies. This is required because the dd will overwrite the filesystem these binaries currently live on. The `awk` / `e2fsck` / `resize2fs` / `partx` additions support the post-dd partition grow step (§6.11.8).
 3. **Enable sysrq** — `echo 1 > /proc/sys/kernel/sysrq`.
 4. **Write a run-dd.sh with shebang `#!/dev/shm/kinstall/bash`**, then `exec` it — the parent process is replaced with a RAM-resident one. From here on nothing touches the target disk's filesystem.
 5. **Wipe sibling disks** — for every name in `$WIPE_DISKS`, `dmsetup remove_all; wipefs -a -f /dev/<name>`. Clears LVM PV / DRBD / old filesystem signatures so Kairos's persistent-partition logic doesn't see stale metadata.
 6. **Stream + dd** — `curl --fail -s $RAW_URL | lz4 -d - - | dd of=$DISK bs=4M oflag=direct`. `oflag=direct` bypasses the page cache (critical — without it an 80 GB write can drive an LVM thin pool into overflow on a tight-RAM server).
 7. **Fix GPT backup header** — `sgdisk -e $DISK; partprobe $DISK`. The raw image was created on an 80 GB disk; the target disk is usually larger, so GPT's backup header ends up at the wrong offset. `sgdisk -e` moves it to the correct location.
-8. **Create a UEFI boot entry** (new — guards physical UEFI deploys):
+8. **Grow the last partition (typically `COS_PERSISTENT`) to fill the disk** — read the last partition number, its start sector, type GUID, and label from `sgdisk -p / -i`; delete and recreate it from the same start to disk end; `partprobe` + `partx -u --nr <n>`; `e2fsck -fy` + `resize2fs` extend the ext4 filesystem. Required because Kairos's own `Grow persistent` boot stage has a math bug on disks much larger than the source image (asks for "need NNN MiB, available NNN MiB" with the values inverted) and silently leaves persistent capped at the image's size — typically 30 GB on a 400+ GB target. Doing it in the installer environment runs against an offline partition so the kernel re-reads the table cleanly.
+9. **Create a UEFI boot entry** (new — guards physical UEFI deploys):
    ```
    if [ -d /sys/firmware/efi/efivars ] && [ -x efibootmgr ]; then
        # delete any existing 'Kairos' entries so re-installs don't stack
@@ -514,8 +528,8 @@ Enable it (`chroot $IMAGE_ROOT systemctl enable kairos-install.service` with a s
    fi
    ```
    Without this, physical UEFI firmware keeps booting stale `BootXXXX` entries tied to the *previous* install's GPT UUIDs and never discovers the freshly-dd'd Kairos bootloader. Guarded by presence of `efivars` so it's a no-op on legacy BIOS.
-9. **Drop page cache + sync** — `echo 3 > /proc/sys/vm/drop_caches; sync`.
-10. **SysRq poweroff** — `echo o > /proc/sysrq-trigger`. Instant hard poweroff because the filesystem is destroyed and normal `poweroff` would fail.
+10. **Drop page cache + sync** — `echo 3 > /proc/sys/vm/drop_caches; sync`.
+11. **SysRq poweroff** — `echo o > /proc/sysrq-trigger`. Instant hard poweroff because the filesystem is destroyed and normal `poweroff` would fail.
 
 ### 6.12 PXE template + syslinux modules
 
@@ -682,7 +696,15 @@ Runs a comprehensive health check across BCM and the Kairos compute node. Reuses
 
 ### 8.1 Connecting to the Kairos node
 
-The template discovers the Kairos IP by reading BCM's ARP table for the compute node's MAC (obtained from `cmsh device use $TARGET_NODE get mac`), falling back to `cmsh device get ip`. Then tries SSH two ways, **from BCM** (using BCM as a jump host into the provisioning network):
+The template discovers the Kairos IP via three ordered fallbacks:
+
+1. **BCM ARP** — `arp -an | grep $COMPUTE_MAC | grep -oP '\d+\.\d+\.\d+\.\d+'` on BCM. Hits when the device is on a network where BCM has a direct interface (managementnet); misses for tenant-VLAN devices reached via DHCP relay.
+2. **`cmsh device get ip`** — synthetic device-level field, reliable on same-network deploys.
+3. **`cmsh device use $TARGET_NODE; interfaces; use BOOTIF; get ip`** — the per-interface IP, where the *real* address lives when the device's `Network` field doesn't match its BOOTIF interface's network (common on multi-VLAN BCMs — the device-level IP synthesizes to `0.0.0.0` while the BOOTIF correctly holds e.g. `192.168.60.10`).
+
+**Loopback guard.** Before attempting SSH, the script refuses to proceed if `KAIROS_IP` is empty, `0.0.0.0`, `127.0.0.1`, or matches `$bcm_internal_ip`. Without this, `ssh root@0.0.0.0` from BCM resolves to BCM's own localhost (OpenSSH treats `0.0.0.0` as `INADDR_ANY` → `127.0.0.1`) and every "Kairos compute node" check would silently probe BCM and report BCM's state — false PASSes for the BCM checks AND for everything that happens to also be true on BCM (Ubuntu / Linux kernel / disk free / etc.).
+
+Then tries SSH two ways, **from BCM** (using BCM as a jump host into the provisioning network):
 1. `ssh root@$KAIROS_IP` (key-based, via the SSH key pair exchanged during the Kairos boot stages).
 2. `sshpass -p kairos ssh kairos@$KAIROS_IP` (password-based fallback to the POC user).
 
