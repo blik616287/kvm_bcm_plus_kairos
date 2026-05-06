@@ -12,7 +12,7 @@ BUILD_DIR="{{ build_dir }}"
 KAIROS_USER="kairos"
 KAIROS_PASSWORD="kairos"
 BCM_INTERNAL_IP="{{ bcm_internal_ip }}"
-TARGET_NODE="{{ bcm_target_node | default('node001') }}"
+TARGET_NODE="{{ bcm_target_node | default('node001', true) }}"
 
 mkdir -p "${BUILD_DIR}"
 SSH_CONFIG="${BUILD_DIR}/.bcm-ssh-config"
