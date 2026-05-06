@@ -88,6 +88,92 @@ cp inventory/group_vars/all.example.yml inventory/group_vars/all.yml
 make all   # runs the full 6-stage pipeline (~100-120 min)
 ```
 
+## Day-2 ops — container publish + Palette rolling upgrade
+
+Once a Kairos cluster is bootstrapped (via the day-1 `kairos-build` + `deploy-dd`
++ `kairos-vm` flow above), ongoing upgrades — new k8s version, new kernel, new
+apt packages, OS-stage tweaks — flow through Palette pulling a new container
+image from `kairos_container_registry`. The same pipeline can build and publish
+*just* the container image, skipping the OVMF QEMU install + raw disk
+generation that day-1 PXE bootstrap needs.
+
+### Step 1 — Publish provider images
+
+```bash
+make kairos-image
+```
+
+Wraps `ansible-playbook playbooks/03-kairos-build.yml -e kairos_build_raw_disk=false`,
+which switches the `kairos_build` role from the day-1 path
+(`./earthly.sh +iso`) to the day-2 path
+(`./earthly.sh --push +build-provider-images --ARCH=<arch>`).
+
+What happens during the run:
+
+1. CanvOS's `+build-provider-images` target reads `CanvOS/k8s_version.json` —
+   the role renders this from the `kairos_k8s_versions` inventory variable
+   (empty dict = use upstream file unmodified).
+2. For each `(distribution, version)` entry, Earthly invokes
+   `+provider-image --K8S_VERSION=<version>`, which contains a
+   `SAVE IMAGE --push <full image ref>`.
+3. The `--push` CLI flag — passed by the role specifically for this day-2 path —
+   tells Earthly to actually upload. Without it, `SAVE IMAGE --push` in the
+   Earthfile is a no-op (image only goes to the local Docker daemon). Day-1's
+   `+iso` target intentionally doesn't push because dd-install never pulls
+   from a registry; only `make kairos-image` adds `--push`.
+
+Tag format: `<registry>/<repo>:<distribution>-<version>-<PE_VERSION>-<CUSTOM_TAG>`,
+e.g. `ttl.sh/ubuntu:k3s-1.31.6-v4.8.10-bcm-test`.
+`PE_VERSION` is set in the CanvOS Earthfile (currently `v4.8.10`). `CUSTOM_TAG`
+is from `.arg`.
+
+For a **multi-version matrix push**, use bare version strings (CanvOS appends
+the flavor tag itself):
+
+```yaml
+# inventory/group_vars/all.yml
+kairos_k8s_versions:
+  k3s:
+    - "1.31.6"
+    - "1.32.1"
+  rke2:
+    - "1.32.1"
+```
+
+Empty dict (default) leaves the file untouched, so the upstream CanvOS k8s
+version list is used.
+
+### Step 2 — Roll the cluster in Palette
+
+In the Palette UI for the cluster's project:
+
+1. **Profiles → \<cluster profile\> → Edit** the OS layer.
+   - Pack: `edge-native-byoi` (the BYOOS pack — its only meaningful field).
+   - Values:
+     ```yaml
+     options:
+       system.uri: "<new image ref>"
+     ```
+2. **Save** — produces a new profile version (or updates the cluster's applied
+   override values, depending on which path you take).
+3. **Clusters → \<your cluster\>** — Palette detects the image drift and pushes
+   a plan-job (`apply-control-plan-on-edge-<id>` in the `spectro-task-<cluster-uid>`
+   namespace).
+4. The plan-job pulls the new provider image, hands it to `kairos-agent`, which:
+   - extracts the OS layer to `/usr/local/spectrocloud/content/provider_extract/`
+   - rotates `cOS/active.img` (current → passive, new → active)
+   - reboots the node
+5. After reboot the node boots from the new active.img → k3s comes up on the
+   new version → cluster goes back to `Running`. Kubernetes objects (deployments,
+   etc.) are preserved — etcd is on `COS_PERSISTENT`, which is not touched by
+   the OS layer rotation.
+
+End-to-end time: ~5–10 min per node for the image pull + reboot.
+
+BCM stays out of this path entirely. The pre-installed cmd integration on each
+Kairos node keeps working through the upgrade because `/oem/*.yaml` lives on
+`COS_OEM`, which is preserved across image rotations.
+
 ## Pipeline Stages
 
 | Stage | Target | Duration | Description |
@@ -113,7 +199,8 @@ Stages **bcm-vm** and **kairos-build** can run in parallel.
 # Pipeline
 make bcm-prepare        # Stage 1 — local-KVM only
 make bcm-vm             # Stage 2 — local-KVM only
-make kairos-build       # Stage 3 — builds Kairos raw image via CanvOS + OVMF
+make kairos-build       # Stage 3 — builds Kairos raw image via CanvOS + OVMF (day-1)
+make kairos-image       # Stage 3 image-only — push container image only (day-2 upgrade)
 make deploy-dd          # Stage 4 — push to BCM, configure PXE + kairos category
 make kairos-vm          # Stage 5 — local-KVM only (PXE boots a local compute VM)
 make validate           # Stage 6 — ~40-point health check

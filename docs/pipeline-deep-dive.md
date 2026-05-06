@@ -369,6 +369,73 @@ The `[ -f ]` guards mean the `99_userdata.yaml` copy is a no-op when `kairos_use
 
 Host polls the QEMU PID every 10 s (up to 60 min) for exit.
 
+### 5.9b Day-2 image-only mode (`make kairos-image`)
+
+`kairos_build_raw_disk` (default `true`, defined in `roles/kairos_build/defaults/main.yml`) switches the Earthly target and gates everything from §5.6 onwards.
+
+**Day-1 (`true`):** runs `./earthly.sh +iso --ARCH=amd64`. Builds the ISO locally; provider images are saved to the local Docker daemon only — *not* pushed to `kairos_container_registry`. That's fine because day-1 install is PXE+dd: the OS layers are baked into the raw disk and never pulled from a registry at install time. Then §5.6–5.10 produce `build/<profile>-disk.raw`.
+
+**Day-2 (`false`, set by `make kairos-image`):** runs `./earthly.sh --push +build-provider-images --ARCH=amd64`. The `--push` CLI flag is **load-bearing** — without it, `SAVE IMAGE --push` directives in CanvOS's Earthfile are no-ops (Earthly tags the image into the local Docker daemon but skips the actual upload). The role passes `--push` explicitly for the day-2 invocation; day-1 (`+iso`) does not need it.
+
+The CanvOS `+build-provider-images` target reads `CanvOS/k8s_version.json` (which the role just rendered from `kairos_k8s_versions`), iterates over each `(distribution, version)` entry, and invokes `+provider-image` per entry — each does a `SAVE IMAGE --push $IMAGE_REGISTRY/$IMAGE_REPO:$K8S_DISTRIBUTION-$K8S_VERSION-$IMAGE_TAG`. So one push per matrix entry.
+
+Resulting tag pattern: `<registry>/<repo>:<distribution>-<version>-<PE_VERSION>-<CUSTOM_TAG>`, e.g. `ttl.sh/ubuntu:k3s-1.31.6-v4.8.10-bcm-test`. `PE_VERSION` is set in the CanvOS Earthfile (currently `v4.8.10`); `CUSTOM_TAG` is from `.arg`.
+
+Skips ISO assembly entirely; skips the OVMF QEMU install and raw-disk patching (§5.6–5.10). Skips `cloud-config.yaml.j2` render, BCM SSH key generation, and the FAT32 user-data image — those live inside the same gated block.
+
+Image-only mode bypasses the ISO-existence short-circuit on the outer "Build Kairos ISO" block — image-only builds always re-run so they push fresh tags to the registry.
+
+`make kairos-image` is a thin wrapper around `ansible-playbook playbooks/03-kairos-build.yml -e kairos_build_raw_disk=false`. The pre-installed nodes' `/oem/90_custom.yaml` (BCM cmd integration logic) sits on the persistent `COS_OEM` partition and survives image rotations, so the BCM heartbeat is unaffected by a Palette upgrade. Only changes to the cloud-config logic itself need a full dd-install (or a Palette OS Layer push). See §5.9d for the cluster-side rolling-upgrade path that consumes a published image.
+
+### 5.9c Multi-version k8s build (`kairos_k8s_versions`)
+
+When `kairos_k8s_versions` (default `{}`, in `roles/kairos_build/defaults/main.yml`) is non-empty, the role renders it to `CanvOS/k8s_version.json` before the Earthly build runs. CanvOS treats an empty `K8S_VERSION` in `.arg` as a signal to read `k8s_version.json`, building one container image per `(distribution, version)` entry in the file. Empty dict (default) leaves whatever ships in upstream CanvOS untouched.
+
+The format is `{ distribution: [bare-version-strings] }`. **Use bare version numbers — CanvOS appends the flavor tag (`-k3s1`, `-rke2r1`, etc.) itself** in `+provider-image`. Don't include the suffix in the values or you'll get a doubled tag (`v1.31.6+k3s1-k3s1`) that doesn't resolve in luet.
+
+```yaml
+# inventory/group_vars/all.yml
+kairos_k8s_versions:
+  k3s:
+    - "1.31.6"
+    - "1.32.1"
+  rke2:
+    - "1.32.1"
+```
+
+Combined with `make kairos-image`, this publishes a whole k8s-version matrix from a single command without touching BCM.
+
+### 5.9d Cluster-side rolling upgrade (consuming a published image)
+
+`make kairos-image` only handles the image-publish half of day-2. The actual rolling upgrade happens in Palette and on the running node — neither requires anything from this repo. End-to-end flow:
+
+1. **Profile change in Palette UI**: edit the cluster profile's OS layer (the `edge-native-byoi` BYOOS pack) values:
+   ```yaml
+   options:
+     system.uri: "<new image ref pushed by make kairos-image>"
+   ```
+2. Palette detects image drift on next reconcile (~30s). The cluster's `ControlPlaneNodeAdditionDone` condition flips `True → False (LaunchControlPlaneNode)`.
+3. Palette schedules a plan-job pod (`apply-control-plan-on-edge-<id>` in the `spectro-task-<cluster-uid>` namespace) that runs on the target node.
+4. The job pulls the new provider image (lands as a containerd image on the node) and hands it to `kairos-agent`, which:
+   - extracts the OS layer to `/usr/local/spectrocloud/content/provider_extract/`
+   - rotates the A/B partition pair on `COS_STATE`: current `active.img` → `passive.img`, new image → `active.img`
+   - updates GRUB / efibootmgr to point at the new active
+   - reboots the node
+5. After reboot the node loads the new `active.img`. k3s starts on the new k8s version, kubelet re-registers, all workloads resume from etcd (which lives on `COS_PERSISTENT` — never touched by the rotation).
+6. `ControlPlaneNodeAdditionDone` flips back to `True (NodeReady)`, cluster state returns to `Running`.
+
+Wall time: ~5–10 min per node for image pull + reboot.
+
+Things that survive the rotation (because they're outside `COS_STATE`):
+
+| Lives on | Survives upgrade |
+|---|---|
+| `COS_OEM` (`/oem/*.yaml`) | ✓ — the BCM cmd integration cloud-config persists; node continues heartbeating to BCM |
+| `COS_PERSISTENT` (`/var`, `/usr/local`, `/etc` overlay) | ✓ — etcd, kubelet's pod state, persistent volumes |
+| `COS_RECOVERY` (recovery image) | ✓ — separate upgrade path |
+
+What gets replaced is *only* the running OS layer (kernel, userspace, k3s/rke2 binary, baked-in container images). That's exactly the surface that day-2 publish should change.
+
 ### 5.10 Post-install raw-disk patching
 
 kairos-agent writes the image but a few things need fixing before this disk can be `dd`'d onto different hardware:

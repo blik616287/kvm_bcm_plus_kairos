@@ -236,6 +236,32 @@ palette_ca_cert: |
 # ttl.sh or you have your own registry.
 # kairos_container_registry: "ttl.sh"
 
+# ==== Day-2 ops: image-only build ====
+# When false, the kairos_build role skips the OVMF QEMU install + raw disk
+# patching steps. Only the CanvOS Earthly build runs, producing a container
+# image pushed to kairos_container_registry. Use this for day-2 ops: bumping
+# K8S_VERSION, kernel, or apt-package set, where Palette pulls the new image
+# tag and rolling-upgrades the cluster nodes — no PXE re-install needed.
+# `make kairos-image` flips this to false automatically; no need to set this
+# in inventory for the normal day-1 flow.
+# kairos_build_raw_disk: true
+
+# ==== Multi-version k8s build ====
+# CanvOS reads CanvOS/k8s_version.json when K8S_VERSION is empty in .arg,
+# building one container image per (distribution, version) entry. When this
+# dict is non-empty, the role renders it into CanvOS/k8s_version.json before
+# the Earthly build, overriding upstream CanvOS's shipped file. Empty dict
+# (default) leaves the upstream file untouched.
+#
+# Format: { distribution: [bare-version-strings] }. CanvOS itself appends
+# the flavor tag (-k3s1 for k3s, -rke2r1 for rke2, etc.) — do NOT include it.
+# kairos_k8s_versions: {}
+#   k3s:
+#     - "1.31.6"
+#     - "1.32.1"
+#   rke2:
+#     - "1.32.1"
+
 # ---------------------------------------------------------------------------
 # Internal — typically don't override these in inventory.
 # ---------------------------------------------------------------------------
