@@ -56,3 +56,4 @@ CLAUDE.md
 inventory/group_vars/all.yml
 bcm-discovery-*.yml
 
+*.customer-backup

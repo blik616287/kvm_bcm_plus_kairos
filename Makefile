@@ -55,6 +55,11 @@ bcm-vm: ## Stage 2: Launch BCM in local KVM, install, boot from disk
 kairos-build: ## Stage 3: Build Kairos ISO + raw disk image
 	$(call run_playbook,03-kairos-build)
 
+.PHONY: kairos-image
+kairos-image: ## Stage 3 (image-only / day-2): build + push container image, skip raw disk
+	@mkdir -p $(LOGS_DIR)
+	ansible-playbook playbooks/03-kairos-build.yml -e kairos_build_raw_disk=false $(ANSIBLE_ARGS) 2>&1 | tee $(LOGS_DIR)/03-kairos-image.log
+
 .PHONY: deploy-dd
 deploy-dd: ## Stage 4: Upload image to BCM, configure PXE
 	$(call run_playbook,04-deploy-dd)
