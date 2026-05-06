@@ -44,3 +44,37 @@ kairos_extra_apt_packages: []
 # userdata file is written. Must NOT redefine the kairos user or the install
 # block — those are owned by the base 90_custom.yaml.
 kairos_user_data: ""
+
+# Switches the role between two Earthly targets and gates the OVMF QEMU
+# install + raw-disk patching half:
+#
+# true  (day-1) → ./earthly.sh +iso: builds the ISO file locally; provider
+#                 images are saved to the local Docker daemon only (NOT
+#                 pushed to kairos_container_registry). The role then runs
+#                 the OVMF QEMU install to produce build/<profile>-disk.raw
+#                 for PXE/dd. No registry credentials needed.
+#
+# false (day-2) → ./earthly.sh --push +build-provider-images: pushes the
+#                 provider-image matrix to kairos_container_registry (one
+#                 image per entry in CanvOS/k8s_version.json); skips ISO
+#                 assembly, OVMF QEMU install, and raw-disk patching.
+#                 Palette pulls the new image tag and rolling-upgrades
+#                 cluster nodes — no PXE/dd needed. Requires push creds for
+#                 the registry (ttl.sh is anonymous; Harbor/JFrog need login).
+#
+# `make kairos-image` flips this to false automatically.
+kairos_build_raw_disk: true
+
+# Optional override for CanvOS/k8s_version.json. CanvOS reads that file when
+# K8S_VERSION is empty in .arg, building one container image per
+# (distribution, version) entry. Empty dict (default) leaves whatever ships
+# with upstream CanvOS untouched. Format is { distribution: [bare version
+# strings] } — CanvOS appends the flavor tag (-k3s1, -rke2r1, …) itself, so
+# DO NOT include it in the values:
+#   kairos_k8s_versions:
+#     k3s:
+#       - "1.31.6"
+#       - "1.32.1"
+#     rke2:
+#       - "1.32.1"
+kairos_k8s_versions: {}

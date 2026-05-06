@@ -47,8 +47,12 @@
     path: "{{ build_dir }}/{{ iso_name }}.iso"
   register: kairos_iso_stat
 
+# Day-1 (raw_disk=true) skips this when the ISO already exists in build/.
+# Day-2 (raw_disk=false) always runs — the goal is to push provider images
+# to the registry, no local-artifact short-circuit applies.
 - name: Build Kairos ISO
-  when: not kairos_iso_stat.stat.exists
+  when:
+    - not kairos_iso_stat.stat.exists or not (kairos_build_raw_disk | default(true) | bool)
   block:
     - name: Generate .arg file from merged dict
       ansible.builtin.template:
@@ -101,18 +105,44 @@
           RUN apt-get update && apt-get install -y --no-install-recommends {{ kairos_extra_apt_packages | join(' ') }} && rm -rf /var/lib/apt/lists/*
       when: kairos_extra_apt_packages | default([]) | length > 0
 
-    - name: Run CanvOS build
+    - name: Render custom k8s_version.json (overrides upstream CanvOS file)
+      ansible.builtin.copy:
+        content: "{{ kairos_k8s_versions | to_nice_json }}\n"
+        dest: "{{ canvos_dir }}/k8s_version.json"
+        mode: "0644"
+      when: kairos_k8s_versions | default({}) | length > 0
+
+    # Day-1 (kairos_build_raw_disk=true): build the ISO. Container images
+    # used at install time are baked INTO the ISO via SAVE IMAGE (local
+    # Docker), not pushed to IMAGE_REGISTRY — fine because day-1 install is
+    # PXE+dd, not registry-pulled.
+    # Day-2 (kairos_build_raw_disk=false): push the provider-image matrix
+    # to IMAGE_REGISTRY; skip ISO assembly entirely. Palette pulls the new
+    # image tag and rolling-upgrades cluster nodes — no PXE/dd needed.
+    # The `--push` CLI flag is load-bearing — without it `SAVE IMAGE --push`
+    # in the Earthfile is a no-op (image only goes to local Docker daemon).
+    - name: Run CanvOS build (day-1 — build ISO)
       ansible.builtin.shell: |
         cd {{ canvos_dir }}
         ./earthly.sh +iso --ARCH={{ arch }}
       async: 3600
       poll: 30
+      when: kairos_build_raw_disk | default(true) | bool
+
+    - name: Run CanvOS build (day-2 — push provider images, skip ISO)
+      ansible.builtin.shell: |
+        cd {{ canvos_dir }}
+        ./earthly.sh --push +build-provider-images --ARCH={{ arch }}
+      async: 3600
+      poll: 30
+      when: not (kairos_build_raw_disk | default(true) | bool)
 
     - name: Copy ISO to build directory
       ansible.builtin.copy:
         src: "{{ canvos_dir }}/build/{{ iso_name }}.iso"
         dest: "{{ build_dir }}/{{ iso_name }}.iso"
         remote_src: true
+      when: kairos_build_raw_disk | default(true) | bool
 
 # ---- Generate raw disk image ----
 
@@ -122,7 +152,9 @@
   register: raw_disk_stat
 
 - name: Generate raw disk image via QEMU
-  when: not raw_disk_stat.stat.exists
+  when:
+    - kairos_build_raw_disk | default(true) | bool
+    - not raw_disk_stat.stat.exists
   block:
     - name: Generate BCM SSH key pair if missing
       ansible.builtin.shell: |
