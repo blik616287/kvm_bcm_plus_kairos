@@ -118,7 +118,7 @@
 
           # --- Structured cmsh output via per-object `get` calls ---
           # cmsh's column-aligned `list` can't be awk-parsed safely because category
-          # names contain whitespace (e.g. "S-AI Partner Lab"). Per-field get is slow
+          # names contain whitespace (e.g. "Partner Lab"). Per-field get is slow
           # but reliable. Each line below uses '|' as the between-field separator.
 
           # Names don't contain whitespace on BCM, so first `list` column is safe to awk.

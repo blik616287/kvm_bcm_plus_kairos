@@ -16,7 +16,7 @@
 # Config (baked into /oem/palette-admin.env at first boot by cloud-config):
 #   APIKEY=<base64 palette admin api key with edgeToken.create + edgehost.delete>
 #   PROJECTUID=<palette project uid>
-#   ENDPOINT=<palette hostname, e.g. s-ai.lan>
+#   ENDPOINT=<palette hostname, e.g. palette.example.com>
 #
 # Fail-open on every error path — never block stylus-agent from starting.
 

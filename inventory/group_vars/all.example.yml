@@ -33,7 +33,7 @@ bcm_ssh_port:        22
 # Leave blank for a directly reachable BCM. Auth to the jumphost uses
 # bcm_ssh_proxy_key; auth to BCM stays password-based via sshpass.
 bcm_ssh_proxy_jump:  "partner@100.90.255.42"
-bcm_ssh_proxy_key:   "~/.ssh/sai"          # `~` expanded at template-render time
+bcm_ssh_proxy_key:   "~/.ssh/bcm-jump"          # `~` expanded at template-render time
 
 # ==== BCM provisioning network ====
 # BCM's IP on the provisioning network — the address compute nodes reach for
@@ -70,7 +70,7 @@ bcm_target_node:     "edge-4c4c454400485610804bc3c04f4e4434"
 # Existing BCM category to clone when creating the kairos_profile category
 # on first run. The clone inherits disksetup, mon templates, FinalizeXML —
 # preserves the site's per-hardware behavior. Must already exist on BCM.
-bcm_source_category: "S-AI Partner Lab"
+bcm_source_category: "Partner Lab"
 
 # OPTIONAL: write the booting NIC's MAC onto the target device's cmsh record.
 # Mirrors the local-KVM `device add physicalnode … set mac …` pattern, so
@@ -158,10 +158,10 @@ kairos_user_data: ""
 # roles/kairos_build/templates/cloud-config.yaml.j2. Changing any of these
 # requires `make clean-canvos && make kairos-build`.
 
-# Palette API hostname. SaaS = api.spectrocloud.com, on-prem = e.g. s-ai.lan.
+# Palette API hostname. SaaS = api.spectrocloud.com, on-prem = e.g. palette.example.com.
 # Written into stylus config as paletteEndpoint and consumed by the on-node
 # palette-cleanup-stale.sh + the dynamic Palette-label PUT in cloud-config.
-palette_endpoint:           "s-ai.lan"
+palette_endpoint:           "palette.example.com"
 
 # Palette project identity. project_name is the human label; project_uid is
 # the internal ID consumed by palette-cleanup-stale.sh + the dynamic-label

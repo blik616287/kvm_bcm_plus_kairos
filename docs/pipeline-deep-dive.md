@@ -96,7 +96,7 @@ Not a pipeline stage — a precursor for remote-BCM deploys. Prompts interactive
 - Discovers which BCM interface holds an IP inside that CIDR by matching IP against interface, not by NIC name (customer BCMs use `ens*`/`enp*`, not `eth*`)
 - Default route → external interface + gateway, `/etc/resolv.conf` DNS, `cmsh partition base nameservers`
 - `systemctl is-active` for `cmd`, `dhcpd`, `named`, `nfs-server`
-- `cmsh category; list -f name` → existing categories (with whitespace trimmed; names can contain spaces like `"S-AI Partner Lab"`, so per-field `get` calls are used rather than parsing column-aligned `list` output)
+- `cmsh category; list -f name` → existing categories (with whitespace trimmed; names can contain spaces like `"Partner Lab"`, so per-field `get` calls are used rather than parsing column-aligned `list` output)
 - `cmsh softwareimage; list -f name` → existing software images
 - `cmsh device; list` filtered to `PhysicalNode|HeadNode` rows → node name, MAC, IP, category, software image (one per-field `get` call per field to survive whitespace-containing category names)
 - Installed kernel version (`/cm/images/default-image/boot/vmlinuz-*`)
@@ -609,7 +609,7 @@ cmsh -c "category; list" | grep -q '^<profile>\b' \
   || cmsh -c "category; clone \"{{ bcm_source_category | default('default') }}\" <profile>; commit"
 ```
 
-On **local-KVM** this clones `default`. On **remote BCM** it clones whatever the site already uses — e.g. `"S-AI Partner Lab"` — so the `<profile>` category inherits disksetup, mon templates, interface layout, and FinalizeXML that match the target hardware. Creating an empty category and hand-copying config would re-invent site-specific behavior that's already correct.
+On **local-KVM** this clones `default`. On **remote BCM** it clones whatever the site already uses — e.g. `"Partner Lab"` — so the `<profile>` category inherits disksetup, mon templates, interface layout, and FinalizeXML that match the target hardware. Creating an empty category and hand-copying config would re-invent site-specific behavior that's already correct.
 
 Configure:
 

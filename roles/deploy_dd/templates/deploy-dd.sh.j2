@@ -310,7 +310,7 @@ if [ -n "\$ACTUAL_KERNEL" ]; then
 fi
 
 # Create the {{ kairos_profile }} category by cloning the configured source
-# ("default" on a fresh BCM, a site-specific category like "S-AI Partner Lab"
+# ("default" on a fresh BCM, a site-specific category like "Partner Lab"
 # on existing deployments).
 cmsh -c "category; list" 2>/dev/null | grep -q '^{{ kairos_profile }}\b' \
   || cmsh -c "category; clone \"{{ bcm_source_category | default('default') }}\" {{ kairos_profile }}; commit" 2>&1 || true

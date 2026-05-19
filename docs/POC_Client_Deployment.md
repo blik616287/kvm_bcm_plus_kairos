@@ -101,7 +101,7 @@ We inject Kairos into BCM's existing provisioning pipeline. BCM already knows ho
 We SSH to the BCM head node (directly or via configured jumphost) and make the following changes via `cmsh` and the filesystem:
 
 1. **Software image `kairos-installer`** — cloned from `bcm_source_category`'s image (on a fresh BCM this is `default-image`; on an existing site we clone from the current operating category's image). Our `install-kairos.sh`, `kairos-install.service`, and `lz4` binary are injected; `eth0`/`ens3` DHCP is added to `/etc/network/interfaces`; the PXE ramdisk is regenerated.
-2. **Category `kairos`** — cloned from your existing category (e.g., `"S-AI Partner Lab"`). Set to `installmode=FULL` with `softwareimage=kairos-installer` and kernel parameters `console=ttyS0,115200n8 net.ifnames=0 biosdevname=0`. The `fsmounts` entries for `/cm/shared` and `/home` are removed (Kairos uses `COS_PERSISTENT` bind-mounts, not NFS). Three `nodeexecutionfilters` are installed to **exclude** the kairos category from BCM's `mounts`, `interfaces`, and `ntp` health checks — Kairos' immutable-OS architecture doesn't match what those checks expect, and without the filters the category would permanently show "health check failed" despite being functionally healthy.
+2. **Category `kairos`** — cloned from your existing category (e.g., `"Partner Lab"`). Set to `installmode=FULL` with `softwareimage=kairos-installer` and kernel parameters `console=ttyS0,115200n8 net.ifnames=0 biosdevname=0`. The `fsmounts` entries for `/cm/shared` and `/home` are removed (Kairos uses `COS_PERSISTENT` bind-mounts, not NFS). Three `nodeexecutionfilters` are installed to **exclude** the kairos category from BCM's `mounts`, `interfaces`, and `ntp` health checks — Kairos' immutable-OS architecture doesn't match what those checks expect, and without the filters the category would permanently show "health check failed" despite being functionally healthy.
 3. **Target device reconfiguration** — the compute node is assumed to already be registered in cmsh. `bcm_target_node` in the inventory names the existing device. We set `category=kairos`, `softwareimage=kairos-installer`, and `installmode=FULL` on it. No new device records are created. (On a fresh local-KVM BCM the pipeline can alternatively register a `node001` from scratch.)
 4. **IP forwarding + NAT** — `net.ipv4.ip_forward=1` and an iptables MASQUERADE rule on BCM's default-route interface (auto-detected — handles `eth1`, `ens*`, `enp*` alike). Only takes effect when compute nodes actually route through BCM for internet access; on sites where compute nodes have their own upstream gateway this is a harmless no-op.
 5. **HTTP server** — systemd unit `kairos-http.service` runs a Python HTTP server on port `8888` from `/cm/shared/kairos/`. This is how compute nodes pull the compressed Kairos image during install.
@@ -149,7 +149,7 @@ Copy `inventory/group_vars/all.example.yml` to `inventory/group_vars/all.yml` an
 | `bcm_ssh_host` | BCM's address on the provisioning network (reached via the jumphost) | `"192.168.98.2"` |
 | `bcm_ssh_port` | SSH port on BCM | `22` |
 | `bcm_ssh_proxy_jump` | Jumphost in `user@host` form — applied as an OpenSSH `ProxyCommand` to every BCM call | `"partner@100.90.255.42"` |
-| `bcm_ssh_proxy_key` | Private key for jumphost auth (`~` is expanded) | `"~/.ssh/sai"` |
+| `bcm_ssh_proxy_key` | Private key for jumphost auth (`~` is expanded) | `"~/.ssh/bcm-jump"` |
 | `bcm_internal_ip` | BCM's IP on the provisioning network (baked into the compute node's HTTP URL) | `"192.168.98.2"` |
 | `bcm_internal_cidr` | CIDR for NFS exports and DHCP pool scope | `"192.168.98.0/24"` |
 | `bcm_manage_dns` | **Must stay `false`** on a customer BCM — skips the cluster-wide DNS rewrite | `false` |
@@ -161,10 +161,10 @@ Copy `inventory/group_vars/all.example.yml` to `inventory/group_vars/all.yml` an
 | `kairos_canvos_args` | **Optional dict.** Overrides any subset of CanvOS `.arg` keys (`OS_VERSION`, `UPDATE_KERNEL`, `CIS_HARDENING`, `UBUNTU_PRO_KEY`, `IMAGE_REGISTRY`, `CUSTOM_TAG`, …). Defaults are in `roles/kairos_build/defaults/main.yml`; arbitrary new keys flow through to `.arg` verbatim | `{OS_VERSION: "22.04", UPDATE_KERNEL: "true"}` |
 | `kairos_extra_apt_packages` | **Optional list.** Extra apt packages installed in the Kairos image via a Dockerfile RUN block. Empty list = no extras | `[htop, tcpdump, jq]` |
 | `kairos_user_data` | **Optional raw YAML.** Layered into `/oem/99_userdata.yaml` on top of the BCM/Palette base config. Empty = no extra userdata file written | (see worked example) |
-| `bcm_source_category` | Existing BCM category to clone for the new `kairos` category (inherits disksetup + mon templates + FinalizeXML) | `"S-AI Partner Lab"` |
+| `bcm_source_category` | Existing BCM category to clone for the new `kairos` category (inherits disksetup + mon templates + FinalizeXML) | `"Partner Lab"` |
 | `kairos_target_disk` | Disk device on the compute node that `dd` will overwrite | `"/dev/nvme0n1"` |
 | `kairos_wipe_disks` | Sibling disks to `wipefs -a -f` before `dd` (clears stale LVM/DRBD signatures) | `"nvme1n1 nvme2n1 nvme3n1 nvme4n1"` |
-| `palette_endpoint` | Palette API hostname | `"s-ai.lan"` |
+| `palette_endpoint` | Palette API hostname | `"palette.example.com"` |
 | `palette_project_name` | Palette project | `"Default"` |
 | `palette_project_uid` | Palette project UID | `"69a81eb…"` |
 | `palette_api_key` | Admin API key with `edgeToken.create` + `edgehost.delete` | `"…"` |
@@ -223,7 +223,7 @@ ansible-playbook playbooks/discover-bcm.yml \
     -e bcm_host=192.168.98.2 -e bcm_port=22 -e bcm_user=root \
     -e bcm_pass='<root-password>' \
     -e bcm_proxy_jump='user@jumphost.example.com' \
-    -e bcm_proxy_key='~/.ssh/sai'
+    -e bcm_proxy_key='~/.ssh/bcm-jump'
 ```
 
 ### Step 1: Build the Kairos image — `make kairos-build`
@@ -270,7 +270,7 @@ ansible-playbook playbooks/discover-bcm.yml \
 | `bcm_ssh_host` / `bcm_ssh_port` | BCM address (e.g., `192.168.98.2:22` on a remote, `localhost:10022` on local-KVM) |
 | `bcm_ssh_proxy_jump` / `bcm_ssh_proxy_key` | Jumphost in `user@host` form + key path (empty when BCM is directly reachable) |
 | `bcm_internal_ip` / `_netmask` / `_cidr` | BCM's provisioning-network identity (bake into `install-kairos.sh`'s HTTP URL) |
-| `bcm_source_category` | Existing category to clone for `kairos` (e.g., `"S-AI Partner Lab"`) |
+| `bcm_source_category` | Existing category to clone for `kairos` (e.g., `"Partner Lab"`) |
 | `bcm_target_node` | Name of the existing cmsh device to re-image |
 | `bcm_manage_dns` | Default `false` on remote — leaves site DNS alone |
 | `bcm_manage_cluster_defaults` | Default `false` on remote — no cluster-wide changes |
