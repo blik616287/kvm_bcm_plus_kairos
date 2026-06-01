@@ -28,6 +28,10 @@ LOG_TAG="palette-cleanup-stale"
 # or stylus never sees it — see inject_token().
 USERDATA_FILE="/oem/90_custom.yaml"
 STYLUS_RUNTIME="/run/stylus/userdata"
+# Persisted on COS_OEM (survives reboots). Lets us reuse a token already minted
+# on a prior boot/run instead of minting a fresh one every time stylus restarts
+# and regenerates /run/stylus/userdata from the empty placeholder.
+TOKEN_CACHE="/oem/.edge-host-token"
 
 log()  { echo "${LOG_TAG}: $*" ; }
 
@@ -114,8 +118,19 @@ if [ -r "$TOKEN_SRC" ]; then
         }' "$TOKEN_SRC")
 fi
 
+# Reuse a token persisted on a prior run rather than minting (and orphaning) a
+# new one each time stylus restarts. Re-inject it into the files stylus reads.
+if [ -z "$CURRENT_TOKEN" ] && [ -r "$TOKEN_CACHE" ]; then
+    CURRENT_TOKEN=$(tr -d '[:space:]' < "$TOKEN_CACHE" 2>/dev/null)
+    if [ -n "$CURRENT_TOKEN" ]; then
+        log "reusing cached edgeHostToken from $TOKEN_CACHE (no new mint)"
+        inject_token "$STYLUS_RUNTIME" "$CURRENT_TOKEN"
+        inject_token "$USERDATA_FILE"  "$CURRENT_TOKEN"
+    fi
+fi
+
 if [ -z "$CURRENT_TOKEN" ]; then
-    log "no edgeHostToken in $USERDATA_FILE — generating one via admin API"
+    log "no edgeHostToken in $TOKEN_SRC and no cache — generating one via admin API"
     EXPIRY=$(date -u -d "+30 days" +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null)
     if [ -z "$EXPIRY" ]; then
         # fallback for busybox date
@@ -143,6 +158,8 @@ if [ -z "$CURRENT_TOKEN" ]; then
                 # copy keeps it across reboots. Update both, indent-agnostic.
                 inject_token "$STYLUS_RUNTIME" "$NEW_TOKEN"
                 inject_token "$USERDATA_FILE"  "$NEW_TOKEN"
+                # Persist so a later restart reuses this token instead of minting again.
+                printf '%s' "$NEW_TOKEN" > "$TOKEN_CACHE" 2>/dev/null && chmod 600 "$TOKEN_CACHE" 2>/dev/null || true
                 CURRENT_TOKEN="$NEW_TOKEN"
             else
                 log "token create returned uid but token fetch returned empty; continuing"
