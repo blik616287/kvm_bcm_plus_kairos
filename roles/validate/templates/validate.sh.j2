@@ -13,6 +13,9 @@ KAIROS_USER="kairos"
 KAIROS_PASSWORD="kairos"
 BCM_INTERNAL_IP="{{ bcm_internal_ip }}"
 TARGET_NODE="{{ bcm_target_node | default('node001', true) }}"
+PALETTE_ENDPOINT="{{ palette_endpoint | default('') }}"
+PALETTE_API_KEY="{{ palette_api_key | default('') }}"
+PALETTE_PROJECT_UID="{{ palette_project_uid | default('') }}"
 
 mkdir -p "${BUILD_DIR}"
 SSH_CONFIG="${BUILD_DIR}/.bcm-ssh-config"
@@ -240,8 +243,32 @@ echo "-- Services --"
 STYLUS=$(run_on_kairos 'systemctl is-active stylus-agent 2>/dev/null' || true)
 [[ "$STYLUS" == "active" ]] && check "stylus-agent" "PASS" "" || check "stylus-agent" "WARN" "status: ${STYLUS:-unknown}"
 
-PALETTE_REG=$(run_on_kairos 'journalctl -u stylus-agent --no-pager 2>/dev/null | grep -c "registering edge host"' | tr -d '[:space:]' || echo 0)
-[ "${PALETTE_REG:-0}" -gt 0 ] 2>/dev/null && check "Palette registration" "PASS" "" || check "Palette registration" "WARN" "no registration log entries found"
+# Palette registration — authoritative check against the Palette API. The edge
+# host UID comes from stylus's own logs (correct regardless of the BCM hostname
+# rename). Falls back to a stylus-log grep when no admin API key is configured.
+EDGE_UID=$(run_on_kairos 'journalctl -u stylus-agent --no-pager 2>/dev/null | grep -oE "edge-[0-9a-f]{32}" | head -1' | tr -d '[:space:]' || true)
+if [[ -n "$PALETTE_API_KEY" && -n "$PALETTE_ENDPOINT" && -n "$PALETTE_PROJECT_UID" && -n "$EDGE_UID" ]]; then
+    EH_JSON=$(mktemp)
+    EH_CODE=$(curl -sk -o "$EH_JSON" -w "%{http_code}" \
+        -H "ApiKey: ${PALETTE_API_KEY}" -H "ProjectUid: ${PALETTE_PROJECT_UID}" \
+        --connect-timeout 15 --max-time 30 \
+        "https://${PALETTE_ENDPOINT}/v1/edgehosts/${EDGE_UID}" 2>/dev/null || echo "000")
+    if [[ "$EH_CODE" == "200" ]] && grep -qE '"health":[[:space:]]*\{[[:space:]]*"state":[[:space:]]*"healthy"' "$EH_JSON"; then
+        check "Palette registration" "PASS" "${EDGE_UID} healthy"
+    elif [[ "$EH_CODE" == "200" ]] && grep -qE '"state":[[:space:]]*"ready"' "$EH_JSON"; then
+        check "Palette registration" "PASS" "${EDGE_UID} ready"
+    elif [[ "$EH_CODE" == "200" ]]; then
+        check "Palette registration" "WARN" "${EDGE_UID} registered, not yet ready/healthy"
+    elif [[ "$EH_CODE" == "404" ]]; then
+        check "Palette registration" "FAIL" "${EDGE_UID} not found in project"
+    else
+        check "Palette registration" "WARN" "Palette API HTTP ${EH_CODE} for ${EDGE_UID}"
+    fi
+    rm -f "$EH_JSON"
+else
+    PALETTE_REG=$(run_on_kairos 'journalctl -u stylus-agent --no-pager 2>/dev/null | grep -c "registering edge host"' | tr -d '[:space:]' || echo 0)
+    [ "${PALETTE_REG:-0}" -gt 0 ] 2>/dev/null && check "Palette registration" "PASS" "via stylus log (no API key set)" || check "Palette registration" "WARN" "no API key set; no registration log entries"
+fi
 
 echo ""
 echo "-- Boot --"
