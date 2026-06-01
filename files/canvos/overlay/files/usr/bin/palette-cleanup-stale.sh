@@ -22,9 +22,38 @@
 
 set +e
 LOG_TAG="palette-cleanup-stale"
+# /oem/90_custom.yaml persists across reboots; /run/stylus/userdata is the copy
+# stylus-agent actually reads at registration time (regenerated from /oem at
+# boot, BEFORE this ExecStartPre runs). The token must land in the runtime file
+# or stylus never sees it — see inject_token().
 USERDATA_FILE="/oem/90_custom.yaml"
+STYLUS_RUNTIME="/run/stylus/userdata"
 
 log()  { echo "${LOG_TAG}: $*" ; }
+
+inject_token() {
+    # inject_token FILE TOKEN — set/replace edgeHostToken under stylus.site:,
+    # matching whatever indentation FILE already uses (the runtime copy and the
+    # /oem copy are serialized at different depths — 2-space vs 4-space — so we
+    # must never assume a fixed indent). No-op if FILE is absent.
+    local file="$1" tok="$2"
+    [ -f "$file" ] || return 0
+    if grep -qE '^[[:space:]]*edgeHostToken:' "$file"; then
+        # replace the existing line (the build bakes an empty placeholder, so
+        # this branch is the normal path); works at any indentation.
+        sed -i "s|^\([[:space:]]*edgeHostToken:\).*|\1 ${tok}|" "$file"
+    else
+        # fallback for images without the placeholder: insert as a sibling of
+        # paletteEndpoint (always present under site:), copying its exact indent.
+        awk -v tok="$tok" '
+            !done && /^[[:space:]]*paletteEndpoint:/ {
+                match($0, /^[[:space:]]*/); ind=substr($0, 1, RLENGTH);
+                print ind "edgeHostToken: " tok; done=1
+            }
+            { print }
+        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+    fi
+}
 
 # ---- Gate: registration mode only ----
 NEEDS_REGISTRATION=false
@@ -69,8 +98,12 @@ api() {
 }
 
 # ---- (1) ensure edgeHostToken is present in userdata ----
+# Inspect the runtime copy stylus actually reads; the build bakes an empty
+# placeholder there, so an empty/missing value correctly triggers minting.
+TOKEN_SRC="$STYLUS_RUNTIME"
+[ -r "$TOKEN_SRC" ] || TOKEN_SRC="$USERDATA_FILE"
 CURRENT_TOKEN=""
-if [ -r "$USERDATA_FILE" ]; then
+if [ -r "$TOKEN_SRC" ]; then
     # grab the value after "edgeHostToken:" (trim quotes/whitespace). Empty if absent.
     CURRENT_TOKEN=$(awk '
         /^[[:space:]]*edgeHostToken:[[:space:]]*/ {
@@ -78,7 +111,7 @@ if [ -r "$USERDATA_FILE" ]; then
             gsub(/["\047]/, "");
             gsub(/[[:space:]]+$/, "");
             print; exit
-        }' "$USERDATA_FILE")
+        }' "$TOKEN_SRC")
 fi
 
 if [ -z "$CURRENT_TOKEN" ]; then
@@ -105,14 +138,11 @@ if [ -z "$CURRENT_TOKEN" ]; then
             BODY2=$(echo "$RESP2" | tail -n +2)
             NEW_TOKEN=$(echo "$BODY2" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("spec",{}).get("token",""))' 2>/dev/null)
             if [ -n "$NEW_TOKEN" ]; then
-                log "generated token uid=${TOKEN_UID}; injecting into $USERDATA_FILE"
-                # replace existing edgeHostToken: line, or inject under stylus.site: if missing
-                if grep -q '^[[:space:]]*edgeHostToken:' "$USERDATA_FILE"; then
-                    sed -i "s|^\([[:space:]]*edgeHostToken:\).*|\1 ${NEW_TOKEN}|" "$USERDATA_FILE"
-                else
-                    # insert after "site:" line (two-space indent assumed)
-                    sed -i "/^  site:/a\    edgeHostToken: ${NEW_TOKEN}" "$USERDATA_FILE"
-                fi
+                log "generated token uid=${TOKEN_UID}; injecting into stylus userdata"
+                # The runtime copy is what stylus-agent reads THIS boot; the /oem
+                # copy keeps it across reboots. Update both, indent-agnostic.
+                inject_token "$STYLUS_RUNTIME" "$NEW_TOKEN"
+                inject_token "$USERDATA_FILE"  "$NEW_TOKEN"
                 CURRENT_TOKEN="$NEW_TOKEN"
             else
                 log "token create returned uid but token fetch returned empty; continuing"
