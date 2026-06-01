@@ -20,7 +20,7 @@ done
 echo "[$(date)] Staging binaries to RAM..."
 RAMDIR="/dev/shm/kinstall"
 mkdir -p "$RAMDIR/lib"
-for bin in bash curl lz4 dd sync sleep sgdisk wipefs dmsetup efibootmgr partprobe blkid awk e2fsck resize2fs partx; do
+for bin in bash curl lz4 dd sync sleep sgdisk wipefs dmsetup efibootmgr partprobe blkid awk e2fsck resize2fs partx vgchange pvscan udevadm; do
     BIN_PATH=$(which "$bin" 2>/dev/null) && cp "$BIN_PATH" "$RAMDIR/" || true
 done
 for b in "$RAMDIR"/*; do
@@ -46,12 +46,30 @@ if [ -n "${WIPE_DISKS}" ]; then
         fi
     done
 fi
+# Quiesce the TARGET disk before overwriting it. On re-provisioned hardware the
+# previous install's LVM / DRBD / device-mapper can still hold ${DISK}; that
+# makes the post-dd partprobe fail with EBUSY and leaves the kernel with a
+# stale/empty partition table, so efibootmgr later encodes an all-zeros GPT GUID
+# and the firmware greys out the boot entry. wipefs only ran on sibling disks
+# (WIPE_DISKS) above — the target itself was never released. Do it here.
+echo "[\$(date)] Quiescing target ${DISK} (deactivate LVM / dm, wipe signatures)..."
+[ -x /dev/shm/kinstall/vgchange ] && /dev/shm/kinstall/vgchange -an 2>/dev/null || true
+/dev/shm/kinstall/dmsetup remove_all 2>/dev/null || true
+/dev/shm/kinstall/wipefs -a -f "${DISK}" 2>&1 || true
+[ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm settle 2>/dev/null || true
 echo "[\$(date)] Writing to ${DISK}..."
 /dev/shm/kinstall/curl --fail -s "${RAW_URL}" | /dev/shm/kinstall/lz4 -d - - | /dev/shm/kinstall/dd of="${DISK}" bs=4M oflag=direct 2>&1
 /dev/shm/kinstall/sync
 echo "[\$(date)] Fixing GPT backup header..."
 /dev/shm/kinstall/sgdisk -e ${DISK} 2>&1 || true
 /dev/shm/kinstall/partprobe ${DISK} 2>&1 || true
+# Partition-name separator: nvme/mmcblk/loop devices name partitions <disk>p<N>
+# (nvme0n1p1); sd/vd/hd do not (sda1). The grow + PARTUUID checks below must use
+# the right one or they silently target a non-existent device.
+case "${DISK}" in
+    *nvme*|*mmcblk*|*loop*) PSEP=p ;;
+    *) PSEP= ;;
+esac
 # Grow the LAST GPT partition (typically COS_PERSISTENT, the 5th partition in
 # Kairos cOS layout) to fill any unused space at the end of the target disk.
 # Required because the raw image was sized to its build VM's disk (~80 GiB)
@@ -72,11 +90,31 @@ if [ -x /dev/shm/kinstall/sgdisk ] && [ -x /dev/shm/kinstall/resize2fs ]; then
         /dev/shm/kinstall/partprobe ${DISK} 2>&1 || true
         /dev/shm/kinstall/partx -u --nr \$LAST_NUM ${DISK} 2>&1 || true
         # ext2/ext3/ext4 — Kairos cOS uses ext2 for active.img but COS_PERSISTENT is ext4
-        /dev/shm/kinstall/e2fsck -fy ${DISK}p\$LAST_NUM 2>&1 | tail -3 || true
-        /dev/shm/kinstall/resize2fs ${DISK}p\$LAST_NUM 2>&1 | tail -3 || true
+        /dev/shm/kinstall/e2fsck -fy ${DISK}\${PSEP}\$LAST_NUM 2>&1 | tail -3 || true
+        /dev/shm/kinstall/resize2fs ${DISK}\${PSEP}\$LAST_NUM 2>&1 | tail -3 || true
     else
         echo "[\$(date)] WARN: couldn't detect last partition, skipping grow"
     fi
+fi
+# Re-read the partition table and let udev repopulate /dev + PARTUUIDs before we
+# point efibootmgr at partition 1. efibootmgr --part 1 reads the GPT GUID from the
+# kernel's view of the disk; if that view is stale (table not re-read after dd) it
+# writes an all-zeros GUID and the firmware greys out the entry. Verify partition 1
+# has a readable PARTUUID first; retry settle/partprobe a few times if not.
+/dev/shm/kinstall/partprobe ${DISK} 2>&1 || true
+[ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm settle 2>/dev/null || true
+ESP_UUID=""
+for _try in 1 2 3 4 5; do
+    ESP_UUID=\$(/dev/shm/kinstall/blkid -s PARTUUID -o value "${DISK}\${PSEP}1" 2>/dev/null)
+    [ -n "\$ESP_UUID" ] && break
+    /dev/shm/kinstall/partprobe ${DISK} 2>/dev/null || true
+    [ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm settle 2>/dev/null || true
+    /dev/shm/kinstall/sleep 2
+done
+if [ -z "\$ESP_UUID" ]; then
+    echo "[\$(date)] WARN: partition 1 PARTUUID still unreadable after dd — the efibootmgr entry may get a zero GUID; the ESP fallback loader (EFI/BOOT/bootx64.efi) is the safety net."
+else
+    echo "[\$(date)] ESP partition 1 PARTUUID=\$ESP_UUID"
 fi
 # Create a UEFI boot entry pointing at our new ESP (partition 1 of the target disk).
 # Without this, physical UEFI firmwares keep booting stale BootXXXX entries tied to the
@@ -87,7 +125,13 @@ if [ -d /sys/firmware/efi/efivars ] && [ -x /dev/shm/kinstall/efibootmgr ]; then
     for n in \$(/dev/shm/kinstall/efibootmgr 2>/dev/null | grep 'Kairos\$' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//'); do
         /dev/shm/kinstall/efibootmgr -b "\$n" -B 2>/dev/null || true
     done
-    /dev/shm/kinstall/efibootmgr --create --disk ${DISK} --part 1 --label Kairos --loader '\EFI\BOOT\bootx64.efi' 2>&1 || true
+    EFI_OUT=\$(/dev/shm/kinstall/efibootmgr --create --disk ${DISK} --part 1 --label Kairos --loader '\EFI\BOOT\bootx64.efi' 2>&1); EFI_RC=\$?
+    echo "\$EFI_OUT"
+    if [ \$EFI_RC -ne 0 ]; then
+        echo "[\$(date)] WARN: efibootmgr --create exited \$EFI_RC — NVRAM boot entry not created. The ESP fallback loader (EFI/BOOT/bootx64.efi) should still boot if firmware honors the removable path."
+    elif echo "\$EFI_OUT" | grep -qiE 'HD\([0-9]+,GPT,0{8}-0{4}-0{4}-0{4}-0{12}'; then
+        echo "[\$(date)] WARN: efibootmgr wrote an all-zeros GPT GUID — firmware will likely grey out this entry. Check that the target disk was released (LVM/dm) and the table re-read."
+    fi
     # Put the new entry at the front of BootOrder.
     NEWID=\$(/dev/shm/kinstall/efibootmgr 2>/dev/null | grep 'Kairos\$' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//' | head -1)
     if [ -n "\$NEWID" ]; then
