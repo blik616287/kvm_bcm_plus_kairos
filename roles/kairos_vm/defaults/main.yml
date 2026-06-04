@@ -1,0 +1,41 @@
+---
+# Defaults for roles/kairos_vm. Inventory values in
+# inventory/group_vars/all.yml override anything set here.
+#
+# Local-KVM compute-node identity. Defaults reproduce the original single-node
+# behavior EXACTLY (node001). To stand up a SECOND concurrent compute node for
+# A/B testing two kairos profiles side by side, override `kairos_node_name`
+# (e.g. node002) and `kairos_vm_mac` on the second run — every other
+# identifier below is derived from the node number so it won't collide.
+
+# BCM device name for this compute node. node001 → original behavior.
+kairos_node_name: "node001"
+
+# Blocking vs non-blocking run. true (default): the play waits in-line for the
+# PXE install to finish, boots from disk, and waits for Kairos to come up —
+# original behavior. false: the play launches the PXE VM, then hands the
+# wait-for-install + disk-boot off to a detached background script and returns
+# immediately, so two nodes can be brought up concurrently from one terminal.
+# Validate each node separately once it has booted.
+kairos_vm_wait: true
+
+# Numeric suffix of the node name (node001 → 1, node002 → 2). All
+# collision-prone identifiers below derive from this so a second node gets a
+# distinct IP, serial-console port, and artifact set automatically.
+kairos_node_num: "{{ kairos_node_name | regex_replace('[^0-9]', '') | int }}"
+
+# Telnet serial-console port for the QEMU process.
+# node001 → 4321 (unchanged); node002 → 4322; etc. Must be unique per running VM.
+kairos_vm_serial_port: "{{ 4320 + (kairos_node_num | int) }}"
+
+# Slug used to namespace on-disk artifacts. The ternary keeps node001's paths
+# byte-identical to the pre-parameterization values, so `make kairos-stop`,
+# `make stop`, and `make teardown` (which match the literal pid file / QEMU
+# `-name`) keep working unchanged. Other nodes get their own artifact set.
+kairos_vm_slug: "{{ 'kairos' if kairos_node_name == 'node001' else kairos_node_name }}"
+kairos_vm_name: "Kairos-ComputeNode{{ '' if kairos_node_name == 'node001' else '-' + kairos_node_name }}"
+
+kairos_disk:        "{{ build_dir }}/{{ kairos_vm_slug }}-compute.qcow2"
+kairos_serial_log:  "{{ e2e_dir }}/logs/{{ kairos_vm_slug }}-serial.log"
+kairos_pid_file:    "{{ build_dir }}/.{{ kairos_vm_slug }}-qemu.pid"
+kairos_ovmf_vars:   "{{ build_dir }}/ovmf-vars-{{ kairos_vm_slug }}-vm.fd"

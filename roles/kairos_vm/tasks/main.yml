@@ -4,12 +4,11 @@
 # Flow: PXE → BCM provisions installer → dd writes Kairos → sysrq poweroff →
 #       reboot from disk → Kairos active
 
+# Artifact paths, VM name, serial port and the node identity (kairos_node_name)
+# come from roles/kairos_vm/defaults/main.yml — they derive from the node
+# number so a second concurrent node (node002) gets a non-colliding set.
 - name: Set Kairos VM variables
   ansible.builtin.set_fact:
-    kairos_disk: "{{ build_dir }}/kairos-compute.qcow2"
-    kairos_serial_log: "{{ e2e_dir }}/logs/kairos-serial.log"
-    kairos_pid_file: "{{ build_dir }}/.kairos-qemu.pid"
-    kairos_ovmf_vars: "{{ build_dir }}/ovmf-vars-kairos-vm.fd"
     ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
     bcm_ssh_cmd: "sshpass -p {{ bcm_password }} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p {{ bcm_ssh_port }} root@localhost"
 
@@ -37,15 +36,17 @@
 - name: Kill any existing Kairos VM
   ansible.builtin.shell: |
     PID=$(cat "{{ kairos_pid_file }}" 2>/dev/null) && kill "$PID" 2>/dev/null || true
-    pkill -f "qemu-system.*Kairos-ComputeNode" 2>/dev/null || true
+    # Match the exact QEMU -name token so killing node001 will not also kill a
+    # concurrently-running node002 (whose name is a superstring).
+    pkill -f "qemu-system.*-name {{ kairos_vm_name }} " 2>/dev/null || true
     sleep 2
   become: true
   changed_when: false
   failed_when: false
 
-- name: Reset node001 install mode to FULL before recreating disk
+- name: Reset {{ kairos_node_name }} install mode to FULL before recreating disk
   ansible.builtin.shell: |
-    {{ bcm_ssh_cmd }} "echo -e 'device\nuse node001\nset installmode FULL\ncommit' | cmsh 2>&1"
+    {{ bcm_ssh_cmd }} "echo -e 'device\nuse {{ kairos_node_name }}\nset installmode FULL\ncommit' | cmsh 2>&1"
   changed_when: true
 
 - name: Create fresh Kairos disk + OVMF vars
@@ -77,12 +78,12 @@
       -machine q35 \
       -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
       -drive if=pflash,format=raw,file="{{ kairos_ovmf_vars }}" \
-      -name "Kairos-ComputeNode" \
+      -name "{{ kairos_vm_name }}" \
       -display {{ qemu_display_type.stdout }} \
       -drive file="{{ kairos_disk }}",format=qcow2,if=virtio \
       -netdev socket,id=intnet,connect=:31337 \
       -device virtio-net-pci,netdev=intnet,mac={{ kairos_vm_mac }} \
-      -chardev socket,id=ser0,host=localhost,port=4321,server=on,wait=off,telnet=on,logfile="{{ kairos_serial_log }}" \
+      -chardev socket,id=ser0,host=localhost,port={{ kairos_vm_serial_port }},server=on,wait=off,telnet=on,logfile="{{ kairos_serial_log }}" \
       -serial chardev:ser0 \
       -pidfile "{{ kairos_pid_file }}" \
       -daemonize \
@@ -95,15 +96,43 @@
       - "Serial log: {{ kairos_serial_log }}"
       - "Flow: PXE → installer → dd → poweroff → disk boot → Kairos"
 
-# ---- Wait for install (VM powers off after dd) ----
+# ---- Non-blocking mode: hand off to a detached finisher and return ----
+
+- name: Drive install → disk-boot in the background (non-blocking mode)
+  when: not (kairos_vm_wait | default(true) | bool)
+  block:
+    - name: Render background finisher script
+      ansible.builtin.template:
+        src: kairos-finish.sh.j2
+        dest: "{{ build_dir }}/kairos-finish-{{ kairos_vm_slug }}.sh"
+        mode: "0755"
+
+    - name: Launch background finisher (detached)
+      ansible.builtin.shell: |
+        setsid nohup "{{ build_dir }}/kairos-finish-{{ kairos_vm_slug }}.sh" \
+          </dev/null > "{{ e2e_dir }}/logs/{{ kairos_vm_slug }}-finish.log" 2>&1 &
+        echo "started"
+      changed_when: true
+
+    - name: Show non-blocking note
+      ansible.builtin.debug:
+        msg:
+          - "{{ kairos_node_name }} launched NON-BLOCKING — playbook returning now."
+          - "It will PXE-install, power off, then auto-boot from disk in the background."
+          - "Track: tail -f logs/{{ kairos_vm_slug }}-finish.log  +  logs/{{ kairos_vm_slug }}-serial.log"
+          - "Validate once up: make validate ANSIBLE_ARGS='-e kairos_profile=<p> -e kairos_node_name={{ kairos_node_name }}'"
+
+# ---- Blocking mode (default): wait for install, boot from disk, wait for boot ----
 
 - name: Render wait-for-boot script
+  when: kairos_vm_wait | default(true) | bool
   ansible.builtin.template:
     src: wait-kairos-boot.sh.j2
     dest: "{{ build_dir }}/wait-kairos-boot.sh"
     mode: "0755"
 
 - name: Wait for dd install to complete (VM powers off, up to 30 min)
+  when: kairos_vm_wait | default(true) | bool
   ansible.builtin.shell: |
     TIMEOUT=1800
     ELAPSED=0
@@ -123,6 +152,7 @@
 # ---- Reboot from disk ----
 
 - name: Start Kairos VM from disk (OVMF/UEFI, reuses vars with Kairos boot entry)
+  when: kairos_vm_wait | default(true) | bool
   ansible.builtin.shell: |
     > "{{ kairos_serial_log }}"
     OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
@@ -135,22 +165,24 @@
       -machine q35 \
       -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
       -drive if=pflash,format=raw,file="{{ kairos_ovmf_vars }}" \
-      -name "Kairos-ComputeNode" \
+      -name "{{ kairos_vm_name }}" \
       -display {{ qemu_display_type.stdout }} \
       -drive file="{{ kairos_disk }}",format=qcow2,if=virtio \
       -netdev socket,id=intnet,connect=:31337 \
       -device virtio-net-pci,netdev=intnet,mac={{ kairos_vm_mac }} \
-      -chardev socket,id=ser0,host=localhost,port=4321,server=on,wait=off,telnet=on,logfile="{{ kairos_serial_log }}" \
+      -chardev socket,id=ser0,host=localhost,port={{ kairos_vm_serial_port }},server=on,wait=off,telnet=on,logfile="{{ kairos_serial_log }}" \
       -serial chardev:ser0 \
       -pidfile "{{ kairos_pid_file }}" \
       -daemonize \
       -boot c
 
 - name: Wait for Kairos to fully boot (up to 10 min)
+  when: kairos_vm_wait | default(true) | bool
   ansible.builtin.shell: "{{ build_dir }}/wait-kairos-boot.sh"
   register: kairos_boot_result
   timeout: 600
 
 - name: Show Kairos boot result
+  when: kairos_vm_wait | default(true) | bool
   ansible.builtin.debug:
     msg: "{{ kairos_boot_result.stdout_lines | default(['unknown']) | last }}"
