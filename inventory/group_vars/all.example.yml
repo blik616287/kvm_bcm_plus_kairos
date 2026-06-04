@@ -126,11 +126,20 @@ kairos_profile:      "default-kairos"
 kairos_canvos_args: {}
 # Example:
 # kairos_canvos_args:
-#   OS_VERSION:      "22.04"      # also "20.04", "24.04"
+#   OS_VERSION:      "22.04"      # also "20.04", "24.04" (Spectro-published bases)
 #   UPDATE_KERNEL:   "true"       # let apt upgrade the kernel during build
 #   CIS_HARDENING:   "false"      # run /cis-harden/harden.sh during build
 #   UBUNTU_PRO_KEY:  ""            # if set, attaches Ubuntu Pro during build
 #   CUSTOM_TAG:      "site-name"  # image tag in the temporary registry
+#
+# Custom base image (OS versions Spectro has NOT published a curated
+# kairos-ubuntu:<ver>-core-... for, e.g. 26.04). Setting BASE_IMAGE bypasses
+# CanvOS's curated-tag lookup and builds FROM your image. Build one first with
+# `make kairos-base BASE_OS_IMAGE=ubuntu:26.04 && make kairos-base-push`:
+# kairos_canvos_args:
+#   OS_DISTRIBUTION: "ubuntu"
+#   OS_VERSION:      "26.04"
+#   BASE_IMAGE:      "ttl.sh/kairos-ubuntu:26.04-core-amd64-generic-v4.0.3"
 
 # Open-ended apt package list. Each name appended to a Dockerfile RUN block
 # in CanvOS, between the BCM-scripts COPY block and CanvOS's other layers.

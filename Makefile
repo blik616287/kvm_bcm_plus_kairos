@@ -60,6 +60,40 @@ kairos-image: ## Stage 3 (image-only / day-2): build + push container image, ski
 	@mkdir -p $(LOGS_DIR)
 	ansible-playbook playbooks/03-kairos-build.yml -e kairos_build_raw_disk=false $(ANSIBLE_ARGS) 2>&1 | tee $(LOGS_DIR)/03-kairos-image.log
 
+# ---- Custom Kairos base image (for OS versions Spectro hasn't published) ----
+# Build a Kairos "core" base from an upstream OS image via kairos-init, for use
+# as a CanvOS .arg BASE_IMAGE override (e.g. Ubuntu 26.04). Override any var:
+#   make kairos-base BASE_OS_IMAGE=ubuntu:26.04 KAIROS_BASE_REGISTRY=ttl.sh
+BASE_OS_IMAGE        ?= ubuntu:26.04
+KAIROS_INIT_VERSION  ?= v0.13.0
+KAIROS_VERSION       ?= v4.0.3
+KAIROS_BASE_REGISTRY ?= ttl.sh
+KAIROS_BASE_REPO     ?= kairos-ubuntu
+KAIROS_BASE_VER      ?= 26.04
+KAIROS_BASE_TAG      ?= $(KAIROS_BASE_VER)-core-amd64-generic-$(KAIROS_VERSION)
+KAIROS_BASE_IMAGE    ?= $(KAIROS_BASE_REGISTRY)/$(KAIROS_BASE_REPO):$(KAIROS_BASE_TAG)
+
+.PHONY: kairos-base
+kairos-base: ## Build a custom Kairos core base from BASE_OS_IMAGE (e.g. ubuntu:26.04) via kairos-init
+	docker build \
+	  --build-arg BASE_IMAGE=$(BASE_OS_IMAGE) \
+	  --build-arg KAIROS_INIT_VERSION=$(KAIROS_INIT_VERSION) \
+	  --build-arg KAIROS_VERSION=$(KAIROS_VERSION) \
+	  -t $(KAIROS_BASE_IMAGE) \
+	  -f files/kairos-base/Dockerfile files/kairos-base
+	@echo ""
+	@echo "Built $(KAIROS_BASE_IMAGE)"
+	@echo "Push:  make kairos-base-push   (or: docker push $(KAIROS_BASE_IMAGE))"
+	@echo "Then set in inventory/group_vars/all.yml:"
+	@echo "  kairos_canvos_args:"
+	@echo "    OS_DISTRIBUTION: ubuntu"
+	@echo "    OS_VERSION: \"$(KAIROS_BASE_VER)\""
+	@echo "    BASE_IMAGE: \"$(KAIROS_BASE_IMAGE)\""
+
+.PHONY: kairos-base-push
+kairos-base-push: kairos-base ## Build + push the custom Kairos base image
+	docker push $(KAIROS_BASE_IMAGE)
+
 .PHONY: deploy-dd
 deploy-dd: ## Stage 4: Upload image to BCM, configure PXE
 	$(call run_playbook,04-deploy-dd)
