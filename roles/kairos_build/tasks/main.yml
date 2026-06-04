@@ -255,13 +255,23 @@
       async: 3600
       poll: 30
 
-    - name: Fix ext4 metadata_csum for GRUB compatibility
+    - name: Fix ext4 features for GRUB compatibility (outer partitions)
       ansible.builtin.shell: |
+        # GRUB cannot read ext4 filesystems with checksum/orphan-file features.
+        # 24.04+/26.04 base images ship e2fsprogs >= 1.47, which enables
+        # orphan_file AND metadata_csum_seed by default; metadata_csum cannot be
+        # cleared while metadata_csum_seed is set, so clear them together (seed
+        # before csum). NOTE: 2>/dev/null was removed deliberately — on 24.04 the
+        # old `tune2fs -O ^metadata_csum` silently failed and the node never booted.
         LOOP=$(losetup -fP --show {{ raw_disk_path }})
         for p in ${LOOP}p2 ${LOOP}p3 ${LOOP}p4 ${LOOP}p5; do
           [ -b "$p" ] || continue
-          e2fsck -fy "$p" >/dev/null 2>&1
-          tune2fs -O ^metadata_csum "$p" 2>/dev/null && echo "Fixed: $p"
+          e2fsck -fy "$p" >/dev/null 2>&1 || true
+          if tune2fs -O ^orphan_file,^metadata_csum_seed,^metadata_csum "$p"; then
+            echo "Stripped ext4 feats: $p"
+          else
+            echo "WARN: ext4 feature-strip failed on $p"
+          fi
         done
         losetup -d "$LOOP"
       become: true
@@ -287,6 +297,14 @@
             echo "Added ifcfg-eth0 in $IMG"
           fi
           umount /tmp/kairos-patch-img
+          # GRUB reads the kernel from inside these cOS images, so strip the same
+          # ext4 features here too (24.04+/26.04 e2fsprogs enables them by default).
+          e2fsck -fy "$IMG_LOOP" >/dev/null 2>&1 || true
+          if tune2fs -O ^orphan_file,^metadata_csum_seed,^metadata_csum "$IMG_LOOP"; then
+            echo "Stripped ext4 feats in $IMG"
+          else
+            echo "WARN: ext4 feature-strip failed in $IMG"
+          fi
           losetup -d "$IMG_LOOP"
           umount /tmp/kairos-patch-state
         done
