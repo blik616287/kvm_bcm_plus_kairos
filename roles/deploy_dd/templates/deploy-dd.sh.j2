@@ -375,7 +375,7 @@ TARGET_NODE_NAME="{{ bcm_target_node }}"
 # formula as roles/kairos_vm/defaults so the two stages agree without sharing a var.
 COMPUTE_NODE_IP="{{ bcm_internal_ip.rsplit('.', 1)[0] }}.{{ 9 + (kairos_node_name | default('node001', true) | regex_replace('[^0-9]', '') | int) }}"
 ${SSH_CMD} "echo -e 'device\nremove {{ kairos_node_name | default('node001', true) }}\ncommit' | cmsh 2>/dev/null; \
-    echo -e 'device\nadd physicalnode {{ kairos_node_name | default('node001', true) }} ${COMPUTE_NODE_IP} enp0s2\nset category {{ kairos_profile }}\nset softwareimage {{ kairos_profile }}-installer\nset mac ${COMPUTE_MAC}\nset provisioninginterface enp0s2\ncommit' | cmsh 2>&1" 2>/dev/null | filter_motd
+    echo -e 'device\nadd physicalnode {{ kairos_node_name | default('node001', true) }} ${COMPUTE_NODE_IP} enp0s2\nset category {{ kairos_profile }}\nset softwareimage {{ kairos_profile }}-installer\nset installmode FULL\nset mac ${COMPUTE_MAC}\nset provisioninginterface enp0s2\ncommit' | cmsh 2>&1" 2>/dev/null | filter_motd
 TARGET_NODE_NAME="{{ kairos_node_name | default('node001', true) }}"
 {% endif %}
 
