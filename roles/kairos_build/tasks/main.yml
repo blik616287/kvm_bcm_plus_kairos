@@ -236,18 +236,38 @@
           -pidfile {{ build_dir }}/.qemu-install.pid \
           -daemonize
         QEMU_PID=$(cat {{ build_dir }}/.qemu-install.pid)
-        sleep 90
+        INSTALL_LOG={{ e2e_dir }}/logs/qemu-install.log
+        : > "$INSTALL_LOG"
         (
-          sleep 2
-          # Mount CIDATA, copy the base cloud-config to /oem/90_custom.yaml,
-          # stash the optional extra-userdata to /tmp for after the install.
-          printf 'mount /dev/vdb /mnt 2>/dev/null && cp /mnt/user-data /oem/90_custom.yaml && cp /mnt/user-data /tmp/99_bcm.yaml && { [ -f /mnt/extra-userdata ] && cp /mnt/extra-userdata /tmp/99_userdata.yaml; true; }\r\n'
+          # Wait for the installer shell prompt on the serial console before
+          # injecting anything. Boot time varies by base/OS_VERSION; a blind sleep
+          # too short drops the config-copy command, so kairos-agent then
+          # installs with NO config and falls into Palette pairing — producing an
+          # EMPTY disk. Poll the serial log nc is writing for the root prompt.
+          for i in $(seq 1 90); do
+            grep -qaE 'root@[A-Za-z0-9._-]+:[^#]*#' "$INSTALL_LOG" 2>/dev/null && break
+            sleep 5
+          done
           sleep 3
-          # Run kairos-agent install, then re-mount the OEM partition on the new
-          # raw disk and drop both 99_bcm.yaml and (if present) 99_userdata.yaml in.
+          # Mount the CIDATA user-data disk and copy the base cloud-config to
+          # /oem/90_custom.yaml. Robust against installer-env differences: ensure
+          # the mountpoints exist and fall back to explicit vfat / LABEL mounts.
+          # Retry until the node echoes the marker — the CFG""DONE quote-split means
+          # the COMMAND echo (CFG""DONE) differs from the OUTPUT (CFGDONE), so grep
+          # only matches a real success. Without a confirmed copy kairos-agent has
+          # no install config and pairs instead of installing.
+          for i in $(seq 1 15); do
+            printf 'mkdir -p /mnt /oem; mount /dev/vdb /mnt 2>/dev/null || mount -t vfat /dev/vdb /mnt 2>/dev/null || mount -t vfat LABEL=CIDATA /mnt 2>/dev/null; cp /mnt/user-data /oem/90_custom.yaml && cp /mnt/user-data /tmp/99_bcm.yaml && { [ -f /mnt/extra-userdata ] && cp /mnt/extra-userdata /tmp/99_userdata.yaml; true; } && echo CFG""DONE\r\n'
+            sleep 4
+            grep -qa 'CFGDONE' "$INSTALL_LOG" 2>/dev/null && break
+          done
+          sleep 2
+          # Run kairos-agent install (reads /oem/90_custom.yaml), then re-mount the
+          # OEM partition on the new raw disk and drop both 99_bcm.yaml and (if
+          # present) 99_userdata.yaml in.
           printf 'kairos-agent --debug install 2>&1; mount /dev/vda2 /oem 2>/dev/null; cp /tmp/99_bcm.yaml /oem/99_bcm.yaml; { [ -f /tmp/99_userdata.yaml ] && cp /tmp/99_userdata.yaml /oem/99_userdata.yaml; true; }; poweroff\r\n'
-          sleep 600
-        ) | nc -U "$SOCK" > {{ e2e_dir }}/logs/qemu-install.log 2>&1 &
+          sleep 900
+        ) | nc -U "$SOCK" > "$INSTALL_LOG" 2>&1 &
         SERIAL_PID=$!
         while kill -0 "$QEMU_PID" 2>/dev/null; do sleep 10; done
         kill "$SERIAL_PID" 2>/dev/null || true
