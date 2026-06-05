@@ -88,6 +88,15 @@ cp inventory/group_vars/all.example.yml inventory/group_vars/all.yml
 make all   # runs the full 6-stage pipeline (~100-120 min)
 ```
 
+To build/deploy/validate **specific Ubuntu versions** (e.g. 24.04 and 26.04) with
+reproducible, committed extra-vars, use the per-OS profiles — full per-profile
+instructions in [`profiles/README.md`](profiles/README.md):
+
+```bash
+make kairos-build ANSIBLE_ARGS="-e @profiles/ubuntu-24.04.yml"   # 24.04 → node001
+make kairos-build ANSIBLE_ARGS="-e @profiles/ubuntu-26.04.yml"   # 26.04 → node002 (self-built base)
+```
+
 ## Day-2 ops — container publish + Palette rolling upgrade
 
 Once a Kairos cluster is bootstrapped (via the day-1 `kairos-build` + `deploy-dd`
