@@ -1,0 +1,25 @@
+---
+# Build/deploy/boot/validate profile for Ubuntu 24.04.
+#
+# Pass to any make stage with:
+#   make kairos-build ANSIBLE_ARGS="-e @profiles/ubuntu-24.04.yml"
+#   make deploy-dd    ANSIBLE_ARGS="-e @profiles/ubuntu-24.04.yml"
+#   make kairos-vm    ANSIBLE_ARGS="-e @profiles/ubuntu-24.04.yml"
+#   make validate     ANSIBLE_ARGS="-e @profiles/ubuntu-24.04.yml"
+#
+# 24.04 uses Spectro's published curated base
+# (us-docker.pkg.dev/palette-images/edge/kairos-ubuntu:24.04-core-...), so NO
+# BASE_IMAGE is needed — CanvOS derives and pulls it automatically.
+
+kairos_profile: "u2404"
+
+# Local-KVM compute node this profile installs/boots (used by kairos-vm + validate).
+kairos_node_name: "node001"
+
+kairos_canvos_args:
+  OS_DISTRIBUTION: "ubuntu"
+  OS_VERSION: "24.04"
+  # Distinct ISO_NAME so the build's "ISO already exists" short-circuit doesn't
+  # reuse a different profile's ISO from build/ (they share that dir). Required
+  # whenever you build more than one profile on the same host.
+  ISO_NAME: "palette-edge-u2404"
