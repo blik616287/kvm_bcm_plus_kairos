@@ -1,0 +1,39 @@
+---
+# Build/deploy/boot/validate profile for Ubuntu 26.04.
+#
+# Pass to any make stage with:
+#   make kairos-build ANSIBLE_ARGS="-e @profiles/ubuntu-26.04.yml"
+#   make deploy-dd    ANSIBLE_ARGS="-e @profiles/ubuntu-26.04.yml"
+#   make kairos-vm    ANSIBLE_ARGS="-e @profiles/ubuntu-26.04.yml"
+#   make validate     ANSIBLE_ARGS="-e @profiles/ubuntu-26.04.yml"
+#
+# PREREQUISITE — Spectro does NOT publish a curated 26.04 base, so you must build
+# and push a Kairos core base yourself, then point BASE_IMAGE (below) at it:
+#
+#   1. Build + push the base (registry of your choice):
+#        make kairos-base-push \
+#          BASE_OS_IMAGE=ubuntu:26.04 \
+#          KAIROS_BASE_VER=26.04 \
+#          KAIROS_BASE_REGISTRY=<your-registry-host>/<repo>
+#      (e.g. KAIROS_BASE_REGISTRY=ttl.sh  → ttl.sh/kairos-ubuntu:26.04-core-amd64-generic-v4.0.3)
+#   2. `docker login <your-registry-host>` on the build host so earthly/buildkit
+#      can pull it during `make kairos-build`.
+#   3. Set BASE_IMAGE below to the exact pushed tag.
+
+kairos_profile: "u2604"
+
+# Local-KVM compute node this profile installs/boots (used by kairos-vm + validate).
+# Distinct node name + MAC so 26.04 can coexist with the 24.04 profile on the BCM.
+kairos_node_name: "node002"
+kairos_vm_mac: "52:54:00:00:02:02"
+
+kairos_canvos_args:
+  OS_DISTRIBUTION: "ubuntu"
+  OS_VERSION: "26.04"
+  # Distinct ISO_NAME so the build's "ISO already exists" short-circuit doesn't
+  # reuse a different profile's ISO from build/.
+  ISO_NAME: "palette-edge-u2604"
+  # Self-built Kairos core base (see PREREQUISITE above). Setting BASE_IMAGE
+  # bypasses CanvOS's curated-tag lookup and builds FROM this image. Change the
+  # registry host to wherever you pushed your base in step 1.
+  BASE_IMAGE: "insightsoftmax.jfrog.io/docker/kairos-ubuntu:26.04-core-amd64-generic-v4.0.3"
