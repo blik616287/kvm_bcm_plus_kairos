@@ -1,0 +1,42 @@
+#!/bin/bash
+# Non-blocking finisher for the kairos_vm role (rendered when kairos_vm_wait=false).
+# Waits for the PXE-install VM to power off after dd, then boots the node from
+# its freshly-written disk. Runs detached (setsid) so the playbook returns
+# immediately and a second compute node can be brought up concurrently.
+set -uo pipefail
+
+PID=$(cat "{{ kairos_pid_file }}" 2>/dev/null)
+echo "[finish] {{ kairos_node_name }}: waiting for install VM (pid ${PID:-?}) to power off after dd..."
+TIMEOUT=1800; ELAPSED=0
+while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+  kill -0 "$PID" 2>/dev/null || { echo "[finish] install VM powered off at ${ELAPSED}s"; break; }
+  sleep 10; ELAPSED=$((ELAPSED + 10))
+done
+if kill -0 "$PID" 2>/dev/null; then
+  echo "[finish] TIMEOUT after ${TIMEOUT}s — install VM still running, aborting disk boot"
+  exit 1
+fi
+
+echo "[finish] booting {{ kairos_node_name }} from disk..."
+> "{{ kairos_serial_log }}"
+OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+[ -f "$OVMF_CODE" ] || OVMF_CODE=/usr/share/qemu/OVMF.fd
+qemu-system-x86_64 \
+  {{ kvm_flag.stdout }} \
+  -m {{ kairos_vm_ram }} \
+  -smp {{ kairos_vm_cpus }} \
+  -cpu host \
+  -machine q35 \
+  -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+  -drive if=pflash,format=raw,file="{{ kairos_ovmf_vars }}" \
+  -name "{{ kairos_vm_name }}" \
+  -display {{ qemu_display_type.stdout }} \
+  -drive file="{{ kairos_disk }}",format=qcow2,if=virtio \
+  -netdev socket,id=intnet,connect=:31337 \
+  -device virtio-net-pci,netdev=intnet,mac={{ kairos_vm_mac }} \
+  -chardev socket,id=ser0,host=localhost,port={{ kairos_vm_serial_port }},server=on,wait=off,telnet=on,logfile="{{ kairos_serial_log }}" \
+  -serial chardev:ser0 \
+  -pidfile "{{ kairos_pid_file }}" \
+  -daemonize \
+  -boot c
+echo "[finish] {{ kairos_node_name }} booting from disk (serial: {{ kairos_serial_log }})"

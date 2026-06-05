@@ -228,6 +228,30 @@ palette_ca_cert: |
 # kairos_vm_ram:       4096
 # kairos_vm_cpus:      2
 # kairos_vm_disk_size: "80G"
+#
+# Multi-node A/B testing: to boot a SECOND compute node concurrently (e.g. one
+# profile on Ubuntu 24.04 and another on 26.04), override kairos_node_name and
+# kairos_vm_mac on the second deploy-dd + kairos-vm + validate run. Everything
+# else (IP, serial-console port, qcow2/serial-log/pid paths, QEMU -name) derives
+# from the node number automatically, so node002 won't collide with node001:
+#   node001 → .10 / port 4321 / kairos-compute.qcow2   (default, unchanged)
+#   node002 → .11 / port 4322 / node002-compute.qcow2
+# kairos_node_name:    "node001"      # second node: "node002"
+#
+# kairos_vm_wait (default true) blocks the kairos-vm stage until the node boots.
+# Set it false to launch a node and return immediately (a detached finisher does
+# the install-wait + disk-boot), so both nodes can come up concurrently from one
+# terminal. Then validate each node once it is up.
+# kairos_vm_wait:      true
+#
+# Example — bring up BOTH nodes concurrently, then validate each:
+#   make deploy-dd ANSIBLE_ARGS='-e kairos_profile=u2404'
+#   make kairos-vm ANSIBLE_ARGS='-e kairos_vm_wait=false'
+#   make deploy-dd ANSIBLE_ARGS='-e kairos_profile=u2604 -e kairos_node_name=node002 -e kairos_vm_mac=52:54:00:00:02:02'
+#   make kairos-vm ANSIBLE_ARGS='-e kairos_node_name=node002 -e kairos_vm_mac=52:54:00:00:02:02 -e kairos_vm_wait=false'
+#   # ...wait for both to boot (watch logs/*-finish.log), then:
+#   make validate  ANSIBLE_ARGS='-e kairos_profile=u2404'
+#   make validate  ANSIBLE_ARGS='-e kairos_profile=u2604 -e kairos_node_name=node002'
 
 # ==== CanvOS container-build registry (used during kairos-build) ====
 # Temporary ephemeral registry that holds the CanvOS-built container while
