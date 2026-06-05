@@ -85,6 +85,20 @@
         line: "                RUN echo 'omit_dracutmodules+=\" nfit \"' > /etc/dracut.conf.d/99-skip-nfit.conf"
       failed_when: false
 
+    # Ubuntu 26.04 ships systemd 259 built +APPARMOR, which dlopens
+    # libapparmor.so.1 when it execs a service. The Kairos initramfs build does
+    # not bundle that lib, so in the initrd systemd cannot start immucore.service
+    # ("Shared library 'libapparmor.so.1' is not available") -> initrd.target
+    # dependency fails -> dracut emergency mode -> the node never assembles its
+    # cOS root and never boots. Force-install the lib into the initramfs.
+    # Harmless on older releases (just an extra lib); fixes the 26.04 boot hang.
+    - name: Patch Earthfile — bundle libapparmor into initramfs (Ubuntu 26.04 boot fix)
+      ansible.builtin.lineinfile:
+        path: "{{ canvos_dir }}/Earthfile"
+        insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
+        line: "                RUN echo 'install_items+=\" /usr/lib/x86_64-linux-gnu/libapparmor.so.1 \"' > /etc/dracut.conf.d/10-apparmor.conf"
+      failed_when: false
+
     - name: Patch Dockerfile — add BCM scripts (COPY + chmod +x as real Dockerfile instructions)
       ansible.builtin.blockinfile:
         path: "{{ canvos_dir }}/Dockerfile"

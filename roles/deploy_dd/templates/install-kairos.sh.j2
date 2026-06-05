@@ -20,7 +20,7 @@ done
 echo "[$(date)] Staging binaries to RAM..."
 RAMDIR="/dev/shm/kinstall"
 mkdir -p "$RAMDIR/lib"
-for bin in bash curl lz4 dd sync sleep sgdisk wipefs dmsetup efibootmgr partprobe blkid awk e2fsck resize2fs partx vgchange pvscan udevadm; do
+for bin in bash curl lz4 dd sync sleep timeout sgdisk wipefs dmsetup efibootmgr partprobe blkid awk e2fsck resize2fs partx vgchange pvscan udevadm; do
     BIN_PATH=$(which "$bin" 2>/dev/null) && cp "$BIN_PATH" "$RAMDIR/" || true
 done
 for b in "$RAMDIR"/*; do
@@ -89,9 +89,13 @@ if [ -x /dev/shm/kinstall/sgdisk ] && [ -x /dev/shm/kinstall/resize2fs ]; then
         /dev/shm/kinstall/sgdisk -d \$LAST_NUM -n \$LAST_NUM:\$LAST_START:0 -t \$LAST_NUM:\$LAST_TYPE -c \$LAST_NUM:"\$LAST_LABEL" ${DISK} 2>&1 || true
         /dev/shm/kinstall/partprobe ${DISK} 2>&1 || true
         /dev/shm/kinstall/partx -u --nr \$LAST_NUM ${DISK} 2>&1 || true
-        # ext2/ext3/ext4 — Kairos cOS uses ext2 for active.img but COS_PERSISTENT is ext4
-        /dev/shm/kinstall/e2fsck -fy ${DISK}\${PSEP}\$LAST_NUM 2>&1 | tail -3 || true
-        /dev/shm/kinstall/resize2fs ${DISK}\${PSEP}\$LAST_NUM 2>&1 | tail -3 || true
+        # ext2/ext3/ext4 — Kairos cOS uses ext2 for active.img but COS_PERSISTENT is ext4.
+        # Bound both with timeout: the installer image ships OLDER e2fsprogs that can
+        # HANG on newer (24.04+/26.04) ext4 filesystems, and a hang here never reaches
+        # the sysrq poweroff below (the install VM then never powers off). The grow is
+        # a no-op when the target disk == image size, so timing these out is safe.
+        /dev/shm/kinstall/timeout 120 /dev/shm/kinstall/e2fsck -fy ${DISK}\${PSEP}\$LAST_NUM 2>&1 | tail -3 || true
+        /dev/shm/kinstall/timeout 120 /dev/shm/kinstall/resize2fs ${DISK}\${PSEP}\$LAST_NUM 2>&1 | tail -3 || true
     else
         echo "[\$(date)] WARN: couldn't detect last partition, skipping grow"
     fi
