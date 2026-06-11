@@ -20,7 +20,7 @@ done
 echo "[$(date)] Staging binaries to RAM..."
 RAMDIR="/dev/shm/kinstall"
 mkdir -p "$RAMDIR/lib"
-for bin in bash curl lz4 dd sync sleep timeout sgdisk wipefs dmsetup efibootmgr partprobe blkid awk e2fsck resize2fs partx vgchange pvscan udevadm; do
+for bin in bash curl lz4 dd sync sleep timeout sgdisk wipefs dmsetup efibootmgr partprobe blkid awk e2fsck resize2fs partx vgchange pvscan udevadm umount swapoff mdadm findmnt; do
     BIN_PATH=$(which "$bin" 2>/dev/null) && cp "$BIN_PATH" "$RAMDIR/" || true
 done
 for b in "$RAMDIR"/*; do
@@ -60,6 +60,33 @@ echo "[\$(date)] Quiescing target ${DISK} (deactivate LVM / dm, wipe signatures)
 echo "[\$(date)] Writing to ${DISK}..."
 /dev/shm/kinstall/curl --fail -s "${RAW_URL}" | /dev/shm/kinstall/lz4 -d - - | /dev/shm/kinstall/dd of="${DISK}" bs=4M oflag=direct 2>&1
 /dev/shm/kinstall/sync
+# Quiesce the FRESHLY-WRITTEN partitions before touching the table. Full-systemd
+# node-installers (e.g. DGX SuperPod under BCM) auto-activate the cOS partitions
+# the moment dd lays down their signatures — auto-mount by COS_* label,
+# LVM/mdraid auto-assembly, udev blkid scans — which holds \${DISK} open. Then
+# every table op below fails with EBUSY:
+#   "Warning: kernel is still using the old partition table ... in use"
+#   "resize2fs: Device or resource busy while trying to open \${DISK}p5"
+# so the COS_PERSISTENT grow silently no-ops (stays build-sized on a multi-TB
+# NVMe -> fills up and crashes minutes after boot) and the stale table makes
+# efibootmgr risk a zero GPT GUID (greyed-out boot entry). The pre-dd quiesce
+# can't cover this — these activations happen AFTER dd re-creates the signatures.
+# (Note: this is the EBUSY case, distinct from the e2fsprogs *hang* the timeouts
+# below guard — on a held-open partition resize2fs returns busy immediately, so
+# the timeout never fires.) Release the holders here and pause udev so it doesn't
+# re-open the partitions between sgdisk and resize2fs.
+echo "[\$(date)] Quiescing freshly-written partitions on ${DISK}..."
+[ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm settle 2>/dev/null || true
+[ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm control --stop-exec-queue 2>/dev/null || true
+# Unmount anything auto-mounted from the target (deepest mountpoints first).
+for mp in \$(/dev/shm/kinstall/awk -v d="${DISK}" '\$1 ~ ("^" d) {print \$2}' /proc/mounts | sort -r); do
+    [ -x /dev/shm/kinstall/umount ] && /dev/shm/kinstall/umount -fl "\$mp" 2>/dev/null || true
+done
+[ -x /dev/shm/kinstall/swapoff ] && /dev/shm/kinstall/swapoff "${DISK}"* 2>/dev/null || true
+[ -x /dev/shm/kinstall/vgchange ] && /dev/shm/kinstall/vgchange -an 2>/dev/null || true
+# Stop any mdraid that auto-assembled on the target (dmsetup won't release md).
+[ -x /dev/shm/kinstall/mdadm ] && /dev/shm/kinstall/mdadm --stop "${DISK}"* 2>/dev/null || true
+/dev/shm/kinstall/dmsetup remove_all 2>/dev/null || true
 echo "[\$(date)] Fixing GPT backup header..."
 /dev/shm/kinstall/sgdisk -e ${DISK} 2>&1 || true
 /dev/shm/kinstall/partprobe ${DISK} 2>&1 || true
@@ -105,6 +132,9 @@ fi
 # kernel's view of the disk; if that view is stale (table not re-read after dd) it
 # writes an all-zeros GUID and the firmware greys out the entry. Verify partition 1
 # has a readable PARTUUID first; retry settle/partprobe a few times if not.
+# Resume udev (paused during the table surgery above) so it repopulates
+# /dev/disk/by-partuuid before efibootmgr reads the ESP GUID.
+[ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm control --start-exec-queue 2>/dev/null || true
 /dev/shm/kinstall/partprobe ${DISK} 2>&1 || true
 [ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm settle 2>/dev/null || true
 ESP_UUID=""
