@@ -73,11 +73,13 @@ echo "[\$(date)] Writing to ${DISK}..."
 # can't cover this — these activations happen AFTER dd re-creates the signatures.
 # (Note: this is the EBUSY case, distinct from the e2fsprogs *hang* the timeouts
 # below guard — on a held-open partition resize2fs returns busy immediately, so
-# the timeout never fires.) Release the holders here and pause udev so it doesn't
-# re-open the partitions between sgdisk and resize2fs.
+# the timeout never fires.) Release the holders here. NOTE: do NOT stop the udev
+# exec-queue around this — with the queue paused, the partprobe / udevadm-settle
+# calls below block until they time out ("Timed out for waiting the udev queue
+# being empty"), adding minutes per run. The unmount/swapoff/vgchange/mdadm/
+# dmsetup releases below are what free the disk; that's sufficient on its own.
 echo "[\$(date)] Quiescing freshly-written partitions on ${DISK}..."
 [ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm settle 2>/dev/null || true
-[ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm control --stop-exec-queue 2>/dev/null || true
 # Unmount anything auto-mounted from the target (deepest mountpoints first).
 for mp in \$(/dev/shm/kinstall/awk -v d="${DISK}" '\$1 ~ ("^" d) {print \$2}' /proc/mounts | sort -r); do
     [ -x /dev/shm/kinstall/umount ] && /dev/shm/kinstall/umount -fl "\$mp" 2>/dev/null || true
@@ -132,9 +134,6 @@ fi
 # kernel's view of the disk; if that view is stale (table not re-read after dd) it
 # writes an all-zeros GUID and the firmware greys out the entry. Verify partition 1
 # has a readable PARTUUID first; retry settle/partprobe a few times if not.
-# Resume udev (paused during the table surgery above) so it repopulates
-# /dev/disk/by-partuuid before efibootmgr reads the ESP GUID.
-[ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm control --start-exec-queue 2>/dev/null || true
 /dev/shm/kinstall/partprobe ${DISK} 2>&1 || true
 [ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm settle 2>/dev/null || true
 ESP_UUID=""
@@ -172,6 +171,14 @@ if [ -d /sys/firmware/efi/efivars ] && [ -x /dev/shm/kinstall/efibootmgr ]; then
         CURORDER=\$(/dev/shm/kinstall/efibootmgr 2>/dev/null | awk '/^BootOrder:/ {print \$2}')
         NEWORDER=\$(echo "\$CURORDER" | tr ',' '\n' | grep -v "^\${NEWID}\$" | paste -sd, -)
         /dev/shm/kinstall/efibootmgr -o "\${NEWID},\${NEWORDER}" 2>&1 || true
+        # Force the VERY NEXT boot to Kairos, overriding BootOrder for one boot.
+        # On multi-disk targets the provisioning system leaves a separate, still-
+        # bootable installer-env root on another disk (the dd only overwrote THIS
+        # disk), and often leaves the node network/PXE-first — so without BootNext
+        # the firmware re-enters the installer and boots that other root instead of
+        # the Kairos disk we just wrote. BootNext gets Kairos up once; its cloud-
+        # config then flips the node to NOSYNC so it stops re-provisioning.
+        /dev/shm/kinstall/efibootmgr -n "\$NEWID" 2>&1 || true
     fi
 else
     echo "[\$(date)] efivars or efibootmgr unavailable; skipping EFI entry creation"
