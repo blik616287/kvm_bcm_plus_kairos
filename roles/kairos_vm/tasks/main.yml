@@ -86,6 +86,7 @@
       -chardev socket,id=ser0,host=localhost,port={{ kairos_vm_serial_port }},server=on,wait=off,telnet=on,logfile="{{ kairos_serial_log }}" \
       -serial chardev:ser0 \
       -pidfile "{{ kairos_pid_file }}" \
+      -no-reboot \
       -daemonize \
       -boot order=cn
 

@@ -1,7 +1,9 @@
 #!/bin/bash
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 set -euo pipefail
 LOG="/dev/shm/kairos-install.log"
-exec > >(tee -a "$LOG") 2>&1
+# Mirror all output to ttyS0 so it appears in the QEMU serial log file.
+exec > >(tee -a "$LOG" /dev/ttyS0) 2>&1
 HEAD_IP="{{ bcm_internal_ip }}"
 RAW_URL="http://${HEAD_IP}:8888/{{ kairos_profile }}/disk.raw.lz4"
 {% if kairos_target_disk is defined and kairos_target_disk | length > 0 %}
@@ -20,8 +22,11 @@ done
 echo "[$(date)] Staging binaries to RAM..."
 RAMDIR="/dev/shm/kinstall"
 mkdir -p "$RAMDIR/lib"
+# Search each standard directory so we don't depend on PATH being fully set during staging.
 for bin in bash curl lz4 dd sync sleep timeout sgdisk wipefs dmsetup efibootmgr partprobe blkid awk e2fsck resize2fs partx vgchange pvscan udevadm umount swapoff mdadm findmnt; do
-    BIN_PATH=$(which "$bin" 2>/dev/null) && cp "$BIN_PATH" "$RAMDIR/" || true
+    for dir in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+        [ -x "$dir/$bin" ] && cp "$dir/$bin" "$RAMDIR/" 2>/dev/null && echo "staged $bin from $dir" && break || true
+    done
 done
 for b in "$RAMDIR"/*; do
     [ -f "$b" ] && [ -x "$b" ] || continue
@@ -36,13 +41,16 @@ echo 1 > /proc/sys/kernel/sysrq
 cat > "$RAMDIR/run-dd.sh" << DDEOF
 #!/dev/shm/kinstall/bash
 export LD_LIBRARY_PATH="/dev/shm/kinstall/lib"
+# PATH: staged binaries first (from RAM), then NFS system paths as fallback.
+# The NFS rootfs is always accessible (dd only overwrites the target disk, not NFS).
+export PATH="/dev/shm/kinstall:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Wipe signatures on sibling disks so stale LVM/DRBD/filesystems don't auto-activate on first Kairos boot.
 if [ -n "${WIPE_DISKS}" ]; then
     for d in ${WIPE_DISKS}; do
         if [ -b "/dev/\$d" ]; then
             echo "[\$(date)] wipefs /dev/\$d"
-            /dev/shm/kinstall/dmsetup remove_all 2>/dev/null || true
-            /dev/shm/kinstall/wipefs -a -f "/dev/\$d" 2>&1 || true
+            dmsetup remove_all 2>/dev/null || true
+            wipefs -a -f "/dev/\$d" 2>&1 || true
         fi
     done
 fi
@@ -53,13 +61,15 @@ fi
 # and the firmware greys out the boot entry. wipefs only ran on sibling disks
 # (WIPE_DISKS) above — the target itself was never released. Do it here.
 echo "[\$(date)] Quiescing target ${DISK} (deactivate LVM / dm, wipe signatures)..."
-[ -x /dev/shm/kinstall/vgchange ] && /dev/shm/kinstall/vgchange -an 2>/dev/null || true
-/dev/shm/kinstall/dmsetup remove_all 2>/dev/null || true
-/dev/shm/kinstall/wipefs -a -f "${DISK}" 2>&1 || true
-[ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm settle 2>/dev/null || true
+command -v vgchange >/dev/null 2>&1 && vgchange -an 2>/dev/null || true
+dmsetup remove_all 2>/dev/null || true
+wipefs -a -f "${DISK}" 2>&1 || true
+command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=30 2>/dev/null || true
 echo "[\$(date)] Writing to ${DISK}..."
-/dev/shm/kinstall/curl --fail -s "${RAW_URL}" | /dev/shm/kinstall/lz4 -d - - | /dev/shm/kinstall/dd of="${DISK}" bs=4M oflag=direct 2>&1
-/dev/shm/kinstall/sync
+curl --fail -s "${RAW_URL}" | lz4 -d - - | dd of="${DISK}" bs=4M oflag=direct 2>&1
+# sync is redundant after oflag=direct (data bypasses page cache); skip it to
+# avoid blocking while the kernel probes newly-written XFS partitions.
+timeout 10 sync 2>/dev/null || true
 # Quiesce the FRESHLY-WRITTEN partitions before touching the table. Full-systemd
 # node-installers (e.g. DGX SuperPod under BCM) auto-activate the cOS partitions
 # the moment dd lays down their signatures — auto-mount by COS_* label,
@@ -73,25 +83,23 @@ echo "[\$(date)] Writing to ${DISK}..."
 # can't cover this — these activations happen AFTER dd re-creates the signatures.
 # (Note: this is the EBUSY case, distinct from the e2fsprogs *hang* the timeouts
 # below guard — on a held-open partition resize2fs returns busy immediately, so
-# the timeout never fires.) Release the holders here. NOTE: do NOT stop the udev
-# exec-queue around this — with the queue paused, the partprobe / udevadm-settle
-# calls below block until they time out ("Timed out for waiting the udev queue
-# being empty"), adding minutes per run. The unmount/swapoff/vgchange/mdadm/
-# dmsetup releases below are what free the disk; that's sufficient on its own.
+# the timeout never fires.) Release the holders here. udevadm settle is bounded by
+# --timeout, so it is safe even with the udev exec-queue paused (it just returns
+# after the timeout); it lets any in-flight device nodes finish appearing first.
 echo "[\$(date)] Quiescing freshly-written partitions on ${DISK}..."
-[ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm settle 2>/dev/null || true
+command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=30 2>/dev/null || true
 # Unmount anything auto-mounted from the target (deepest mountpoints first).
-for mp in \$(/dev/shm/kinstall/awk -v d="${DISK}" '\$1 ~ ("^" d) {print \$2}' /proc/mounts | sort -r); do
-    [ -x /dev/shm/kinstall/umount ] && /dev/shm/kinstall/umount -fl "\$mp" 2>/dev/null || true
+for mp in \$(awk -v d="${DISK}" '\$1 ~ ("^" d) {print \$2}' /proc/mounts 2>/dev/null | sort -r); do
+    command -v umount >/dev/null 2>&1 && umount -fl "\$mp" 2>/dev/null || true
 done
-[ -x /dev/shm/kinstall/swapoff ] && /dev/shm/kinstall/swapoff "${DISK}"* 2>/dev/null || true
-[ -x /dev/shm/kinstall/vgchange ] && /dev/shm/kinstall/vgchange -an 2>/dev/null || true
+command -v swapoff >/dev/null 2>&1 && swapoff "${DISK}"* 2>/dev/null || true
+command -v vgchange >/dev/null 2>&1 && vgchange -an 2>/dev/null || true
 # Stop any mdraid that auto-assembled on the target (dmsetup won't release md).
-[ -x /dev/shm/kinstall/mdadm ] && /dev/shm/kinstall/mdadm --stop "${DISK}"* 2>/dev/null || true
-/dev/shm/kinstall/dmsetup remove_all 2>/dev/null || true
+command -v mdadm >/dev/null 2>&1 && mdadm --stop "${DISK}"* 2>/dev/null || true
+dmsetup remove_all 2>/dev/null || true
 echo "[\$(date)] Fixing GPT backup header..."
-/dev/shm/kinstall/sgdisk -e ${DISK} 2>&1 || true
-/dev/shm/kinstall/partprobe ${DISK} 2>&1 || true
+sgdisk -e ${DISK} 2>&1 || true
+timeout 30 partprobe ${DISK} 2>&1 || true
 # Partition-name separator: nvme/mmcblk/loop devices name partitions <disk>p<N>
 # (nvme0n1p1); sd/vd/hd do not (sda1). The grow + PARTUUID checks below must use
 # the right one or they silently target a non-existent device.
@@ -107,24 +115,24 @@ esac
 # (it asks for "need NNN MiB, available NNN MiB" with the numbers swapped) and
 # leaves COS_PERSISTENT at the original size. Doing it here in the installer
 # environment — partition is offline, kernel re-reads the table cleanly.
-if [ -x /dev/shm/kinstall/sgdisk ] && [ -x /dev/shm/kinstall/resize2fs ]; then
+if command -v sgdisk >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1; then
     echo "[\$(date)] Growing last partition + ext4 to fill disk..."
-    LAST_NUM=\$(/dev/shm/kinstall/sgdisk -p ${DISK} 2>/dev/null | /dev/shm/kinstall/awk '/^[ ]+[0-9]+/{n=\$1} END{print n}')
-    LAST_INFO=\$(/dev/shm/kinstall/sgdisk -i \$LAST_NUM ${DISK} 2>/dev/null)
-    LAST_START=\$(echo "\$LAST_INFO" | /dev/shm/kinstall/awk '/First sector:/{print \$3}')
-    LAST_TYPE=\$(echo "\$LAST_INFO" | /dev/shm/kinstall/awk '/Partition GUID code:/{print \$4}')
+    LAST_NUM=\$(sgdisk -p ${DISK} 2>/dev/null | awk '/^[ ]+[0-9]+/{n=\$1} END{print n}')
+    LAST_INFO=\$(sgdisk -i \$LAST_NUM ${DISK} 2>/dev/null)
+    LAST_START=\$(echo "\$LAST_INFO" | awk '/First sector:/{print \$3}')
+    LAST_TYPE=\$(echo "\$LAST_INFO" | awk '/Partition GUID code:/{print \$4}')
     LAST_LABEL=\$(echo "\$LAST_INFO" | grep "name:" | sed -e "s/.*name: //; s/^.\\\\(.*\\\\).\$/\\\\1/")
     if [ -n "\$LAST_NUM" ] && [ -n "\$LAST_START" ]; then
-        /dev/shm/kinstall/sgdisk -d \$LAST_NUM -n \$LAST_NUM:\$LAST_START:0 -t \$LAST_NUM:\$LAST_TYPE -c \$LAST_NUM:"\$LAST_LABEL" ${DISK} 2>&1 || true
-        /dev/shm/kinstall/partprobe ${DISK} 2>&1 || true
-        /dev/shm/kinstall/partx -u --nr \$LAST_NUM ${DISK} 2>&1 || true
+        sgdisk -d \$LAST_NUM -n \$LAST_NUM:\$LAST_START:0 -t \$LAST_NUM:\$LAST_TYPE -c \$LAST_NUM:"\$LAST_LABEL" ${DISK} 2>&1 || true
+        timeout 30 partprobe ${DISK} 2>&1 || true
+        timeout 30 partx -u --nr \$LAST_NUM ${DISK} 2>&1 || true
         # ext2/ext3/ext4 — Kairos cOS uses ext2 for active.img but COS_PERSISTENT is ext4.
         # Bound both with timeout: the installer image ships OLDER e2fsprogs that can
         # HANG on newer (24.04+/26.04) ext4 filesystems, and a hang here never reaches
         # the sysrq poweroff below (the install VM then never powers off). The grow is
         # a no-op when the target disk == image size, so timing these out is safe.
-        /dev/shm/kinstall/timeout 120 /dev/shm/kinstall/e2fsck -fy ${DISK}\${PSEP}\$LAST_NUM 2>&1 | tail -3 || true
-        /dev/shm/kinstall/timeout 120 /dev/shm/kinstall/resize2fs ${DISK}\${PSEP}\$LAST_NUM 2>&1 | tail -3 || true
+        timeout 120 e2fsck -fy ${DISK}\${PSEP}\$LAST_NUM 2>&1 | tail -3 || true
+        timeout 120 resize2fs ${DISK}\${PSEP}\$LAST_NUM 2>&1 | tail -3 || true
     else
         echo "[\$(date)] WARN: couldn't detect last partition, skipping grow"
     fi
@@ -134,15 +142,15 @@ fi
 # kernel's view of the disk; if that view is stale (table not re-read after dd) it
 # writes an all-zeros GUID and the firmware greys out the entry. Verify partition 1
 # has a readable PARTUUID first; retry settle/partprobe a few times if not.
-/dev/shm/kinstall/partprobe ${DISK} 2>&1 || true
-[ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm settle 2>/dev/null || true
+timeout 30 partprobe ${DISK} 2>&1 || true
+command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=30 2>/dev/null || true
 ESP_UUID=""
 for _try in 1 2 3 4 5; do
-    ESP_UUID=\$(/dev/shm/kinstall/blkid -s PARTUUID -o value "${DISK}\${PSEP}1" 2>/dev/null)
+    ESP_UUID=\$(blkid -s PARTUUID -o value "${DISK}\${PSEP}1" 2>/dev/null)
     [ -n "\$ESP_UUID" ] && break
-    /dev/shm/kinstall/partprobe ${DISK} 2>/dev/null || true
-    [ -x /dev/shm/kinstall/udevadm ] && /dev/shm/kinstall/udevadm settle 2>/dev/null || true
-    /dev/shm/kinstall/sleep 2
+    timeout 30 partprobe ${DISK} 2>/dev/null || true
+    command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=30 2>/dev/null || true
+    sleep 2
 done
 if [ -z "\$ESP_UUID" ]; then
     echo "[\$(date)] WARN: partition 1 PARTUUID still unreadable after dd — the efibootmgr entry may get a zero GUID; the ESP fallback loader (EFI/BOOT/bootx64.efi) is the safety net."
@@ -152,13 +160,13 @@ fi
 # Create a UEFI boot entry pointing at our new ESP (partition 1 of the target disk).
 # Without this, physical UEFI firmwares keep booting stale BootXXXX entries tied to the
 # previous install's GPT UUIDs and never discover our freshly-dd'd Kairos bootloader.
-if [ -d /sys/firmware/efi/efivars ] && [ -x /dev/shm/kinstall/efibootmgr ]; then
+if [ -d /sys/firmware/efi/efivars ] && command -v efibootmgr >/dev/null 2>&1; then
     echo "[\$(date)] Creating UEFI boot entry for Kairos..."
     # Remove any existing 'Kairos' entries so we don't stack duplicates on re-installs.
-    for n in \$(/dev/shm/kinstall/efibootmgr 2>/dev/null | grep 'Kairos\$' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//'); do
-        /dev/shm/kinstall/efibootmgr -b "\$n" -B 2>/dev/null || true
+    for n in \$(efibootmgr 2>/dev/null | grep 'Kairos\$' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//'); do
+        efibootmgr -b "\$n" -B 2>/dev/null || true
     done
-    EFI_OUT=\$(/dev/shm/kinstall/efibootmgr --create --disk ${DISK} --part 1 --label Kairos --loader '\EFI\BOOT\bootx64.efi' 2>&1); EFI_RC=\$?
+    EFI_OUT=\$(efibootmgr --create --disk ${DISK} --part 1 --label Kairos --loader '\EFI\BOOT\bootx64.efi' 2>&1); EFI_RC=\$?
     echo "\$EFI_OUT"
     if [ \$EFI_RC -ne 0 ]; then
         echo "[\$(date)] WARN: efibootmgr --create exited \$EFI_RC — NVRAM boot entry not created. The ESP fallback loader (EFI/BOOT/bootx64.efi) should still boot if firmware honors the removable path."
@@ -166,11 +174,11 @@ if [ -d /sys/firmware/efi/efivars ] && [ -x /dev/shm/kinstall/efibootmgr ]; then
         echo "[\$(date)] WARN: efibootmgr wrote an all-zeros GPT GUID — firmware will likely grey out this entry. Check that the target disk was released (LVM/dm) and the table re-read."
     fi
     # Put the new entry at the front of BootOrder.
-    NEWID=\$(/dev/shm/kinstall/efibootmgr 2>/dev/null | grep 'Kairos\$' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//' | head -1)
+    NEWID=\$(efibootmgr 2>/dev/null | grep 'Kairos\$' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//' | head -1)
     if [ -n "\$NEWID" ]; then
-        CURORDER=\$(/dev/shm/kinstall/efibootmgr 2>/dev/null | awk '/^BootOrder:/ {print \$2}')
+        CURORDER=\$(efibootmgr 2>/dev/null | awk '/^BootOrder:/ {print \$2}')
         NEWORDER=\$(echo "\$CURORDER" | tr ',' '\n' | grep -v "^\${NEWID}\$" | paste -sd, -)
-        /dev/shm/kinstall/efibootmgr -o "\${NEWID},\${NEWORDER}" 2>&1 || true
+        efibootmgr -o "\${NEWID},\${NEWORDER}" 2>&1 || true
         # Force the VERY NEXT boot to Kairos, overriding BootOrder for one boot.
         # On multi-disk targets the provisioning system leaves a separate, still-
         # bootable installer-env root on another disk (the dd only overwrote THIS
@@ -178,19 +186,35 @@ if [ -d /sys/firmware/efi/efivars ] && [ -x /dev/shm/kinstall/efibootmgr ]; then
         # the firmware re-enters the installer and boots that other root instead of
         # the Kairos disk we just wrote. BootNext gets Kairos up once; its cloud-
         # config then flips the node to NOSYNC so it stops re-provisioning.
-        /dev/shm/kinstall/efibootmgr -n "\$NEWID" 2>&1 || true
+        efibootmgr -n "\$NEWID" 2>&1 || true
     fi
 else
     echo "[\$(date)] efivars or efibootmgr unavailable; skipping EFI entry creation"
 fi
 echo "[\$(date)] Dropping page cache to prevent stale writeback..."
 echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-/dev/shm/kinstall/sync
+sync 2>/dev/null || true
 echo "[\$(date)] Write complete. Powering off..."
-/dev/shm/kinstall/sleep 2
-echo o > /proc/sysrq-trigger
+sleep 2 2>/dev/null || true
+# Try multiple poweroff methods in order of reliability.
+echo o > /proc/sysrq-trigger 2>/dev/null || true
+sleep 1 2>/dev/null || true
+# Fallback: systemctl works even if /proc is remounted, communicates via D-Bus to PID 1.
+systemctl poweroff --no-block 2>/dev/null || true
+sleep 3 2>/dev/null || true
+kill -SIGPWR 1 2>/dev/null || true
+sleep 2 2>/dev/null || true
+kill -9 1 2>/dev/null || true
 DDEOF
 chmod +x "$RAMDIR/run-dd.sh"
+# Belt-and-suspenders: strip any /dev/shm/kinstall/ absolute paths from command lines
+# so they use PATH (NFS system paths survive root remounts). Skip 'export' lines so
+# LD_LIBRARY_PATH and PATH keep their /dev/shm/kinstall references intact.
+sed -i '/^export /!s|/dev/shm/kinstall/||g' "$RAMDIR/run-dd.sh"
 echo "[$(date)] Starting dd..."
+# Stop udev BEFORE dd so new partition events are queued but not processed during install.
+# This prevents snapd/gpt-auto-generator from automounting Kairos partitions mid-install
+# and overlaying /dev/shm (breaking staged binaries) or /proc (breaking sysrq poweroff).
+udevadm control --stop-exec-queue 2>/dev/null || true
 export LD_LIBRARY_PATH="$RAMDIR/lib"
 exec "$RAMDIR/bash" "$RAMDIR/run-dd.sh"

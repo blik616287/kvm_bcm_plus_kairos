@@ -275,6 +275,7 @@ ExecStart=/usr/local/sbin/install-kairos.sh
 TimeoutStartSec=1800
 StandardOutput=journal+console
 StandardError=journal+console
+MountFlags=private
 [Install]
 WantedBy=multi-user.target
 SERVICE
@@ -282,6 +283,15 @@ chroot "\${IMAGE_ROOT}" systemctl enable kairos-install.service 2>&1 || {
     mkdir -p "\${IMAGE_ROOT}/etc/systemd/system/multi-user.target.wants"
     ln -sf /etc/systemd/system/kairos-install.service "\${IMAGE_ROOT}/etc/systemd/system/multi-user.target.wants/kairos-install.service"
 }
+# Clear fstab — installer runs from NFS, local disk mounts via UUID would be
+# automounted after dd and replace /dev/shm and /proc inside the service.
+echo '# Installer runs from NFS — no local disk mounts needed.' > "\${IMAGE_ROOT}/etc/fstab"
+# Mask systemd-gpt-auto-generator — prevents GPT partition type automounts.
+ln -sf /dev/null "\${IMAGE_ROOT}/lib/systemd/system-generators/systemd-gpt-auto-generator" 2>/dev/null || true
+# Copy efibootmgr from BCM host into installer image if missing.
+if [ ! -x "\${IMAGE_ROOT}/usr/sbin/efibootmgr" ]; then
+    cp \$(which efibootmgr 2>/dev/null || echo /usr/bin/efibootmgr) "\${IMAGE_ROOT}/usr/sbin/efibootmgr" 2>/dev/null || true
+fi
 echo "[OK] Installer script and service installed in image"
 EOF
 
