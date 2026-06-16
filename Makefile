@@ -9,7 +9,7 @@ LOGS_DIR := $(E2E_DIR)/logs
 
 define run_playbook
 	@mkdir -p $(LOGS_DIR)
-	ansible-playbook playbooks/$(1).yml $(ANSIBLE_ARGS) 2>&1 | tee $(LOGS_DIR)/$(1).log
+	set -o pipefail; ansible-playbook playbooks/$(1).yml $(ANSIBLE_ARGS) 2>&1 | tee $(LOGS_DIR)/$(1).log
 endef
 
 .PHONY: help

@@ -3,7 +3,16 @@
 
 - name: Detect package manager
   ansible.builtin.set_fact:
-    pkg_mgr: "{{ 'apt' if ansible_os_family == 'Debian' else 'dnf' }}"
+    pkg_mgr: "{{ 'apt' if ansible_facts['os_family'] == 'Debian' else 'dnf' }}"
+
+# Docker is handled separately: a pre-existing Docker CE install (containerd.io
+# from Docker's official repo) conflicts with the distro docker.io / docker
+# package, so only install the distro package when no docker is present.
+- name: Check for an existing docker binary
+  ansible.builtin.command: docker --version
+  register: docker_check
+  changed_when: false
+  failed_when: false
 
 - name: Install dependencies (Debian/Ubuntu)
   when: pkg_mgr == 'apt'
@@ -12,7 +21,6 @@
       - qemu-system-x86
       - qemu-utils
       - ovmf
-      - docker.io
       - sshpass
       - xorriso
       - p7zip-full
@@ -31,6 +39,16 @@
     update_cache: true
   become: true
 
+- name: Install docker.io (Debian/Ubuntu, only if docker is not already present)
+  when:
+    - pkg_mgr == 'apt'
+    - docker_check.rc != 0
+  ansible.builtin.apt:
+    name: docker.io
+    state: present
+    update_cache: true
+  become: true
+
 - name: Install dependencies (Fedora/RHEL)
   when: pkg_mgr == 'dnf'
   ansible.builtin.dnf:
@@ -38,7 +56,6 @@
       - qemu-system-x86-core
       - qemu-img
       - edk2-ovmf
-      - docker
       - sshpass
       - xorriso
       - p7zip
@@ -53,5 +70,14 @@
       - gdisk
       - e2fsprogs
       - socat
+    state: present
+  become: true
+
+- name: Install docker (Fedora/RHEL, only if docker is not already present)
+  when:
+    - pkg_mgr == 'dnf'
+    - docker_check.rc != 0
+  ansible.builtin.dnf:
+    name: docker
     state: present
   become: true
