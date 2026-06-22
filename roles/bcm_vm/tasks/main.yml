@@ -6,6 +6,9 @@
 - name: Set BCM connection variables
   ansible.builtin.set_fact:
     bcm_disk: "{{ build_dir }}/bcm-headnode.qcow2"
+    # Per-phase serial logs: the install log (Phase 1) must NOT be clobbered by
+    # the disk-boot log (Phase 2), or the full autoinstall trace is lost.
+    bcm_install_serial_log: "{{ e2e_dir }}/logs/bcm-install-serial.log"
     bcm_serial_log: "{{ e2e_dir }}/logs/bcm-serial.log"
     bcm_pid_file: "{{ build_dir }}/.bcm-qemu.pid"
     ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
@@ -73,7 +76,7 @@
 
     - name: Launch BCM installer (direct kernel boot)
       ansible.builtin.shell: |
-        > "{{ bcm_serial_log }}"
+        > "{{ bcm_install_serial_log }}"
         qemu-system-x86_64 \
           {{ kvm_flag.stdout }} \
           -m {{ bcm_vm_ram }} \
@@ -87,12 +90,13 @@
           -kernel "{{ build_dir }}/.bcm-kernel" \
           -initrd "{{ build_dir }}/.bcm-rootfs-auto.cgz" \
           -append "dvdinstall nokeymap root=/dev/ram0 rw ramdisk_size=1000000 vga=normal bcmblacklist=nouveau systemd.unit=multi-user.target net.ifnames=0 biosdevname=0 console=ttyS0,115200 console=tty0" \
+          -serial file:"{{ bcm_install_serial_log }}" \
           -netdev socket,id=intnet,listen=:31337 \
           -device virtio-net-pci,netdev=intnet,mac=BC:24:11:7F:33:7C \
           -netdev user,id=extnet,hostfwd=tcp::{{ bcm_ssh_port }}-:22,hostfwd=tcp::{{ bcm_https_port }}-:443 \
           -device virtio-net-pci,netdev=extnet,mac=BC:24:11:ED:21:50 \
           -vga virtio \
-          -serial file:"{{ bcm_serial_log }}" \
+          -no-reboot \
           -pidfile "{{ bcm_pid_file }}" \
           -daemonize \
           -boot d
@@ -211,4 +215,5 @@
       - "BCM head node running"
       - "SSH: ssh -p {{ bcm_ssh_port }} root@localhost (password: {{ bcm_password }})"
       - "Internal IP: {{ bcm_internal_ip }} (socket network)"
-      - "Serial log: {{ bcm_serial_log }}"
+      - "Install serial log: {{ bcm_install_serial_log }}"
+      - "Boot serial log: {{ bcm_serial_log }}"

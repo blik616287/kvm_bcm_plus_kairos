@@ -124,8 +124,31 @@ echo "=========================================="
 echo " Running cm-master-install"
 echo "=========================================="
 cd /cm
-yes | perl ./cm-master-install --config /cm/build-config.xml --mountpath /mnt/cdrom --password "$PASS" 2>&1 | tee -a "$LOG"
+# --noreboot: cm-master-install otherwise reboots the VM at the end, which (a)
+# re-enters the installer under `-boot d`/`-kernel` = an infinite install loop,
+# and (b) races/kills the post-install GRUB patch below, leaving the installed
+# system with predictable NIC names (ensX) instead of eth0 -> CMDaemon can't
+# find its management interface -> "initializing management daemon failed".
+# With --noreboot, control returns here so we patch GRUB and power off cleanly.
+yes | perl ./cm-master-install --config /cm/build-config.xml --mountpath /mnt/cdrom --password "$PASS" --noreboot 2>&1 | tee -a "$LOG"
 RETVAL=${PIPESTATUS[1]}
+
+# cm-master-install only prints a [N/14] progress summary to the console; the
+# verbose per-step output (every *.cgi helper, including cmdaemoninit.cgi =
+# step 14 "Initializing management daemon") is appended to /var/log/install-log.
+# Dump it to the console — captured into the persistent install serial log — so
+# every step's detail survives, even when the run fails before the box is
+# reachable over SSH. Runs on success AND failure.
+echo "=========================================="
+echo " cm-master-install detailed log: /var/log/install-log"
+echo "=========================================="
+cat /var/log/install-log 2>/dev/null || echo "(install-log missing)"
+echo "=========================================="
+echo " cm-master-install status: /var/log/status.json"
+echo "=========================================="
+cat /var/log/status.json 2>/dev/null; echo
+echo "========== end cm-master-install detailed log =========="
+
 if [ $RETVAL -ne 0 ]; then
     echo " INSTALLATION FAILED (exit code: $RETVAL)"; exit $RETVAL
 fi

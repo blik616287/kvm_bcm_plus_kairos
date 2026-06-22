@@ -152,36 +152,71 @@
 
 # ---- Reboot from disk ----
 
+# Reusable disk-boot command. The FIRST post-install disk boot lands on the
+# Palette `stylus.registration` GRUB entry; in an isolated/local-KVM network it
+# cannot reach Palette, so it parks in registration mode and never brings up the
+# kairos user or sshd. kairos-agent already set the default GRUB entry to the
+# active "Palette eXtended Kubernetes Edge" image during install, so the NEXT
+# boot comes up healthy. We therefore reset the VM once if the first boot stalls.
+- name: Compose Kairos disk-boot command
+  when: kairos_vm_wait | default(true) | bool
+  ansible.builtin.set_fact:
+    kairos_disk_boot_cmd: |
+      > "{{ kairos_serial_log }}"
+      OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+      [ -f "$OVMF_CODE" ] || OVMF_CODE=/usr/share/qemu/OVMF.fd
+      qemu-system-x86_64 \
+        {{ kvm_flag.stdout }} \
+        -m {{ kairos_vm_ram }} \
+        -smp {{ kairos_vm_cpus }} \
+        -cpu host \
+        -machine q35 \
+        -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+        -drive if=pflash,format=raw,file="{{ kairos_ovmf_vars }}" \
+        -name "{{ kairos_vm_name }}" \
+        -display {{ qemu_display_type.stdout }} \
+        -drive file="{{ kairos_disk }}",format=qcow2,if=virtio \
+        -netdev socket,id=intnet,connect=:31337 \
+        -device virtio-net-pci,netdev=intnet,mac={{ kairos_vm_mac }} \
+        -chardev socket,id=ser0,host=localhost,port={{ kairos_vm_serial_port }},server=on,wait=off,telnet=on,logfile="{{ kairos_serial_log }}" \
+        -serial chardev:ser0 \
+        -pidfile "{{ kairos_pid_file }}" \
+        -daemonize \
+        -boot c
+
 - name: Start Kairos VM from disk (OVMF/UEFI, reuses vars with Kairos boot entry)
   when: kairos_vm_wait | default(true) | bool
-  ansible.builtin.shell: |
-    > "{{ kairos_serial_log }}"
-    OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
-    [ -f "$OVMF_CODE" ] || OVMF_CODE=/usr/share/qemu/OVMF.fd
-    qemu-system-x86_64 \
-      {{ kvm_flag.stdout }} \
-      -m {{ kairos_vm_ram }} \
-      -smp {{ kairos_vm_cpus }} \
-      -cpu host \
-      -machine q35 \
-      -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
-      -drive if=pflash,format=raw,file="{{ kairos_ovmf_vars }}" \
-      -name "{{ kairos_vm_name }}" \
-      -display {{ qemu_display_type.stdout }} \
-      -drive file="{{ kairos_disk }}",format=qcow2,if=virtio \
-      -netdev socket,id=intnet,connect=:31337 \
-      -device virtio-net-pci,netdev=intnet,mac={{ kairos_vm_mac }} \
-      -chardev socket,id=ser0,host=localhost,port={{ kairos_vm_serial_port }},server=on,wait=off,telnet=on,logfile="{{ kairos_serial_log }}" \
-      -serial chardev:ser0 \
-      -pidfile "{{ kairos_pid_file }}" \
-      -daemonize \
-      -boot c
+  ansible.builtin.shell: "{{ kairos_disk_boot_cmd }}"
 
-- name: Wait for Kairos to fully boot (up to 10 min)
+- name: Wait for Kairos to fully boot (reset past stylus.registration first-boot if needed)
   when: kairos_vm_wait | default(true) | bool
-  ansible.builtin.shell: "{{ build_dir }}/wait-kairos-boot.sh"
-  register: kairos_boot_result
-  timeout: 600
+  block:
+    - name: Wait for Kairos to fully boot (up to 10 min)
+      ansible.builtin.shell: "{{ build_dir }}/wait-kairos-boot.sh"
+      register: kairos_boot_result
+      timeout: 600
+  rescue:
+    - name: First disk boot stalled — reset VM into the active Kairos entry
+      ansible.builtin.debug:
+        msg: >-
+          First disk boot did not become reachable (likely parked in the
+          stylus.registration first-boot). Resetting the VM; the default GRUB
+          entry is the active image, so this boot should come up healthy.
+
+    - name: Kill the stalled Kairos VM
+      ansible.builtin.shell: |
+        PID=$(cat "{{ kairos_pid_file }}" 2>/dev/null) && kill "$PID" 2>/dev/null || true
+        pkill -f "qemu-system.*{{ kairos_vm_name }}" 2>/dev/null || true
+        sleep 2; true
+      changed_when: false
+
+    - name: Re-launch Kairos VM from disk (active entry)
+      ansible.builtin.shell: "{{ kairos_disk_boot_cmd }}"
+
+    - name: Wait for Kairos to fully boot after reset (up to 10 min)
+      ansible.builtin.shell: "{{ build_dir }}/wait-kairos-boot.sh"
+      register: kairos_boot_result
+      timeout: 600
 
 - name: Show Kairos boot result
   when: kairos_vm_wait | default(true) | bool
