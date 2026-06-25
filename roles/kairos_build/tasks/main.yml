@@ -276,10 +276,15 @@
             grep -qa 'CFGDONE' "$INSTALL_LOG" 2>/dev/null && break
           done
           sleep 2
-          # Run kairos-agent install (reads /oem/90_custom.yaml), then re-mount the
-          # OEM partition on the new raw disk and drop both 99_bcm.yaml and (if
-          # present) 99_userdata.yaml in.
-          printf 'kairos-agent --debug install 2>&1; mount /dev/vda2 /oem 2>/dev/null; cp /tmp/99_bcm.yaml /oem/99_bcm.yaml; { [ -f /tmp/99_userdata.yaml ] && cp /tmp/99_userdata.yaml /oem/99_userdata.yaml; true; }; poweroff\r\n'
+          # kairos-agent install with teardown + retry. After it partitions the
+          # blank disk, the live env races to auto-unlock+mount the new COS_*
+          # partitions (LUKS -> /dev/mapper/persistent|oem, mounted at /run/cos/*,
+          # /usr/local, /oem), and the deploy step then aborts with "target device
+          # /dev/vda has mounted partitions". teardown() unmounts those (lazy),
+          # closes the LUKS mappers, and wipes the table; we retry up to 3x since
+          # the race does not fire on every attempt. Then re-mount the new OEM
+          # partition and drop in 99_bcm.yaml and (if present) 99_userdata.yaml.
+          printf 'teardown() { sync; for mp in $(grep -E " (/run/cos|/oem|/usr/local)" /proc/mounts | cut -d" " -f2 | sort -r); do umount -l "$mp" 2>/dev/null || true; done; for d in persistent oem state recovery; do [ -e /dev/mapper/$d ] && cryptsetup close /dev/mapper/$d 2>/dev/null || true; done; wipefs -a /dev/vda 2>/dev/null || true; sgdisk --zap-all /dev/vda 2>/dev/null || true; partprobe /dev/vda 2>/dev/null || true; }; n=1; while true; do teardown; kairos-agent --debug install 2>&1 && break; n=$((n+1)); [ "$n" -gt 3 ] && break; echo INSTALL-RETRY-$n; sleep 5; done; mount /dev/vda2 /oem 2>/dev/null; cp /tmp/99_bcm.yaml /oem/99_bcm.yaml; { [ -f /tmp/99_userdata.yaml ] && cp /tmp/99_userdata.yaml /oem/99_userdata.yaml; true; }; poweroff\r\n'
           sleep 900
         ) | nc -U "$SOCK" > "$INSTALL_LOG" 2>&1 &
         SERIAL_PID=$!
@@ -288,6 +293,70 @@
         rm -f "$SOCK" {{ build_dir }}/.qemu-install.pid {{ build_dir }}/userdata.img
       async: 3600
       poll: 30
+
+    - name: Verify kairos-agent install produced a bootable disk
+      # The QEMU install step cannot surface kairos-agent's exit code — it only
+      # waits for the VM to power off, and a FAILED install powers off cleanly
+      # too. A failed install leaves an empty ESP and a near-empty active.img,
+      # which the firmware reports as "Failed to boot Kairos". Assert the install
+      # actually produced a bootloader + a real rootfs so the build fails here
+      # instead of silently shipping an unbootable image to deploy-dd.
+      ansible.builtin.shell: |
+        set -eu
+        LOOP=$(losetup -fP --show {{ raw_disk_path }})
+        cleanup() {
+          umount /tmp/kairos-verify-esp 2>/dev/null || true
+          umount /tmp/kairos-verify-state 2>/dev/null || true
+          losetup -d "$LOOP" 2>/dev/null || true
+          rmdir /tmp/kairos-verify-esp /tmp/kairos-verify-state 2>/dev/null || true
+        }
+        trap cleanup EXIT
+        mkdir -p /tmp/kairos-verify-esp /tmp/kairos-verify-state
+        errs=""
+
+        # 1) The ESP must carry a GRUB EFI binary. Its absence is exactly the
+        #    firmware "Failed to boot" case — nothing for the firmware to launch.
+        ESP=""
+        for p in "${LOOP}"p*; do
+          [ -b "$p" ] || continue
+          [ "$(blkid -o value -s TYPE "$p" 2>/dev/null)" = vfat ] && { ESP="$p"; break; }
+        done
+        if [ -z "$ESP" ]; then
+          errs="${errs} [no EFI System Partition (vfat) found]"
+        else
+          mount -o ro "$ESP" /tmp/kairos-verify-esp
+          find /tmp/kairos-verify-esp -iname '*.efi' | grep -q . \
+            || errs="${errs} [ESP has no .efi bootloader — GRUB not installed]"
+          umount /tmp/kairos-verify-esp
+        fi
+
+        # 2) active.img must hold a real rootfs. A failed deploy leaves it nearly
+        #    empty (~255MB observed) vs multi-GB for a good install; require >1GiB.
+        found_active=0
+        for p in "${LOOP}"p*; do
+          [ -b "$p" ] || continue
+          case "$(blkid -o value -s TYPE "$p" 2>/dev/null)" in ext2|ext3|ext4) ;; *) continue ;; esac
+          mount -o ro "$p" /tmp/kairos-verify-state 2>/dev/null || continue
+          if [ -f /tmp/kairos-verify-state/cOS/active.img ]; then
+            found_active=1
+            used_kb=$(du -sk /tmp/kairos-verify-state/cOS/active.img | awk '{print $1}')
+            [ "${used_kb:-0}" -ge 1048576 ] \
+              || errs="${errs} [cOS/active.img only ${used_kb}KB written — deploy incomplete]"
+            umount /tmp/kairos-verify-state
+            break
+          fi
+          umount /tmp/kairos-verify-state
+        done
+        [ "$found_active" = 1 ] || errs="${errs} [cOS/active.img not found on any partition]"
+
+        if [ -n "$errs" ]; then
+          echo "kairos-agent install verification FAILED:${errs}" >&2
+          echo "Inspect {{ e2e_dir }}/logs/qemu-install.log for the installer output." >&2
+          exit 1
+        fi
+        echo "install verification OK — ESP has a bootloader and active.img is populated"
+      become: true
+      changed_when: false
 
     - name: Fix ext4 features for GRUB compatibility (outer partitions)
       ansible.builtin.shell: |
