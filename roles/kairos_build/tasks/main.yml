@@ -349,8 +349,9 @@
         done
         [ "$found_active" = 1 ] || errs+=("[cOS/active.img not found on any partition]")
 
-        # Note: test emptiness via ${errs[*]} not ${#errs[@]} — the latter's `{#`
-        # is parsed by Ansible's Jinja as a comment-block start and breaks the task.
+        # Test emptiness via the array-expansion form below, NOT the array-length
+        # form: a literal brace-hash sequence reads as a Jinja comment-start here
+        # and breaks the task at parse time.
         if [ -n "${errs[*]:-}" ]; then
           echo "kairos-agent install verification FAILED: ${errs[*]}" >&2
           echo "Inspect {{ e2e_dir }}/logs/qemu-install.log for the installer output." >&2
