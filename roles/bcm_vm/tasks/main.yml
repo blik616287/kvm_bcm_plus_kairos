@@ -55,6 +55,17 @@
     path: "{{ bcm_disk }}"
   register: bcm_disk_stat
 
+- name: Detect KVM acceleration
+  ansible.builtin.shell: test -e /dev/kvm && echo "-enable-kvm" || echo ""
+  register: kvm_flag
+  changed_when: false
+
+- name: Render the shared BCM QEMU launcher (used by both install + boot phases)
+  ansible.builtin.template:
+    src: bcm-qemu.sh.j2
+    dest: "{{ build_dir }}/bcm-qemu.sh"
+    mode: "0755"
+
 # ---- Phase 1: Auto-install from ISO ----
 
 - name: Phase 1 — Install BCM from ISO
@@ -69,37 +80,8 @@
     - name: Create BCM disk image
       ansible.builtin.shell: qemu-img create -f qcow2 "{{ bcm_disk }}" {{ bcm_vm_disk_size }}
 
-    - name: Detect KVM acceleration
-      ansible.builtin.shell: test -e /dev/kvm && echo "-enable-kvm" || echo ""
-      register: kvm_flag
-      changed_when: false
-
-    - name: Launch BCM installer (direct kernel boot)
-      ansible.builtin.shell: |
-        > "{{ bcm_install_serial_log }}"
-        qemu-system-x86_64 \
-          {{ kvm_flag.stdout }} \
-          -m {{ bcm_vm_ram }} \
-          -smp {{ bcm_vm_cpus }} \
-          -cpu host \
-          -name "BCM-HeadNode-Install" \
-          -display {{ qemu_display_type.stdout }} \
-          -drive file="{{ bcm_disk }}",format=qcow2,if=virtio \
-          -drive format=raw,media=cdrom,readonly=on,file="{{ build_dir }}/bcm-autoinstall.iso" \
-          -drive file="{{ build_dir }}/.bcm-init.img",format=raw,if=virtio \
-          -kernel "{{ build_dir }}/.bcm-kernel" \
-          -initrd "{{ build_dir }}/.bcm-rootfs-auto.cgz" \
-          -append "dvdinstall nokeymap root=/dev/ram0 rw ramdisk_size=1000000 vga=normal bcmblacklist=nouveau systemd.unit=multi-user.target net.ifnames=0 biosdevname=0 console=ttyS0,115200 console=tty0" \
-          -serial file:"{{ bcm_install_serial_log }}" \
-          -netdev socket,id=intnet,listen=:31337 \
-          -device virtio-net-pci,netdev=intnet,mac=BC:24:11:7F:33:7C \
-          -netdev user,id=extnet,hostfwd=tcp::{{ bcm_ssh_port }}-:22,hostfwd=tcp::{{ bcm_https_port }}-:443 \
-          -device virtio-net-pci,netdev=extnet,mac=BC:24:11:ED:21:50 \
-          -vga virtio \
-          -no-reboot \
-          -pidfile "{{ bcm_pid_file }}" \
-          -daemonize \
-          -boot d
+    - name: Launch BCM installer (ISO direct-kernel autoinstall)
+      ansible.builtin.command: "{{ build_dir }}/bcm-qemu.sh install"
 
     - name: Wait for BCM install to complete (VM powers off)
       ansible.builtin.shell: |
@@ -129,31 +111,8 @@
   changed_when: false
   failed_when: false
 
-- name: Detect KVM acceleration
-  ansible.builtin.shell: test -e /dev/kvm && echo "-enable-kvm" || echo ""
-  register: kvm_flag
-  changed_when: false
-
-- name: Launch BCM from installed disk
-  ansible.builtin.shell: |
-    > "{{ bcm_serial_log }}"
-    qemu-system-x86_64 \
-      {{ kvm_flag.stdout }} \
-      -m {{ bcm_vm_ram }} \
-      -smp {{ bcm_vm_cpus }} \
-      -cpu host \
-      -name "BCM-HeadNode" \
-      -display {{ qemu_display_type.stdout }} \
-      -drive file="{{ bcm_disk }}",format=qcow2,if=virtio \
-      -netdev socket,id=intnet,listen=:31337 \
-      -device virtio-net-pci,netdev=intnet,mac=BC:24:11:7F:33:7C \
-      -netdev user,id=extnet,hostfwd=tcp::{{ bcm_ssh_port }}-:22,hostfwd=tcp::{{ bcm_https_port }}-:443 \
-      -device virtio-net-pci,netdev=extnet,mac=BC:24:11:ED:21:50 \
-      -vga virtio \
-      -serial file:"{{ bcm_serial_log }}" \
-      -pidfile "{{ bcm_pid_file }}" \
-      -daemonize \
-      -boot c
+- name: Launch BCM from the installed disk
+  ansible.builtin.command: "{{ build_dir }}/bcm-qemu.sh boot"
 
 - name: Wait for BCM SSH to be reachable
   ansible.builtin.shell: |
