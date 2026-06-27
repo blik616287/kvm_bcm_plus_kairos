@@ -312,7 +312,7 @@
         }
         trap cleanup EXIT
         mkdir -p /tmp/kairos-verify-esp /tmp/kairos-verify-state
-        errs=""
+        errs=()
 
         # 1) The ESP must carry a GRUB EFI binary. Its absence is exactly the
         #    firmware "Failed to boot" case — nothing for the firmware to launch.
@@ -322,11 +322,11 @@
           [ "$(blkid -o value -s TYPE "$p" 2>/dev/null)" = vfat ] && { ESP="$p"; break; }
         done
         if [ -z "$ESP" ]; then
-          errs="${errs} [no EFI System Partition (vfat) found]"
+          errs+=("[no EFI System Partition (vfat) found]")
         else
           mount -o ro "$ESP" /tmp/kairos-verify-esp
           find /tmp/kairos-verify-esp -iname '*.efi' | grep -q . \
-            || errs="${errs} [ESP has no .efi bootloader — GRUB not installed]"
+            || errs+=("[ESP has no .efi bootloader — GRUB not installed]")
           umount /tmp/kairos-verify-esp
         fi
 
@@ -341,16 +341,19 @@
             found_active=1
             used_kb=$(du -sk /tmp/kairos-verify-state/cOS/active.img | awk '{print $1}')
             [ "${used_kb:-0}" -ge 1048576 ] \
-              || errs="${errs} [cOS/active.img only ${used_kb}KB written — deploy incomplete]"
+              || errs+=("[cOS/active.img only ${used_kb}KB written — deploy incomplete]")
             umount /tmp/kairos-verify-state
             break
           fi
           umount /tmp/kairos-verify-state
         done
-        [ "$found_active" = 1 ] || errs="${errs} [cOS/active.img not found on any partition]"
+        [ "$found_active" = 1 ] || errs+=("[cOS/active.img not found on any partition]")
 
-        if [ -n "$errs" ]; then
-          echo "kairos-agent install verification FAILED:${errs}" >&2
+        # Test emptiness via the array-expansion form below, NOT the array-length
+        # form: a literal brace-hash sequence reads as a Jinja comment-start here
+        # and breaks the task at parse time.
+        if [ -n "${errs[*]:-}" ]; then
+          echo "kairos-agent install verification FAILED: ${errs[*]}" >&2
           echo "Inspect {{ e2e_dir }}/logs/qemu-install.log for the installer output." >&2
           exit 1
         fi
