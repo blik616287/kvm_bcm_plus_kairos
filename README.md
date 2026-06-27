@@ -77,13 +77,15 @@ make deploy-dd
 make validate
 ```
 
-`inventory/group_vars/all.yml` is gitignored. `inventory/group_vars/all.example.yml` is the committable template and documents every variable.
+`inventory/group_vars/all.yml` is gitignored. `inventory/group_vars/all.example.yml` is the committable **remote/customer-BCM** template and documents every variable.
 
 ## Quick Start — Local KVM (dev / demo)
 
 ```bash
-cp inventory/group_vars/all.example.yml inventory/group_vars/all.yml
-# Uncomment the local-KVM section; set jfrog_token, palette_api_key, etc.
+# Minimal local-KVM config: most values default from inventory/hosts.yml,
+# so you only fill jfrog_token + kairos_target_disk (+ optional Palette).
+cp inventory/group_vars/all.local-kvm.example.yml inventory/group_vars/all.yml
+$EDITOR inventory/group_vars/all.yml
 
 make all   # runs the full 6-stage pipeline (~100-120 min)
 ```
@@ -435,6 +437,7 @@ Milestones and notable changes, newest first. Each entry links its JIRA ticket
 
 ### 2026-06-27
 
+- **Inventory example consolidation** ([IN-2295](https://insightsoftmax.atlassian.net/browse/IN-2295) · [#29](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/29)) — collapsed 3 overlapping example files to 2 (one per mode: `all.local-kvm.example.yml` local, `all.example.yml` remote/full-reference) with a clear "which file?" header; fixed stale comments that the rearchitecture invalidated (now describe `add_host`/`delegate_to`, not the deleted `*.sh.j2` scripts).
 - **`kairos_vm`: shared QEMU launcher** ([IN-2294](https://insightsoftmax.atlassian.net/browse/IN-2294) · [#28](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/28)) — the ~24-line `qemu-system` invocation was copy-pasted 3× (PXE-install launch, disk-boot fact, non-blocking finisher); extracted to one `kairos-qemu.sh.j2` taking a boot-spec arg. Validated live (`kairos-vm` + `validate`, 0 FAIL).
 - **`validate` → native Ansible** ([IN-2293](https://insightsoftmax.atlassian.net/browse/IN-2293) · [#27](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/27)) — replaced the 303-line `validate.sh.j2` with native assertion tasks: BCM checks run delegated to the `add_host` managed BCM; each check records a `{name, status, detail}` result that `report.j2` renders as a PASS/WARN/FAIL summary gated by an `assert`. (Kairos checks run per-check via the BCM — the node is password-only and Ansible can't cleanly proxy-password a password jumphost, and key injection would plant persistent access.) Validated live: 29 PASS / 1 WARN / 0 FAIL.
 - **`deploy_dd` → native Ansible** ([IN-2292](https://insightsoftmax.atlassian.net/browse/IN-2292) · [#26](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/26)) — replaced the 417-line `deploy-dd.sh.j2` orchestration script with native delegated tasks (the BCM as an `add_host` managed host): 8 task files mirroring the old `[N/7]` steps, systemd units extracted to `files/`, idempotent modules replacing hand-rolled `grep -qF || echo`, and an explicit assertion on the load-bearing category→installer-image end-state (was a silent `|| true`). Fixed 5 latent bugs the old script masked by running without `set -e`. Validated end-to-end on local-KVM (`deploy-dd` + `kairos-vm` + `validate`, 0 FAIL).

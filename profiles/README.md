@@ -19,7 +19,7 @@ node identity, `OS_VERSION`, `ISO_NAME`, and for 26.04 `BASE_IMAGE`). Ansible lo
 
 ## 0. Shared setup (once, for both profiles)
 
-1. **`inventory/group_vars/all.yml`** — copy from `all.local-minimal.example.yml`
+1. **`inventory/group_vars/all.yml`** — copy from `all.local-kvm.example.yml`
    (local-KVM) and fill in real values. Local-KVM essentials:
    ```yaml
    bcm_ssh_host: "127.0.0.1"        # BCM runs as a local QEMU VM
