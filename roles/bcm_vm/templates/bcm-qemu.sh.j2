@@ -1,0 +1,54 @@
+#!/bin/bash
+# Launch the BCM head-node VM. Single source for both phases (was two ~24-line
+# qemu invocations in tasks/main.yml). The internal/external NIC MACs live here
+# only, so the install and boot phases can't drift (CMDaemon binds by NIC MAC).
+#
+# Usage: bcm-qemu.sh <phase>
+#   install : ISO direct-kernel autoinstall; powers off when done (-no-reboot).
+#   boot    : boot from the installed disk and stay up.
+set -euo pipefail
+PHASE="${1:?phase required: install|boot}"
+
+case "$PHASE" in
+    install) SERIAL="{{ bcm_install_serial_log }}"; NAME="BCM-HeadNode-Install" ;;
+    boot) SERIAL="{{ bcm_serial_log }}"; NAME="BCM-HeadNode" ;;
+    *)
+        echo "unknown phase: $PHASE (want install|boot)" >&2
+        exit 2
+        ;;
+esac
+: > "$SERIAL"
+
+# Common args for both phases.
+args=(
+    {{ kvm_flag.stdout }}
+    -m {{ bcm_vm_ram }} -smp {{ bcm_vm_cpus }} -cpu host
+    -name "$NAME"
+    -display {{ qemu_display_type.stdout }}
+    -drive file="{{ bcm_disk }}",format=qcow2,if=virtio
+    -netdev socket,id=intnet,listen=:31337
+    -device virtio-net-pci,netdev=intnet,mac=BC:24:11:7F:33:7C
+    -netdev user,id=extnet,hostfwd=tcp::{{ bcm_ssh_port }}-:22,hostfwd=tcp::{{ bcm_https_port }}-:443
+    -device virtio-net-pci,netdev=extnet,mac=BC:24:11:ED:21:50
+    -vga virtio
+    -serial file:"$SERIAL"
+    -pidfile "{{ bcm_pid_file }}"
+    -daemonize
+)
+
+if [ "$PHASE" = install ]; then
+    # ISO + config drive + direct kernel/initrd boot for the unattended install.
+    args+=(
+        -drive format=raw,media=cdrom,readonly=on,file="{{ build_dir }}/bcm-autoinstall.iso"
+        -drive file="{{ build_dir }}/.bcm-init.img",format=raw,if=virtio
+        -kernel "{{ build_dir }}/.bcm-kernel"
+        -initrd "{{ build_dir }}/.bcm-rootfs-auto.cgz"
+        -append "dvdinstall nokeymap root=/dev/ram0 rw ramdisk_size=1000000 vga=normal bcmblacklist=nouveau systemd.unit=multi-user.target net.ifnames=0 biosdevname=0 console=ttyS0,115200 console=tty0"
+        -no-reboot
+        -boot d
+    )
+else
+    args+=(-boot c)
+fi
+
+exec qemu-system-x86_64 "${args[@]}"
