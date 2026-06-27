@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------------------
+# MINIMAL local-KVM inventory.  Copy to inventory/group_vars/all.yml:
+#
+#     cp inventory/group_vars/all.local-kvm.example.yml \
+#        inventory/group_vars/all.yml
+#
+# Then fill in jfrog_token and run `make all`.
+#
+# Everything else (BCM connection/network/sizing, ISO repo, compute-VM sizing,
+# Palette placeholders) is supplied by the local-KVM defaults in
+# inventory/hosts.yml. Override any of those by adding the variable here —
+# group_vars/all.yml wins over the inventory defaults.
+#
+# For a remote/customer BCM instead, use all.example.yml (the full template).
+# ---------------------------------------------------------------------------
+
+# REQUIRED — JFrog API token used to download the BCM ISO in stage 1
+# (bcm-prepare). The only true secret with no safe default. If the ISO is
+# already staged under dist/, this is not needed.
+jfrog_token: "PASTE_YOUR_JFROG_TOKEN"
+
+# REQUIRED — disk the compute VM dd's Kairos onto. The local-KVM compute node
+# has a single virtio disk, so this is /dev/vda. (Never defaulted: picking the
+# wrong disk bricks a real box, so it's always explicit.)
+kairos_target_disk: "/dev/vda"
+
+# ---------------------------------------------------------------------------
+# OPTIONAL — Palette registration. Leave commented for a pure bring-up + boot
+# (the node will come up but won't register; a local on-prem Palette usually
+# isn't reachable from the KVM rig anyway). Uncomment + fill to register.
+# ---------------------------------------------------------------------------
+# palette_endpoint:     "palette.example.com"     # SaaS: api.spectrocloud.com
+# palette_project_uid:  "your-project-uid"
+# palette_api_key:      "your-admin-api-key"
+# palette_ca_cert: |                                # on-prem self-signed CA only
+#   -----BEGIN CERTIFICATE-----
+#   ...
+#   -----END CERTIFICATE-----
+
+# ---------------------------------------------------------------------------
+# OPTIONAL overrides (all have local-KVM defaults in inventory/hosts.yml):
+#   bcm_password / bcm_ssh_port / bcm_https_port
+#   bcm_internal_ip / bcm_internal_cidr / bcm_internal_netmask
+#   bcm_hostname / bcm_timezone / bcm_external_gateway / bcm_external_dns
+#   bcm_vm_ram / bcm_vm_cpus / bcm_vm_disk_size
+#   jfrog_instance / jfrog_repo / iso_filename
+#   kairos_vm_mac / kairos_vm_ram / kairos_vm_cpus / kairos_vm_disk_size
+# Kairos build knobs (OS_VERSION etc.) default in roles/kairos_build/defaults;
+# override via kairos_canvos_args here if needed. See all.example.yml.
+# ---------------------------------------------------------------------------
