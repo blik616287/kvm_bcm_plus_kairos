@@ -7,9 +7,25 @@ export E2E_DIR
 
 LOGS_DIR := $(E2E_DIR)/logs
 
+# Verbosity passthrough for any stage, e.g. `make deploy-dd V=-vv` (empty = normal).
+V ?=
+
+# Run a stage playbook with rich, retained logging (plan Part D):
+#  - a timestamped per-run dir logs/run-<ts>/ (+ a `latest` symlink) so reruns
+#    never clobber a prior run's evidence;
+#  - ANSIBLE_LOG_PATH -> a structured ansible log in that dir, capturing every
+#    task/result incl. delegated BCM/Kairos hosts (profile_tasks adds timings);
+#  - console tee'd to BOTH the run dir and the flat logs/<stage>.log (back-compat
+#    with `make *-serial`, docs, and the old paths).
 define run_playbook
 	@mkdir -p $(LOGS_DIR)
-	set -o pipefail; ansible-playbook playbooks/$(1).yml $(ANSIBLE_ARGS) 2>&1 | tee $(LOGS_DIR)/$(1).log
+	@RUN_TS=$$(date +%Y%m%d-%H%M%S); RUN_DIR="$(LOGS_DIR)/run-$$RUN_TS"; \
+	  mkdir -p "$$RUN_DIR"; ln -sfn "run-$$RUN_TS" "$(LOGS_DIR)/latest"; \
+	  echo "==> logs: $$RUN_DIR  (symlinked as $(LOGS_DIR)/latest)"; \
+	  set -o pipefail; \
+	  ANSIBLE_LOG_PATH="$$RUN_DIR/$(1).ansible.log" \
+	    ansible-playbook playbooks/$(1).yml $(V) $(ANSIBLE_ARGS) 2>&1 \
+	    | tee "$$RUN_DIR/$(1).console.log" "$(LOGS_DIR)/$(1).log"
 endef
 
 .PHONY: help
