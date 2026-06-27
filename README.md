@@ -392,17 +392,28 @@ kvm_bcm_plus_kairos/
 
 ## Logs
 
+Each stage run writes to a **timestamped per-run directory** so reruns never
+clobber a prior run's evidence, with `logs/latest` pointing at the newest:
+
 ```
-logs/01-bcm-prepare.log
-logs/02-bcm-vm.log
-logs/03-kairos-build.log
-logs/04-deploy-dd.log
-logs/05-kairos-vm.log
-logs/06-validate.log
-logs/bcm-serial.log
-logs/kairos-serial.log
-logs/qemu-install.log
+logs/run-<YYYYmmdd-HHMMSS>/
+  <stage>.console.log      # full console output (tee'd)
+  <stage>.ansible.log      # structured per-task log incl. delegated hosts +
+                           #   a slowest-tasks timing summary (profile_tasks)
+logs/latest -> run-<...>/   # symlink to the most recent run
 ```
+
+The flat per-stage paths are still written too (back-compat with `make *-serial`
+and older docs):
+
+```
+logs/01-bcm-prepare.log   logs/04-deploy-dd.log   logs/bcm-serial.log
+logs/02-bcm-vm.log         logs/05-kairos-vm.log    logs/kairos-serial.log
+logs/03-kairos-build.log   logs/06-validate.log     logs/qemu-install.log
+```
+
+Bump verbosity for any stage with `V`, e.g. `make deploy-dd V=-vv` (or
+`V=-vvvv` for connection-level ssh detail).
 
 ## Re-running Stages
 
