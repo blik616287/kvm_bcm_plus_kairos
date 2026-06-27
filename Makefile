@@ -193,6 +193,12 @@ bcm-serial: ## Tail BCM serial log
 kairos-serial: ## Tail Kairos serial log
 	@tail -f logs/kairos-serial.log 2>/dev/null || echo "No serial log found"
 
+.PHONY: collect-logs
+collect-logs: ## Pull BCM + Kairos on-target logs into logs/collected/ (troubleshooting)
+	@mkdir -p $(LOGS_DIR)
+	set -o pipefail; ANSIBLE_LOG_PATH="$(LOGS_DIR)/collect-logs.ansible.log" \
+	  ansible-playbook playbooks/collect-logs.yml $(V) $(ANSIBLE_ARGS) 2>&1 | tee $(LOGS_DIR)/collect-logs.log
+
 # ---- Cleanup ----
 
 .PHONY: clean

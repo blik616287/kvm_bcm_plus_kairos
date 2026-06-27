@@ -1,0 +1,118 @@
+---
+# collect-logs.yml — pull the on-target logs that actually explain failures off
+# the BCM and the Kairos node into logs/collected/, so troubleshooting (esp.
+# remote/proxied) doesn't depend on a live SSH session into the boxes. Safe to
+# run anytime the BCM is up; failures on individual logs are tolerated.
+#   make collect-logs
+- name: "Collect on-target logs (BCM + Kairos)"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
+    collect_dir: "{{ e2e_dir }}/logs/collected"
+    v_target_node: "{{ bcm_target_node | default(kairos_node_name | default('node001', true), true) }}"
+  pre_tasks:
+    - name: Register the BCM as a managed host
+      ansible.builtin.import_tasks: tasks/add_bcm_host.yml
+  tasks:
+    - name: Ensure the collected-log directories exist (owned by the invoking user)
+      ansible.builtin.file:
+        path: "{{ collect_dir }}/{{ item }}"
+        state: directory
+        mode: "0755"
+      become: false
+      loop: [bcm, kairos]
+
+    # ---- BCM head node ----
+    - name: Gather BCM logs (delegated)
+      ansible.builtin.command: "{{ item.cmd }}"
+      args:
+        argv: "{{ item.argv | default(omit) }}"
+      delegate_to: bcm
+      register: v_bcm_logs
+      changed_when: false
+      failed_when: false
+      loop:
+        - { f: cmd.log, cmd: "journalctl -u cmd --no-pager -n 500" }
+        - { f: dhcpd.log, cmd: "journalctl -u dhcpd --no-pager -n 200" }
+        - { f: named.log, cmd: "journalctl -u named --no-pager -n 200" }
+        - { f: nfs-exports.txt, cmd: "cat /etc/exports" }
+        - { f: cmsh-devices.txt, cmd: "cmsh -c 'device; list'" }
+      loop_control:
+        label: "{{ item.f }}"
+
+    - name: Write BCM logs to logs/collected/bcm/
+      ansible.builtin.copy:
+        content: "{{ item.stdout | default('') }}\n{{ item.stderr | default('') }}\n"
+        dest: "{{ collect_dir }}/bcm/{{ item.item.f }}"
+        mode: "0644"
+      become: false
+      loop: "{{ v_bcm_logs.results }}"
+      loop_control:
+        label: "{{ item.item.f }}"
+
+    # ---- Kairos node IP (the node is password-only; reached via the BCM) ----
+    - name: Look up the Kairos node IP (device-level)
+      ansible.builtin.command: "cmsh -c 'device; use {{ v_target_node }}; get ip'"
+      delegate_to: bcm
+      register: v_kip_dev
+      changed_when: false
+      failed_when: false
+
+    - name: Fall back to the BOOTIF interface IP when the device IP is 0.0.0.0
+      ansible.builtin.command: "cmsh -c 'device; use {{ v_target_node }}; interfaces; use BOOTIF; get ip'"
+      delegate_to: bcm
+      register: v_kip_bootif
+      changed_when: false
+      failed_when: false
+      when: (v_kip_dev.stdout | trim) in ['', '0.0.0.0']
+
+    - name: Compose the BCM->Kairos ssh prefix
+      ansible.builtin.set_fact:
+        kairos_ip: >-
+          {{ (v_kip_bootif.stdout | trim)
+             if (v_kip_dev.stdout | trim) in ['', '0.0.0.0']
+             else (v_kip_dev.stdout | trim) }}
+        kairos_ssh: >-
+          sshpass -p kairos ssh -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+          kairos@{{ (v_kip_bootif.stdout | trim) if (v_kip_dev.stdout | trim) in ['', '0.0.0.0'] else (v_kip_dev.stdout | trim) }}
+      no_log: true
+
+    # ---- Kairos node (run via the BCM; commands base64-encoded) ----
+    - name: Gather Kairos logs (via the BCM)
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: '{{ kairos_ssh }} "echo {{ item.cmd | b64encode }} | base64 -d | bash"'
+      delegate_to: bcm
+      register: v_k_logs
+      changed_when: false
+      failed_when: false
+      when: kairos_ip is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+      loop:
+        - { f: stylus-agent.log, cmd: "sudo journalctl -u stylus-agent --no-pager -n 800" }
+        - { f: kairos-agent.log, cmd: "sudo journalctl -u kairos-agent --no-pager -n 400 2>/dev/null || true" }
+        - { f: cmdline.txt, cmd: "cat /proc/cmdline" }
+        - { f: kairos-release.txt, cmd: "cat /etc/kairos-release 2>/dev/null || true" }
+        - { f: oem-listing.txt, cmd: "sudo ls -la /oem/ 2>/dev/null || true" }
+        - { f: dmesg-tail.txt, cmd: "sudo dmesg | tail -300" }
+      loop_control:
+        label: "{{ item.f }}"
+
+    - name: Write Kairos logs to logs/collected/kairos/
+      ansible.builtin.copy:
+        content: "{{ item.stdout | default('') }}\n"
+        dest: "{{ collect_dir }}/kairos/{{ item.item.f }}"
+        mode: "0644"
+      become: false
+      loop: "{{ v_k_logs.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.f }}"
+      when: not (v_k_logs.skipped | default(false))
+
+    - name: Report where the logs landed
+      ansible.builtin.debug:
+        msg:
+          - "Collected logs -> {{ collect_dir }}/ (bcm/, kairos/)."
+          - "{{ 'Kairos logs skipped (node IP ' ~ (kairos_ip | default('?')) ~ ' not reachable)' if (v_k_logs.skipped | default(false)) else 'Kairos node ' ~ kairos_ip ~ ' logs collected.' }}"
+          - "Serial consoles remain at {{ e2e_dir }}/logs/*-serial.log."

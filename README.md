@@ -417,6 +417,17 @@ logs/03-kairos-build.log   logs/06-validate.log     logs/qemu-install.log
 Bump verbosity for any stage with `V`, e.g. `make deploy-dd V=-vv` (or
 `V=-vvvv` for connection-level ssh detail).
 
+**Pull on-target logs for troubleshooting** — `make collect-logs` fetches the
+logs that actually explain failures off the BCM and the Kairos node (which you
+otherwise can't reach without a live SSH session, especially via a jumphost)
+into `logs/collected/`:
+
+```
+logs/collected/bcm/      cmd.log · dhcpd.log · named.log · nfs-exports.txt · cmsh-devices.txt
+logs/collected/kairos/   stylus-agent.log · kairos-agent.log · cmdline.txt ·
+                         kairos-release.txt · oem-listing.txt · dmesg-tail.txt
+```
+
 ## Re-running Stages
 
 Stages are idempotent:
