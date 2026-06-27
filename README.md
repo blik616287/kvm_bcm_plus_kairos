@@ -427,3 +427,13 @@ Stages are idempotent:
 - **validate** — always re-runs
 
 Force a full rebuild with `make clean && make all` (local-KVM) or `make clean && make kairos-build deploy-dd` (remote BCM).
+
+## Changelog
+
+Milestones and notable changes, newest first. Each entry links its JIRA ticket
+(project `IN`) and PR. New milestones append here as part of the same PR.
+
+### 2026-06-27
+
+- **Logging & observability** ([IN-2290](https://insightsoftmax.atlassian.net/browse/IN-2290) · [#24](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/24)) — per-run timestamped `logs/run-<ts>/` directories with a `latest` symlink (reruns no longer clobber a prior run's evidence), a structured `*.ansible.log` capturing per-task detail incl. delegated hosts, `profile_tasks` slowest-step timings, failed-task stderr surfaced to the console, and a `V=-vv` verbosity knob.
+- **Lint + static-analysis + CI quality gates** ([IN-2289](https://insightsoftmax.atlassian.net/browse/IN-2289) · [#23](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/23)) — the repo's first code-quality gates: shellcheck/shfmt, yamllint, ansible-lint, checkov, gitleaks (blocking), bandit/vulture, pre-commit, `make lint/fmt/analyze`, GitHub Actions CI, and a render-bridge to lint bash embedded in `.sh.j2` templates. Lax baseline-then-ratchet so the existing tree is green; CI runs the same `make` targets as a local checkout for local↔CI parity.

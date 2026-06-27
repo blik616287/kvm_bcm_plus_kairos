@@ -1,0 +1,53 @@
+---
+# add_bcm_host.yml — register the BCM head node as a runtime-managed Ansible
+# host named `bcm`, so downstream stages run REAL delegated tasks on it instead
+# of shelling in through a rendered bash script. One model serves both modes:
+#
+#   local-KVM : ansible_host=localhost, port-forwarded SSH (bcm_ssh_port),
+#               password auth (bcm_password).
+#   remote    : ansible_host=<bcm ip/host>, optional jumphost reached via an
+#               ssh ProxyCommand built from bcm_ssh_proxy_jump/bcm_ssh_proxy_key.
+#
+# Include from a play's pre_tasks (or tasks) before `delegate_to: bcm` /
+# `- hosts: bcm`:
+#     pre_tasks:
+#       - ansible.builtin.import_tasks: tasks/add_bcm_host.yml
+#
+# Inputs (from inventory/group_vars): bcm_ssh_host, bcm_ssh_port, bcm_password,
+# bcm_ssh_proxy_jump (default ''), bcm_ssh_proxy_key (default '').
+
+- name: Build the optional jumphost ProxyCommand fragment
+  ansible.builtin.set_fact:
+    # Empty for a directly-reachable BCM (local-KVM); a `-o ProxyCommand=...`
+    # arg when a jumphost is configured. `~` in the key path is expanded here
+    # because OpenSSH does not expand it inside an -o ProxyCommand value.
+    _bcm_proxy_jump: "{{ bcm_ssh_proxy_jump | default('') }}"
+    _bcm_proxy_key: "{{ bcm_ssh_proxy_key | default('') | regex_replace('^~', lookup('env', 'HOME')) }}"
+
+- name: Compose the ProxyCommand arg when a jumphost is set
+  ansible.builtin.set_fact:
+    _bcm_proxy_arg: >-
+      -o ProxyCommand="ssh -i {{ _bcm_proxy_key }} -o StrictHostKeyChecking=no
+      -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -W %h:%p {{ _bcm_proxy_jump }}"
+  when: _bcm_proxy_jump | length > 0
+
+- name: Default the ProxyCommand arg to empty for a directly-reachable BCM
+  ansible.builtin.set_fact:
+    _bcm_proxy_arg: "{{ _bcm_proxy_arg | default('') }}"
+
+- name: Register the BCM as a managed host (works for local-KVM + remote/jumphost)
+  ansible.builtin.add_host:
+    name: bcm
+    groups: [bcm]
+    ansible_connection: ssh
+    ansible_host: "{{ bcm_ssh_host | default('localhost') }}"
+    ansible_port: "{{ bcm_ssh_port }}"
+    ansible_user: root
+    ansible_password: "{{ bcm_password }}"
+    # BCM is a full Ubuntu head node — python3 is present, so modules work.
+    ansible_python_interpreter: /usr/bin/python3
+    ansible_ssh_common_args: >-
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      -o LogLevel=ERROR -o ConnectTimeout=10 {{ _bcm_proxy_arg }}
+  changed_when: false
+  no_log: true   # bcm_password flows through this task

@@ -1,0 +1,33 @@
+---
+# Smoke-test for tasks/add_bcm_host.yml — proves the BCM is reachable as a
+# *managed* Ansible host (native ssh connection + python3 module exec + cmsh),
+# which is the foundation the deploy_dd/validate rearchitecture builds on.
+# Run after the BCM is up (`make bcm-vm`):
+#   ansible-playbook playbooks/_validate-bcm-host.yml
+#
+# Underscore-prefixed: a developer smoke-test, not a pipeline stage.
+
+- name: Register the BCM as a managed host
+  hosts: localhost
+  gather_facts: false
+  vars:
+    e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
+  tasks:
+    - name: Add the BCM to the runtime inventory
+      ansible.builtin.import_tasks: tasks/add_bcm_host.yml
+
+- name: Verify the BCM responds to native Ansible tasks
+  hosts: bcm
+  gather_facts: false
+  tasks:
+    - name: Ping over the native connection (proves ssh + python3 module exec)
+      ansible.builtin.ping:
+
+    - name: Run cmsh device list as a delegated command
+      ansible.builtin.command: cmsh -c 'device; list'
+      register: _devlist
+      changed_when: false
+
+    - name: Show what the BCM reported
+      ansible.builtin.debug:
+        var: _devlist.stdout_lines
