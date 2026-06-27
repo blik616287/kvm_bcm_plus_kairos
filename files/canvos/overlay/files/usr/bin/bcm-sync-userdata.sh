@@ -12,11 +12,11 @@
 USERDATA="/oem/99_userdata.yaml"
 
 # ---- Registration mode ----
-if ! grep -q "stylus.registration" /proc/cmdline 2>/dev/null; then
+if ! grep -q "stylus.registration" /proc/cmdline 2> /dev/null; then
     NEEDS_REGISTRATION=false
     if [ ! -f /oem/.stylus-state ]; then
         NEEDS_REGISTRATION=true
-    elif ! grep -q "authToken" /oem/.stylus-state 2>/dev/null; then
+    elif ! grep -q "authToken" /oem/.stylus-state 2> /dev/null; then
         NEEDS_REGISTRATION=true
     fi
 
@@ -53,7 +53,7 @@ if [ ! -f "$USERDATA" ]; then
 fi
 
 # Check if name already matches
-if grep -q "name: ${NODE_NAME}$" "$USERDATA" 2>/dev/null; then
+if grep -q "name: ${NODE_NAME}$" "$USERDATA" 2> /dev/null; then
     echo "bcm-sync-userdata: name already set to ${NODE_NAME}"
     exit 0
 fi

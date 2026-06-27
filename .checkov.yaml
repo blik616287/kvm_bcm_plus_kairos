@@ -1,0 +1,17 @@
+---
+# Checkov IaC static analysis — Ansible framework.
+# soft_fail during rollout (Phase 0-4): report findings, never fail the build.
+# Remove `soft-fail: true` in Phase 5 to make it blocking.
+directory:
+  - "."
+framework:
+  - ansible
+skip-path:
+  - CanvOS
+  - build
+  - dist
+  - logs
+  - tests/fixtures
+compact: true
+quiet: true
+soft-fail: true

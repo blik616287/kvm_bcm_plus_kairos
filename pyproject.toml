@@ -1,0 +1,10 @@
+# Python static-analysis config. Wired now; blocking only once real Python
+# exists in the repo (plan Part C.5/C.6 — the bcm-autoinstall render-config.py,
+# kairos_build image-patch helpers, etc.). No Python ships today.
+
+[tool.bandit]
+exclude_dirs = ["CanvOS", "build", "dist", "logs", "tests"]
+
+[tool.vulture]
+min_confidence = 80
+exclude = ["CanvOS/", "build/", "dist/", "logs/"]

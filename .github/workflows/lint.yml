@@ -1,0 +1,77 @@
+---
+name: lint
+
+# Static quality gates. Mirrors `make lint` / `make analyze` so a green local
+# run predicts a green PR. Gates are lax during rollout (plan Part C.6) and
+# ratchet over time; gitleaks is the one job that blocks from day one.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bash:
+    name: bash (shellcheck + shfmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck + shfmt
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          curl -fsSL -o /usr/local/bin/shfmt \
+            https://github.com/mvdan/sh/releases/download/v3.10.0/shfmt_v3.10.0_linux_amd64
+          sudo chmod +x /usr/local/bin/shfmt
+      - name: shellcheck (real .sh)
+        run: |
+          files=$(git ls-files '*.sh' | grep -v -E '^(CanvOS/|build/|dist/|logs/)' || true)
+          [ -z "$files" ] || shellcheck -x --severity=error $files
+      - name: shfmt (format check)
+        run: |
+          files=$(git ls-files '*.sh' | grep -v -E '^(CanvOS/|build/|dist/|logs/)' || true)
+          [ -z "$files" ] || shfmt -i 4 -ci -bn -sr -d $files
+
+  yaml-ansible:
+    name: yaml + ansible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet ansible-lint yamllint
+      - run: yamllint -c .yamllint .
+      - run: ansible-lint
+
+  templates:
+    name: sh.j2 template lint (render bridge)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          pip install --quiet ansible
+      - run: scripts/shellcheck-templates.sh --severity=error
+
+  security:
+    name: secrets + IaC
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history for gitleaks
+      - name: gitleaks (blocking)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_CONFIG: .gitleaks.toml
+      - name: checkov (soft-fail during rollout)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          framework: ansible
+          soft_fail: true
+          quiet: true

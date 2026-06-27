@@ -1,0 +1,41 @@
+title = "kvm_bcm_plus_kairos secret policy"
+
+# Build on gitleaks' default ruleset, add repo-specific secret shapes.
+# This gate is BLOCKING from day one (plan Part C.6 Phase 0) — never baselined.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "jfrog-token"
+description = "JFrog access token in inventory/vars"
+regex = '''(?i)jfrog_token\s*[:=]\s*["']?[A-Za-z0-9._-]{16,}'''
+tags = ["secret", "jfrog"]
+
+[[rules]]
+id = "palette-api-key"
+description = "Spectro Cloud Palette API key"
+regex = '''(?i)palette_api_key\s*[:=]\s*["']?[A-Za-z0-9+/=._-]{20,}'''
+tags = ["secret", "palette"]
+
+[[rules]]
+id = "bcm-password"
+description = "BCM root password"
+regex = '''(?i)bcm_password\s*[:=]\s*["']?[^"'\s#]{6,}'''
+tags = ["secret", "bcm"]
+
+[allowlist]
+description = "Example/template files and docs carry placeholders, not real secrets"
+paths = [
+  '''inventory/group_vars/.*\.example\.yml$''',
+  '''docs/.*''',
+  '''.*\.tpl$''',
+]
+# Obvious placeholder values are never real secrets.
+regexes = [
+  '''(?i)(changeme|change-me|example|placeholder|your[-_]?token|your[-_]?key|xxx+|<[^>]*>|\.\.\.)''',
+  # Known non-secret local-KVM test default committed in inventory/hosts.yml.
+  # TODO(C.4/C.7 secret-hardening): remove this baked-in default from the
+  # committed inventory (require bcm_password via the gitignored all.yml), then
+  # delete this allowlist entry. Real passwords do NOT match this literal.
+  '''bcm-test-pw''',
+]

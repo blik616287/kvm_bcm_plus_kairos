@@ -33,7 +33,7 @@ STYLUS_RUNTIME="/run/stylus/userdata"
 # and regenerates /run/stylus/userdata from the empty placeholder.
 TOKEN_CACHE="/oem/.edge-host-token"
 
-log()  { echo "${LOG_TAG}: $*" ; }
+log() { echo "${LOG_TAG}: $*"; }
 
 inject_token() {
     # inject_token FILE TOKEN — set/replace edgeHostToken under stylus.site:,
@@ -61,10 +61,10 @@ inject_token() {
 
 # ---- Gate: registration mode only ----
 NEEDS_REGISTRATION=false
-if grep -q "stylus.registration" /proc/cmdline 2>/dev/null; then
+if grep -q "stylus.registration" /proc/cmdline 2> /dev/null; then
     NEEDS_REGISTRATION=true
 fi
-if [ ! -f /oem/.stylus-state ] || ! grep -q "authToken" /oem/.stylus-state 2>/dev/null; then
+if [ ! -f /oem/.stylus-state ] || ! grep -q "authToken" /oem/.stylus-state 2> /dev/null; then
     NEEDS_REGISTRATION=true
 fi
 if [ "$NEEDS_REGISTRATION" != "true" ]; then
@@ -97,7 +97,7 @@ api() {
         "${extra[@]}" \
         "https://${ENDPOINT}${path}"
     echo
-    cat /tmp/palette-api.out 2>/dev/null
+    cat /tmp/palette-api.out 2> /dev/null
     rm -f /tmp/palette-api.out
 }
 
@@ -121,24 +121,24 @@ fi
 # Reuse a token persisted on a prior run rather than minting (and orphaning) a
 # new one each time stylus restarts. Re-inject it into the files stylus reads.
 if [ -z "$CURRENT_TOKEN" ] && [ -r "$TOKEN_CACHE" ]; then
-    CURRENT_TOKEN=$(tr -d '[:space:]' < "$TOKEN_CACHE" 2>/dev/null)
+    CURRENT_TOKEN=$(tr -d '[:space:]' < "$TOKEN_CACHE" 2> /dev/null)
     if [ -n "$CURRENT_TOKEN" ]; then
         log "reusing cached edgeHostToken from $TOKEN_CACHE (no new mint)"
         inject_token "$STYLUS_RUNTIME" "$CURRENT_TOKEN"
-        inject_token "$USERDATA_FILE"  "$CURRENT_TOKEN"
+        inject_token "$USERDATA_FILE" "$CURRENT_TOKEN"
     fi
 fi
 
 if [ -z "$CURRENT_TOKEN" ]; then
     log "no edgeHostToken in $TOKEN_SRC and no cache — generating one via admin API"
-    EXPIRY=$(date -u -d "+30 days" +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null)
+    EXPIRY=$(date -u -d "+30 days" +"%Y-%m-%dT%H:%M:%S.000Z" 2> /dev/null)
     if [ -z "$EXPIRY" ]; then
         # fallback for busybox date
         EXPIRY=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
     fi
-    NAME="auto-$(cat /sys/class/dmi/id/product_uuid 2>/dev/null | head -c 18)-$(date +%s)"
+    NAME="auto-$(cat /sys/class/dmi/id/product_uuid 2> /dev/null | head -c 18)-$(date +%s)"
     BODY=$(printf '{"metadata":{"name":"%s"},"spec":{"defaultProject":{"uid":"%s"},"expiry":"%s"}}' \
-           "$NAME" "$PROJECTUID" "$EXPIRY")
+        "$NAME" "$PROJECTUID" "$EXPIRY")
     # The create-token endpoint is TENANT-scoped — do NOT send ProjectUid header.
     RESP=$(api POST "/v1/edgehosts/tokens" "$BODY")
     HTTP=$(echo "$RESP" | head -1)
@@ -146,20 +146,20 @@ if [ -z "$CURRENT_TOKEN" ]; then
     if [ "$HTTP" != "201" ] && [ "$HTTP" != "200" ]; then
         log "token create failed HTTP $HTTP: $BODYLINE — continuing without token"
     else
-        TOKEN_UID=$(echo "$BODYLINE" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uid",""))' 2>/dev/null)
+        TOKEN_UID=$(echo "$BODYLINE" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("uid",""))' 2> /dev/null)
         if [ -n "$TOKEN_UID" ]; then
             # Fetch the token string
             RESP2=$(api GET "/v1/edgehosts/tokens/${TOKEN_UID}" "")
             BODY2=$(echo "$RESP2" | tail -n +2)
-            NEW_TOKEN=$(echo "$BODY2" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("spec",{}).get("token",""))' 2>/dev/null)
+            NEW_TOKEN=$(echo "$BODY2" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("spec",{}).get("token",""))' 2> /dev/null)
             if [ -n "$NEW_TOKEN" ]; then
                 log "generated token uid=${TOKEN_UID}; injecting into stylus userdata"
                 # The runtime copy is what stylus-agent reads THIS boot; the /oem
                 # copy keeps it across reboots. Update both, indent-agnostic.
                 inject_token "$STYLUS_RUNTIME" "$NEW_TOKEN"
-                inject_token "$USERDATA_FILE"  "$NEW_TOKEN"
+                inject_token "$USERDATA_FILE" "$NEW_TOKEN"
                 # Persist so a later restart reuses this token instead of minting again.
-                printf '%s' "$NEW_TOKEN" > "$TOKEN_CACHE" 2>/dev/null && chmod 600 "$TOKEN_CACHE" 2>/dev/null || true
+                printf '%s' "$NEW_TOKEN" > "$TOKEN_CACHE" 2> /dev/null && chmod 600 "$TOKEN_CACHE" 2> /dev/null || true
                 CURRENT_TOKEN="$NEW_TOKEN"
             else
                 log "token create returned uid but token fetch returned empty; continuing"
@@ -171,7 +171,7 @@ else
 fi
 
 # ---- (2) purge stale edge host record if present ----
-SYS_UUID=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null | tr -d '-' | tr 'A-Z' 'a-z')
+SYS_UUID=$(cat /sys/class/dmi/id/product_uuid 2> /dev/null | tr -d '-' | tr 'A-Z' 'a-z')
 if [ -z "$SYS_UUID" ]; then
     log "no SMBIOS product_uuid available, skipping stale-record check"
     exit 0
@@ -207,7 +207,7 @@ case "$HTTP" in
     404)
         log "no existing record for ${EDGE_UID}, proceeding to registration"
         ;;
-    401|403)
+    401 | 403)
         log "auth failure (HTTP ${HTTP}); check APIKEY permissions — skipping"
         ;;
     *)

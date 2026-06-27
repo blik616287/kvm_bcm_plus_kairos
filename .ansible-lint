@@ -1,0 +1,35 @@
+---
+# ansible-lint configuration.
+# Profile ratchets over time: basic -> moderate -> safety -> shared -> production
+# (see plan Part C.6 Phase 4). Start at `basic` so the first run is actionable.
+profile: basic
+
+exclude_paths:
+  - CanvOS/
+  - build/
+  - dist/
+  - logs/
+  - .github/
+  - tests/fixtures/
+
+# warn_list = known debt: surfaced but non-fatal. Burn these down as the stage
+# march converts orchestration to native tasks, then delete each entry (the
+# ratchet). These are the rule IDs the Phase-0 baseline surfaced.
+warn_list:
+  - command-instead-of-shell    # roles use `shell:` with pipes/redirs deliberately
+  - command-instead-of-module   # curl/cmsh/qemu have no native module (yet / ever)
+  - no-changed-when             # many shell tasks are genuinely not idempotent yet
+  - name[template]              # a few task names interpolate {{ }} mid-string
+  - risky-shell-pipe           # `shell:` pipelines without pipefail — fixed during refactor
+  - yaml[line-length]
+  - yaml[document-start]        # add `---` as each file is touched in the stage march
+  - name[play]                  # name plays as each playbook is converted to tasks
+  - jinja[spacing]
+
+# skip_list = intentional and permanent.
+skip_list:
+  - var-naming[no-role-prefix]  # inventory uses bare names (bcm_password, etc.)
+
+# Lint templates as their own kind isn't supported; .sh.j2 are handled by
+# scripts/shellcheck-templates.sh instead.
+offline: true
