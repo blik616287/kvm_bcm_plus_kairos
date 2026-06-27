@@ -1,0 +1,48 @@
+---
+# network.yml — DNS forwarders + IP-forwarding/NAT so compute nodes can route
+# out through the BCM. Gated on bcm_manage_dns: only when we OWN the BCM
+# (local-KVM / fresh head node). On a customer BCM (bcm_manage_dns=false,
+# the default) we never rewrite the site's DNS or turn the box into a NAT
+# router — fixing the old template's fail-open default (plan C.4 #2/#5).
+
+- name: Manage BCM DNS + egress (owned-BCM only)
+  when: bcm_manage_dns | default(false) | bool
+  delegate_to: bcm
+  block:
+    - name: Set DNS forwarders via cmsh
+      ansible.builtin.command: >-
+        cmsh -c "partition; use base; set nameservers {{ bcm_external_dns }}; commit"
+      register: dd_dns
+      changed_when: "'nameservers' in dd_dns.stdout or dd_dns.rc == 0"
+
+    - name: Restart named to pick up the forwarders
+      ansible.builtin.systemd_service:
+        name: named
+        state: restarted
+      failed_when: false
+
+    - name: Enable IPv4 forwarding (runtime + persistent)
+      ansible.posix.sysctl:
+        name: net.ipv4.ip_forward
+        value: "1"
+        sysctl_set: true
+        state: present
+        reload: true
+
+    - name: Find the BCM's default-route (external) interface
+      ansible.builtin.shell: ip route | awk '/^default/ {print $5; exit}'
+      register: dd_ext_if
+      changed_when: false
+
+    - name: MASQUERADE compute traffic out the external interface
+      ansible.builtin.iptables:
+        table: nat
+        chain: POSTROUTING
+        out_interface: "{{ dd_ext_if.stdout | trim }}"
+        jump: MASQUERADE
+      when: dd_ext_if.stdout | trim | length > 0
+
+- name: Note that DNS/NAT management was skipped (customer BCM)
+  ansible.builtin.debug:
+    msg: "bcm_manage_dns is false — leaving the site's DNS/NAT untouched."
+  when: not (bcm_manage_dns | default(false) | bool)

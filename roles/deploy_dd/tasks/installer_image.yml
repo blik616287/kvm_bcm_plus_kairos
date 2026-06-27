@@ -1,0 +1,178 @@
+---
+# installer_image.yml — [3/7] clone the BCM software image for this profile,
+# [4/7] install the dd installer (script + service + tools) into it, and add the
+# per-profile rsyncd module. The installer image PXE-boots over NFS and dd's the
+# Kairos raw image onto the node's disk.
+
+# ---- [3/7] software image ----
+- name: Check whether the installer image already exists
+  ansible.builtin.command: cmsh -c "softwareimage; use {{ dd_installer_image }}"
+  delegate_to: bcm
+  register: dd_img_exists
+  changed_when: false
+  failed_when: false
+
+- name: Clone default-image -> {{ dd_installer_image }}
+  ansible.builtin.command: cmsh -c "softwareimage; clone default-image {{ dd_installer_image }}; commit"
+  delegate_to: bcm
+  when: dd_img_exists.rc != 0
+  changed_when: true
+
+- name: Wait for the installer image filesystem to be provisioned
+  ansible.builtin.stat:
+    path: "{{ dd_image_root }}/usr"
+  delegate_to: bcm
+  register: dd_img_fs
+  retries: 60
+  delay: 2
+  until: dd_img_fs.stat.exists and dd_img_fs.stat.isdir
+
+# ---- [4/7] dd installer into the image ----
+- name: Ensure lz4 is installed on the BCM host (needed to decompress the image)
+  ansible.builtin.apt:
+    name: lz4
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  delegate_to: bcm
+
+- name: Locate the lz4 binary on the BCM
+  ansible.builtin.command: which lz4
+  delegate_to: bcm
+  register: dd_lz4_bin
+  changed_when: false
+
+- name: Stage lz4 into the installer image
+  ansible.builtin.copy:
+    src: "{{ dd_lz4_bin.stdout | trim }}"
+    dest: "{{ dd_image_root }}/usr/local/bin/lz4"
+    mode: "0755"
+    remote_src: true
+  delegate_to: bcm
+
+- name: Render the dd installer script into the image (stays bash — dd-ramdisk)
+  ansible.builtin.template:
+    src: install-kairos.sh.j2
+    dest: "{{ dd_image_root }}/usr/local/sbin/install-kairos.sh"
+    mode: "0755"
+  delegate_to: bcm
+
+- name: Ensure the installer image brings up eth0/ens3 via DHCP
+  ansible.builtin.blockinfile:
+    path: "{{ dd_image_root }}/etc/network/interfaces"
+    create: true
+    mode: "0644"
+    marker: "# {mark} kairos dd-installer NICs"
+    block: |
+      auto eth0
+      iface eth0 inet dhcp
+
+      auto ens3
+      iface ens3 inet dhcp
+  delegate_to: bcm
+
+- name: Install the kairos-install service unit into the image
+  ansible.builtin.copy:
+    src: kairos-install.service
+    dest: "{{ dd_image_root }}/etc/systemd/system/kairos-install.service"
+    mode: "0644"
+  delegate_to: bcm
+
+- name: Ensure the image's multi-user.target.wants dir exists
+  ansible.builtin.file:
+    path: "{{ dd_image_root }}/etc/systemd/system/multi-user.target.wants"
+    state: directory
+    mode: "0755"
+  delegate_to: bcm
+
+- name: Enable kairos-install in the image (wants symlink)
+  ansible.builtin.file:
+    src: /etc/systemd/system/kairos-install.service
+    dest: "{{ dd_image_root }}/etc/systemd/system/multi-user.target.wants/kairos-install.service"
+    state: link
+    force: true
+  delegate_to: bcm
+
+- name: Clear the image fstab (installer runs from NFS; no local mounts)
+  ansible.builtin.copy:
+    dest: "{{ dd_image_root }}/etc/fstab"
+    content: "# Installer runs from NFS — no local disk mounts needed.\n"
+    mode: "0644"
+  delegate_to: bcm
+
+- name: Mask systemd-gpt-auto-generator in the image (no GPT automounts)
+  ansible.builtin.file:
+    src: /dev/null
+    dest: "{{ dd_image_root }}/lib/systemd/system-generators/systemd-gpt-auto-generator"
+    state: link
+    force: true
+  delegate_to: bcm
+  failed_when: false
+
+- name: Ensure efibootmgr is present in the image
+  ansible.builtin.command: "cp /usr/bin/efibootmgr {{ dd_image_root }}/usr/sbin/efibootmgr"
+  args:
+    creates: "{{ dd_image_root }}/usr/sbin/efibootmgr"
+  delegate_to: bcm
+  failed_when: false
+
+# ---- rsyncd module (additive, per profile) ----
+- name: Check for an existing rsyncd default-image module
+  ansible.builtin.command: grep -q '^\[default-image\]' /etc/rsyncd.conf
+  delegate_to: bcm
+  register: dd_rsync_base
+  changed_when: false
+  failed_when: false
+
+- name: Ensure the rsyncd base config (only when no default-image module yet)
+  ansible.builtin.blockinfile:
+    path: /etc/rsyncd.conf
+    create: true
+    mode: "0644"
+    marker: "# {mark} rsyncd base"
+    block: |
+      uid = root
+      gid = root
+      use chroot = no
+      read only = yes
+      list = yes
+
+      [default-image]
+      path = /cm/images/default-image
+      comment = Default image
+  delegate_to: bcm
+  when: dd_rsync_base.rc != 0
+  notify: Restart rsync
+
+- name: Ensure the per-profile rsyncd module
+  ansible.builtin.blockinfile:
+    path: /etc/rsyncd.conf
+    marker: "# {mark} rsyncd {{ kairos_profile }}-installer"
+    block: |
+      [{{ kairos_profile }}-installer]
+      path = /cm/images/{{ kairos_profile }}-installer
+      comment = Kairos installer image ({{ kairos_profile }})
+  delegate_to: bcm
+  notify: Restart rsync
+
+# ---- NFS-export the installer image (now that it exists) ----
+# Deferred from nfs.yml: exportfs -ra fails to stat a not-yet-cloned image.
+- name: Export the installer image per CIDR — skip if already exported
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -euo pipefail
+      if grep -qE "^{{ dd_image_root | regex_escape }}[[:space:]]+{{ item | regex_escape }}[(]" /etc/exports; then
+        echo NOOP
+      else
+        printf '%s %s(ro,no_subtree_check,no_root_squash,async)\n' '{{ dd_image_root }}' '{{ item }}' >> /etc/exports
+        echo ADDED
+      fi
+  loop: "{{ dd_export_cidrs }}"
+  delegate_to: bcm
+  changed_when: "stdout is defined and 'ADDED' in stdout"
+
+- name: Apply all NFS exports now that the installer image is present
+  ansible.builtin.command: exportfs -ra
+  delegate_to: bcm
+  changed_when: true

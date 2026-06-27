@@ -1,0 +1,66 @@
+---
+# image_http.yml — [1/7] compress + upload the raw image, [2/7] serve the
+# /cm/shared/kairos tree over HTTP for the dd-installer to fetch.
+
+- name: Stat the raw + compressed image locally
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ dd_raw_image }}"
+    - "{{ dd_raw_image }}.lz4"
+  register: dd_imgs
+
+- name: Compress the raw image (lz4) when the archive is missing or stale
+  ansible.builtin.command: "lz4 -f {{ dd_raw_image }} {{ dd_raw_image }}.lz4"
+  when: >-
+    not dd_imgs.results[1].stat.exists
+    or dd_imgs.results[0].stat.mtime > dd_imgs.results[1].stat.mtime
+  changed_when: true
+
+- name: Ensure the profile-scoped share dir exists on the BCM
+  ansible.builtin.file:
+    path: "{{ dd_profile_share }}"
+    state: directory
+    mode: "0755"
+  delegate_to: bcm
+
+- name: Upload the compressed image to the BCM (checksum-skipped if unchanged)
+  ansible.builtin.copy:
+    src: "{{ dd_raw_image }}.lz4"
+    dest: "{{ dd_profile_share }}/disk.raw.lz4"
+    mode: "0644"
+  delegate_to: bcm
+
+- name: Install the Kairos image HTTP service unit
+  ansible.builtin.copy:
+    src: kairos-http.service
+    dest: /etc/systemd/system/kairos-http.service
+    mode: "0644"
+  delegate_to: bcm
+  register: dd_http_unit
+
+- name: Enable + start the HTTP server (single shared unit for all profiles)
+  ansible.builtin.systemd_service:
+    name: kairos-http
+    enabled: true
+    state: started
+    daemon_reload: true
+  delegate_to: bcm
+
+- name: Restart the HTTP server if its unit changed
+  ansible.builtin.systemd_service:
+    name: kairos-http
+    state: restarted
+  delegate_to: bcm
+  when: dd_http_unit.changed
+
+- name: Verify the image is reachable over HTTP
+  ansible.builtin.uri:
+    url: "http://localhost:8888/{{ kairos_profile }}/disk.raw.lz4"
+    method: HEAD
+    status_code: [200]
+  delegate_to: bcm
+  register: dd_http_probe
+  retries: 5
+  delay: 2
+  until: dd_http_probe.status is defined and dd_http_probe.status == 200

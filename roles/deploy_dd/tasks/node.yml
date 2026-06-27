@@ -1,0 +1,46 @@
+---
+# node.yml — assign/register the target compute node into the profile category.
+# Two paths: an EXISTING device on a remote/customer BCM (bcm_target_node), or a
+# freshly-registered local-KVM node. The compute IP formula (node001 -> .10)
+# mirrors roles/kairos_vm/defaults so the two stages agree (plan C.1 will hoist
+# it to a shared var).
+
+- name: Assign an existing BCM device to the profile (targeted/remote BCM)
+  ansible.builtin.command: >-
+    cmsh -c "device; use \"{{ bcm_target_node }}\";
+    set category {{ kairos_profile }};
+    set softwareimage {{ dd_installer_image }};
+    set installmode FULL{% if kairos_target_mac | default('') | length > 0 %};
+    set mac {{ kairos_target_mac }}{% endif %}{% if kairos_target_ip | default('') | length > 0 %};
+    set ip {{ kairos_target_ip }}{% endif %};
+    commit"
+  delegate_to: bcm
+  when: bcm_target_node | default('', true) | length > 0
+  changed_when: true
+  failed_when: false
+
+- name: Register a fresh compute node (local-KVM / no target device)
+  when: bcm_target_node | default('', true) | length == 0
+  delegate_to: bcm
+  vars:
+    dd_compute_ip: "{{ bcm_internal_ip.rsplit('.', 1)[0] }}.{{ 9 + (dd_target_node | regex_replace('[^0-9]', '') | int) }}"
+  block:
+    - name: Remove any stale registration for the node
+      ansible.builtin.command: cmsh -c "device; remove {{ dd_target_node }}; commit"
+      changed_when: true
+      failed_when: false
+
+    # provisioninginterface is enp0s2: the local-KVM compute VM runs q35+OVMF, so
+    # the installer env's systemd-networkd names the virtio NIC enp0s2 regardless
+    # of net.ifnames=0 on the cmdline.
+    - name: Register the compute node with explicit IP + MAC
+      ansible.builtin.command: >-
+        cmsh -c "device; add physicalnode {{ dd_target_node }} {{ dd_compute_ip }} enp0s2;
+        set category {{ kairos_profile }};
+        set softwareimage {{ dd_installer_image }};
+        set installmode FULL;
+        set mac {{ kairos_vm_mac | default('') }};
+        set provisioninginterface enp0s2;
+        commit"
+      changed_when: true
+      failed_when: false
