@@ -105,6 +105,13 @@
         mode: "0755"
       become: true
 
+    - name: Stage render-config.py into rootfs (run by bcm-autoinstall.sh)
+      ansible.builtin.copy:
+        src: render-config.py
+        dest: "{{ work_dir.path }}/rootfs/usr/local/bin/render-config.py"
+        mode: "0755"
+      become: true
+
     - name: Copy auto-install systemd unit into rootfs
       ansible.builtin.copy:
         src: bcm-autoinstall.service
