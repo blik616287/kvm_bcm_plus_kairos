@@ -1,0 +1,56 @@
+---
+# Fixture variables for rendering *.sh.j2 templates during linting ONLY.
+# These are NOT real deployment values — they exist so the interim
+# render-then-shellcheck bridge (scripts/shellcheck-templates.sh) can produce
+# syntactically-valid bash to feed shellcheck. As templates are extracted into
+# real .sh files (plan Part C, Phase 3), they drop out of the bridge and this
+# file shrinks toward empty.
+#
+# Role-internal vars (e.g. kairos_vm_slug) are supplied automatically by the
+# bridge loading each role's defaults/main.yml — only inventory/build-level
+# vars need to live here.
+
+# --- paths (normally set as facts / from E2E_DIR) ---
+e2e_dir: "/tmp/lint-e2e"
+build_dir: "/tmp/lint-e2e/build"
+dist_dir: "/tmp/lint-e2e/dist"
+
+# --- BCM connection ---
+bcm_ssh_host: "localhost"
+bcm_password: "lint-placeholder"
+bcm_ssh_port: 10022
+bcm_https_port: 10443
+bcm_internal_ip: "192.168.98.2"
+bcm_internal_cidr: "192.168.98.0/24"
+bcm_internal_netmask: "24"
+bcm_ssh_proxy_jump: ""
+bcm_ssh_proxy_key: "~/.ssh/id_ed25519"
+bcm_manage_dns: false
+bcm_manage_cluster_defaults: false
+bcm_external_dns: "1.1.1.1"
+bcm_external_gateway: "10.0.2.2"
+bcm_hostname: "bcm11-headnode"
+bcm_timezone: "America/Los_Angeles"
+bcm_source_category: "default"
+
+# --- target node ---
+bcm_target_node: ""
+kairos_target_disk: "/dev/vda"
+kairos_wipe_disks: ""
+kairos_target_mac: ""
+kairos_target_ip: ""
+
+# --- profile / build ---
+kairos_profile: "default-kairos"
+kairos_vm_mac: "52:54:00:00:02:01"
+
+# --- runtime facts the templates reference (provided so rendering succeeds) ---
+kvm_flag:
+  stdout: "-enable-kvm"
+qemu_display_type:
+  stdout: "none"
+
+# --- Palette ---
+palette_endpoint: "palette.example.com"
+palette_api_key: ""
+palette_project_uid: ""

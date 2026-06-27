@@ -1,0 +1,17 @@
+# shellcheck configuration — see https://github.com/koalaman/shellcheck/wiki
+shell=bash
+external-sources=true
+
+# SC2086 (unquoted $var → word splitting) is DELIBERATE across this codebase:
+# command strings like `${SSH_CMD} "echo ok"` and `${SCP_CMD} src dst` rely on
+# word-splitting to assemble the ssh/scp invocation. Quoting them breaks the
+# pipeline. Disabled globally (with this reason) rather than per-line.
+disable=SC2086
+
+# SC1091 — don't fail when a sourced file only exists on the TARGET at runtime
+# (e.g. /oem/palette-admin.env on the Kairos node, BCM env files in chroots).
+disable=SC1091
+
+# Severity is intentionally NOT set here — it's passed on the CLI
+# (`--severity=error` now, ratcheting toward `style`) so the gate can tighten
+# without editing this file. See Makefile `lint` target and .pre-commit-config.yaml.

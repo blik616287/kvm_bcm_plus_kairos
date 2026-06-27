@@ -13,7 +13,7 @@ if [ -f /etc/hostname ]; then
     EXPECTED=$(cat /etc/hostname | tr -d '[:space:]')
     CURRENT=$(hostname)
     if [ -n "$EXPECTED" ] && [ "$CURRENT" != "$EXPECTED" ]; then
-        hostnamectl set-hostname "$EXPECTED" 2>/dev/null || hostname "$EXPECTED"
+        hostnamectl set-hostname "$EXPECTED" 2> /dev/null || hostname "$EXPECTED"
         echo "bcm-compat: set hostname to $EXPECTED"
     fi
 fi

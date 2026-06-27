@@ -1,0 +1,67 @@
+---
+# pre-commit hooks. Tools are installed into the active environment (see plan
+# Part C tooling decision), so hooks call them via `repo: local` — guaranteeing
+# `pre-commit`, `make lint`, and CI all run the exact same binaries (no env skew).
+#
+# Gates match plan Part C.6: gitleaks BLOCKS from day one; shellcheck/shfmt are
+# scoped to real .sh files and ratchet via the severity flag; the .sh.j2 bridge
+# and ansible/checkov run on the relevant file globs.
+fail_fast: false
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '^(CanvOS/|build/|dist/|logs/)'
+      - id: end-of-file-fixer
+        exclude: '^(CanvOS/|build/|dist/|logs/)'
+      - id: check-merge-conflict
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+        exclude: '\.j2$|^(CanvOS/|build/|dist/|logs/)'
+
+  - repo: local
+    hooks:
+      # --- Secrets: blocking from day one, never baselined ---
+      - id: gitleaks
+        name: gitleaks (staged secret scan)
+        entry: gitleaks protect --staged --redact --config .gitleaks.toml
+        language: system
+        pass_filenames: false
+
+      # --- Bash: real .sh files (the .sh.j2 templates use the bridge below) ---
+      - id: shellcheck
+        name: shellcheck (real .sh files)
+        entry: shellcheck -x --severity=error
+        language: system
+        types: [shell]
+        exclude: '\.j2$|^(CanvOS/|build/|dist/|logs/)'
+      - id: shfmt
+        name: shfmt (format check)
+        entry: shfmt -i 4 -ci -bn -sr -d
+        language: system
+        types: [shell]
+        exclude: '\.j2$|^(CanvOS/|build/|dist/|logs/)'
+
+      # --- Bash inside Jinja templates: interim render+shellcheck bridge ---
+      - id: shellcheck-templates
+        name: shellcheck .sh.j2 templates (render bridge)
+        entry: scripts/shellcheck-templates.sh --severity=error
+        language: system
+        files: '\.sh\.j2$'
+        pass_filenames: false
+
+      # --- YAML / Ansible ---
+      - id: yamllint
+        name: yamllint
+        entry: yamllint -c .yamllint
+        language: system
+        types: [yaml]
+        exclude: '\.j2$|^(CanvOS/|build/|dist/|logs/)'
+      - id: ansible-lint
+        name: ansible-lint
+        entry: ansible-lint
+        language: system
+        pass_filenames: false
+        files: '^(playbooks/|roles/).*\.ya?ml$'

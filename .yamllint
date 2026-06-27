@@ -1,0 +1,35 @@
+---
+# yamllint configuration. Tuned for an Ansible repo with wide table-style vars.
+extends: default
+
+rules:
+  line-length:
+    max: 160
+    level: warning
+  truthy:
+    allowed-values: ["true", "false"]
+    check-keys: false        # Ansible uses yes/no in some module args
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable
+  braces:
+    max-spaces-inside: 1
+  octal-values:
+    forbid-implicit-octal: true   # catches `mode: 0755` footguns
+  # The inventory/defaults use DELIBERATE column alignment
+  # (`bcm_password:        "..."`) for readability — don't fight it.
+  colons: disable
+  document-start:
+    level: warning
+
+# Jinja2 templates are NOT valid YAML (even *.yaml.j2 carries {{ }}/{% %}),
+# and generated/vendored trees are out of scope.
+ignore: |
+  *.j2
+  **/*.j2
+  .github/
+  CanvOS/
+  build/
+  dist/
+  logs/
+  inventory/group_vars/all.yml     # gitignored, user-managed secrets file

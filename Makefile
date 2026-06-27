@@ -35,6 +35,46 @@ setup: ## Verify prerequisites (ansible, qemu, docker, sshpass, etc.)
 install-deps: ## Install all build dependencies
 	$(call run_playbook,install-dependencies)
 
+# ---- Code quality: lint / format / static analysis ----
+# Real .sh scripts shellcheck/shfmt directly; bash inside *.sh.j2 templates goes
+# through scripts/shellcheck-templates.sh (renders then shellchecks). Gates
+# ratchet via SHELLCHECK_SEVERITY (error -> warning -> style). See plan Part C.
+SHELLCHECK_SEVERITY ?= error
+SH_FILES = $(shell git ls-files '*.sh' | grep -v -E '^(CanvOS/|build/|dist/|logs/)')
+
+.PHONY: lint
+lint: ## Lint bash (.sh + .sh.j2), YAML, and Ansible
+	@mkdir -p $(LOGS_DIR)
+	@set -o pipefail; { \
+	  echo "== shellcheck (real .sh) =="; \
+	  test -z "$(SH_FILES)" || shellcheck -x --severity=$(SHELLCHECK_SEVERITY) $(SH_FILES); \
+	  echo "== shellcheck (.sh.j2 templates) =="; \
+	  scripts/shellcheck-templates.sh --severity=$(SHELLCHECK_SEVERITY); \
+	  echo "== yamllint =="; yamllint -c .yamllint . ; \
+	  echo "== ansible-lint =="; ansible-lint ; \
+	} 2>&1 | tee $(LOGS_DIR)/lint.log
+
+.PHONY: fmt
+fmt: ## Auto-format all real .sh scripts (shfmt, in place)
+	test -z "$(SH_FILES)" || shfmt -i 4 -ci -bn -sr -w $(SH_FILES)
+
+.PHONY: fmt-check
+fmt-check: ## Check .sh formatting without writing (CI/gate)
+	test -z "$(SH_FILES)" || shfmt -i 4 -ci -bn -sr -d $(SH_FILES)
+
+.PHONY: analyze
+analyze: ## Static analysis: secrets (gitleaks) + IaC (checkov) + Python (bandit/vulture)
+	@mkdir -p $(LOGS_DIR)
+	@set -o pipefail; { \
+	  echo "== gitleaks (BLOCKING) =="; gitleaks detect --config .gitleaks.toml --redact -v --no-banner; \
+	  echo "== checkov (soft-fail during rollout) =="; checkov --config-file .checkov.yaml || true; \
+	  echo "== bandit (Python; none yet) =="; bandit -r . -c pyproject.toml -q 2>/dev/null || true; \
+	} 2>&1 | tee $(LOGS_DIR)/analyze.log
+
+.PHONY: lint-fix
+lint-fix: fmt ## Apply safe auto-fixes (shfmt format; ansible-lint --fix)
+	ansible-lint --fix || true
+
 # ---- Discovery ----
 
 .PHONY: discover
