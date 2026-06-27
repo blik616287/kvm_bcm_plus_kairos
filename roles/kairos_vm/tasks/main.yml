@@ -65,30 +65,16 @@
   register: kvm_flag
   changed_when: false
 
+- name: Render the shared Kairos QEMU launcher
+  ansible.builtin.template:
+    src: kairos-qemu.sh.j2
+    dest: "{{ build_dir }}/kairos-qemu-{{ kairos_vm_slug }}.sh"
+    mode: "0755"
+
 - name: Launch Kairos compute VM (PXE boot, OVMF/UEFI)
-  ansible.builtin.shell: |
-    > "{{ kairos_serial_log }}"
-    OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
-    [ -f "$OVMF_CODE" ] || OVMF_CODE=/usr/share/qemu/OVMF.fd
-    qemu-system-x86_64 \
-      {{ kvm_flag.stdout }} \
-      -m {{ kairos_vm_ram }} \
-      -smp {{ kairos_vm_cpus }} \
-      -cpu host \
-      -machine q35 \
-      -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
-      -drive if=pflash,format=raw,file="{{ kairos_ovmf_vars }}" \
-      -name "{{ kairos_vm_name }}" \
-      -display {{ qemu_display_type.stdout }} \
-      -drive file="{{ kairos_disk }}",format=qcow2,if=virtio \
-      -netdev socket,id=intnet,connect=:31337 \
-      -device virtio-net-pci,netdev=intnet,mac={{ kairos_vm_mac }} \
-      -chardev socket,id=ser0,host=localhost,port={{ kairos_vm_serial_port }},server=on,wait=off,telnet=on,logfile="{{ kairos_serial_log }}" \
-      -serial chardev:ser0 \
-      -pidfile "{{ kairos_pid_file }}" \
-      -no-reboot \
-      -daemonize \
-      -boot order=cn
+  # order=cn = PXE then disk; -no-reboot powers the VM off after dd so the
+  # play can detect install completion.
+  ansible.builtin.command: "{{ build_dir }}/kairos-qemu-{{ kairos_vm_slug }}.sh order=cn -no-reboot"
 
 - name: Display Kairos VM info
   ansible.builtin.debug:
@@ -158,35 +144,14 @@
 # kairos user or sshd. kairos-agent already set the default GRUB entry to the
 # active "Palette eXtended Kubernetes Edge" image during install, so the NEXT
 # boot comes up healthy. We therefore reset the VM once if the first boot stalls.
-- name: Compose Kairos disk-boot command
+- name: Compose Kairos disk-boot command (reuses the shared launcher, boot=c)
   when: kairos_vm_wait | default(true) | bool
   ansible.builtin.set_fact:
-    kairos_disk_boot_cmd: |
-      > "{{ kairos_serial_log }}"
-      OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
-      [ -f "$OVMF_CODE" ] || OVMF_CODE=/usr/share/qemu/OVMF.fd
-      qemu-system-x86_64 \
-        {{ kvm_flag.stdout }} \
-        -m {{ kairos_vm_ram }} \
-        -smp {{ kairos_vm_cpus }} \
-        -cpu host \
-        -machine q35 \
-        -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
-        -drive if=pflash,format=raw,file="{{ kairos_ovmf_vars }}" \
-        -name "{{ kairos_vm_name }}" \
-        -display {{ qemu_display_type.stdout }} \
-        -drive file="{{ kairos_disk }}",format=qcow2,if=virtio \
-        -netdev socket,id=intnet,connect=:31337 \
-        -device virtio-net-pci,netdev=intnet,mac={{ kairos_vm_mac }} \
-        -chardev socket,id=ser0,host=localhost,port={{ kairos_vm_serial_port }},server=on,wait=off,telnet=on,logfile="{{ kairos_serial_log }}" \
-        -serial chardev:ser0 \
-        -pidfile "{{ kairos_pid_file }}" \
-        -daemonize \
-        -boot c
+    kairos_disk_boot_cmd: "{{ build_dir }}/kairos-qemu-{{ kairos_vm_slug }}.sh c"
 
 - name: Start Kairos VM from disk (OVMF/UEFI, reuses vars with Kairos boot entry)
   when: kairos_vm_wait | default(true) | bool
-  ansible.builtin.shell: "{{ kairos_disk_boot_cmd }}"
+  ansible.builtin.command: "{{ kairos_disk_boot_cmd }}"
 
 - name: Wait for Kairos to fully boot (reset past stylus.registration first-boot if needed)
   when: kairos_vm_wait | default(true) | bool
@@ -211,7 +176,7 @@
       changed_when: false
 
     - name: Re-launch Kairos VM from disk (active entry)
-      ansible.builtin.shell: "{{ kairos_disk_boot_cmd }}"
+      ansible.builtin.command: "{{ kairos_disk_boot_cmd }}"
 
     - name: Wait for Kairos to fully boot after reset (up to 10 min)
       ansible.builtin.shell: "{{ build_dir }}/wait-kairos-boot.sh"
