@@ -24,7 +24,7 @@ The node is running the **BCM installer image** — `<profile>-installer`, which
 
 ## The intended flow (and where it stalled)
 
-From `roles/deploy_dd/templates/deploy-dd.sh.j2:256–284`, `deploy-dd`:
+From the `deploy_dd` role (`tasks/installer_image.yml`), `deploy-dd`:
 - copies `install-kairos.sh` into the installer image at `/usr/local/sbin/install-kairos.sh`, and
 - installs + enables a systemd unit **`kairos-install.service`**
   (`Type=oneshot`, `ExecStartPre=sleep 10`, `ExecStart=/usr/local/sbin/install-kairos.sh`, `TimeoutStartSec=1800`, `WantedBy=multi-user.target`).

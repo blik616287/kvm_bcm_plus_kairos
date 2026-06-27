@@ -57,8 +57,8 @@ Where a stage, role, or code path is mode-specific it is called out explicitly.
 
 Three places build their own per-run SSH config file in `build/` or the repo root and route all traffic through it:
 
-- `roles/deploy_dd/templates/deploy-dd.sh.j2` → `build/.bcm-ssh-config` (stage 4)
-- `roles/validate/templates/validate.sh.j2` → `build/.bcm-ssh-config` (stage 6)
+- `roles/deploy_dd/tasks/*.yml` (native Ansible; rearchitected from deploy-dd.sh.j2, IN-2292)
+- `roles/validate/tasks/*.yml` + `report.j2` (native Ansible; rearchitected from validate.sh.j2, IN-2293)
 - `playbooks/discover-bcm.yml` → `.discover-ssh-config` (top-level, cleaned up at end)
 
 The template is:
@@ -456,7 +456,7 @@ At the end, `build/` ownership is restored to the invoking user (ansible.cfg has
 ## 6. Stage 4 — Deploy DD
 
 **Role:** `roles/deploy_dd/tasks/main.yml`
-**Templates:** `deploy-dd.sh.j2`, `install-kairos.sh.j2`
+**Files:** `roles/deploy_dd/tasks/*.yml` (native Ansible), `templates/install-kairos.sh.j2`
 **Produces:** on BCM: populated `<profile>-installer` software image, `<profile>` cmsh category, target device in FULL install mode, `/cm/shared/kairos/<profile>/disk.raw.lz4`, `kairos-http.service` (single, profile-agnostic, serves `/cm/shared/kairos/`), DHCP/NFS/rsyncd config, NAT rule. Locally: `build/deploy-dd.sh`, `build/install-kairos.sh`, `build/.bcm-ssh-config`
 **Duration:** ~3–5 minutes
 **Mode:** both. This is the stage where remote-BCM and local-KVM diverge in policy (safety flags) but share the same template.
@@ -755,7 +755,7 @@ During this window the Kairos boot stages (§5.7) run: hostname, Palette site na
 ## 8. Stage 6 — Validate
 
 **Role:** `roles/validate/tasks/main.yml`
-**Template:** `roles/validate/templates/validate.sh.j2`
+**Files:** `roles/validate/tasks/*.yml` + `templates/report.j2` (native Ansible)
 **Duration:** ~15 seconds
 **Mode:** both. The template is parameterized by `bcm_target_node` (defaulting to `node001` for local-KVM) and by the same jumphost SSH config pattern as deploy-dd.
 
@@ -829,7 +829,7 @@ Two safety flags in `inventory/group_vars/all.yml` gate the only operations that
 
 Beyond these flags, `deploy-dd` is additive: it creates a *new* `kairos` category (cloned from `bcm_source_category`, inheriting site-specific disksetup / FinalizeXML) and moves exactly one device — `bcm_target_node` — into it. Moving the device back to its original category and re-PXE'ing reverts it to standard HPC provisioning.
 
-When modifying `deploy_dd/templates/deploy-dd.sh.j2`, preserve both properties: no cluster-wide writes outside the two gates, and the only cmsh device touched is `bcm_target_node`.
+When modifying the `deploy_dd` role (now native Ansible tasks), preserve both properties: no cluster-wide writes outside the two gates, and the only cmsh device touched is `bcm_target_node`.
 
 ### 9.2 UEFI raw image + post-`dd` efibootmgr
 

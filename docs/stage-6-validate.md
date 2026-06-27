@@ -1,13 +1,15 @@
 # Stage 6 — `validate`
 
-~40 health checks over SSH — the BCM head node **and** the booted Kairos node — printing `PASS` / `WARN` / `FAIL` and a tally. Exits non-zero if any `FAIL`. This is the closest thing to a test suite; it's also how you confirm a node actually became Kairos.
+~30 health checks — the BCM head node **and** the booted Kairos node — printing `PASS` / `WARN` / `FAIL` and a tally. Exits non-zero if any `FAIL`. This is the closest thing to a test suite; it's also how you confirm a node actually became Kairos.
+
+> **Rearchitected to native Ansible (IN-2293).** This stage used to render one 303-line `validate.sh`; it's now `roles/validate/tasks/*.yml` — BCM checks run as delegated tasks, each records a `{name, status, detail}` result, and `templates/report.j2` renders the PASS/WARN/FAIL summary (gated by an `assert`). The Kairos node (password-only) is checked via the BCM.
 
 | | |
 |---|---|
 | **Playbook / role** | `playbooks/06-validate.yml` → `roles/validate` |
 | **Target** | `make validate` |
 | **Modes** | local-KVM **and** remote-BCM |
-| **Key template** | `roles/validate/templates/validate.sh.j2` |
+| **Key files** | `roles/validate/tasks/*.yml` + `templates/report.j2` (native Ansible) |
 
 ## Run it
 ```bash
@@ -53,7 +55,7 @@ OS = Ubuntu …  Kernel = 6.8.0-51-generic
 **`[WARN] Palette registration — no API key set`** is **expected** when `palette_api_key` is empty (the minimal local-KVM config) — not a failure.
 
 ## Logging
-`logs/06-validate.log` (Ansible run + the full printed report) · `build/validate.sh` (the exact rendered checks).
+`logs/06-validate.log` + `logs/run-<ts>/06-validate.ansible.log` (the full per-task run incl. the printed report). Pull on-target logs with `make collect-logs`.
 
 ## Troubleshooting
 

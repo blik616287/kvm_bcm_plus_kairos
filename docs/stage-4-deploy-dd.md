@@ -1,13 +1,15 @@
 # Stage 4 — `deploy-dd`
 
-Configures the BCM head node to PXE-install Kairos onto a target node via whole-disk `dd`. Renders `build/deploy-dd.sh` and runs it over SSH against BCM. **Always re-runs** (idempotent), so it's the stage you re-run after almost any change.
+Configures the BCM head node to PXE-install Kairos onto a target node via whole-disk `dd`. The BCM is registered as an Ansible managed host (`add_host`) and configured via native delegated tasks (one per `[N/7]` step). **Always re-runs** (idempotent), so it's the stage you re-run after almost any change.
+
+> **Rearchitected to native Ansible (IN-2292).** This stage used to render one 417-line `deploy-dd.sh` and run it over SSH; it's now `roles/deploy_dd/tasks/*.yml` delegated to the BCM. The step-by-step flow below is still accurate conceptually; the implementation is idempotent tasks, not a bash script.
 
 | | |
 |---|---|
 | **Playbook / role** | `playbooks/04-deploy-dd.yml` → `roles/deploy_dd` |
 | **Target** | `make deploy-dd` |
 | **Modes** | local-KVM **and** remote-BCM |
-| **Key templates** | `deploy-dd.sh.j2` (BCM-side setup) · `install-kairos.sh.j2` (runs on the node) |
+| **Key files** | `roles/deploy_dd/tasks/*.yml` (BCM-side, native Ansible) · `templates/install-kairos.sh.j2` (dd-installer, runs on the node) |
 
 ## What it does (on BCM, in order)
 
