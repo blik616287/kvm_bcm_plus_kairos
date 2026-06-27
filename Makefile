@@ -172,14 +172,17 @@ all: ## Run full pipeline (stages 1-6)
 
 .PHONY: bcm-stop
 bcm-stop: ## Stop BCM VM
-	@PID=$$(cat build/.bcm-qemu.pid 2>/dev/null) && kill $$PID 2>/dev/null || true
-	@ps aux | grep '[q]emu-system.*BCM-HeadNode' | awk '{print $$2}' | xargs -r kill 2>/dev/null || true
+	@# qemu is launched via Ansible become (root-owned), so the kill needs sudo —
+	@# a bare user kill silently fails with "operation not permitted". The pkill
+	@# is anchored at ^qemu-system so it never matches the shell running it.
+	@PID=$$(cat build/.bcm-qemu.pid 2>/dev/null) && sudo kill $$PID 2>/dev/null || true
+	@sudo pkill -f '^qemu-system.*BCM-HeadNode' 2>/dev/null || true
 	@echo "BCM VM stopped"
 
 .PHONY: kairos-stop
 kairos-stop: ## Stop Kairos compute VM
-	@PID=$$(cat build/.kairos-qemu.pid 2>/dev/null) && kill $$PID 2>/dev/null || true
-	@ps aux | grep '[q]emu-system.*Kairos-ComputeNode' | awk '{print $$2}' | xargs -r kill 2>/dev/null || true
+	@PID=$$(cat build/.kairos-qemu.pid 2>/dev/null) && sudo kill $$PID 2>/dev/null || true
+	@sudo pkill -f '^qemu-system.*Kairos-ComputeNode' 2>/dev/null || true
 	@echo "Kairos VM stopped"
 
 .PHONY: stop
@@ -202,7 +205,10 @@ collect-logs: ## Pull BCM + Kairos on-target logs into logs/collected/ (troubles
 # ---- Cleanup ----
 
 .PHONY: clean
-clean: ## Remove build/, logs/
+clean: ## Stop VMs, then remove build/, logs/
+	@# Stop VMs FIRST — otherwise removing build/ deletes the pid files and orphans
+	@# any running VM (no pid file left to kill it by). Same order teardown uses.
+	@$(MAKE) --no-print-directory stop
 	ansible localhost -m file -a "path=$(E2E_DIR)/build state=absent" --become
 	ansible localhost -m file -a "path=$(E2E_DIR)/logs state=absent" --become
 
