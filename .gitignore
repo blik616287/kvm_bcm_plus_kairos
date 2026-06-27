@@ -57,3 +57,7 @@ inventory/group_vars/all.yml
 bcm-discovery-*.yml
 
 *.customer-backup
+
+# --- Scratch / local artifacts (never commit) ---
+*.mov
+Untitled
