@@ -6,19 +6,34 @@
     e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
     build_dir: "{{ e2e_dir }}/build"
   tasks:
-    - name: Kill BCM VM
-      ansible.builtin.shell: |
-        PID=$(cat {{ build_dir }}/.bcm-qemu.pid 2>/dev/null) && kill $PID 2>/dev/null || true
+    # One loop over every *-qemu.pid (was two hardcoded kill tasks) — this also
+    # catches a second/third compute node (node002 -> .node002-qemu.pid), which
+    # the old fixed list missed (plan C.4 #7).
+    - name: Find all VM pid files (BCM + every compute node)
+      ansible.builtin.find:
+        paths: "{{ build_dir }}"
+        patterns: ['.*-qemu\.pid$']
+        use_regex: true
+        hidden: true
+      register: vm_pids
+      failed_when: false
+
+    - name: Kill each VM by its recorded pid
+      ansible.builtin.shell: "kill $(cat {{ item.path }}) 2> /dev/null || true"
+      loop: "{{ vm_pids.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
       changed_when: false
       failed_when: false
 
-    - name: Kill Kairos VM
-      ansible.builtin.shell: |
-        PID=$(cat {{ build_dir }}/.kairos-qemu.pid 2>/dev/null) && kill $PID 2>/dev/null || true
+    # Catch-all for VMs whose pid file was lost. `^qemu-system` anchors to real
+    # QEMU processes so pkill never matches the shell running it.
+    - name: Kill any orphaned BCM/Kairos QEMU processes by name
+      ansible.builtin.shell: "pkill -f '^qemu-system.*(BCM-HeadNode|Kairos-ComputeNode)' 2> /dev/null || true"
       changed_when: false
       failed_when: false
 
-    - name: Remove build artifacts
+    - name: Remove build artifacts + logs
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
