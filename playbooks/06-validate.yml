@@ -1,10 +1,13 @@
 ---
-- name: "Stage 6: Validation"
+- name: "Stage 6: Validation (native Ansible)"
   hosts: localhost
   gather_facts: true
   vars:
     e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
     build_dir: "{{ e2e_dir }}/build"
     dist_dir: "{{ e2e_dir }}/dist"
+  pre_tasks:
+    - name: Register the BCM as a managed host
+      ansible.builtin.import_tasks: tasks/add_bcm_host.yml
   roles:
     - validate

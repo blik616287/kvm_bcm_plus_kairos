@@ -1,0 +1,116 @@
+---
+# bcm.yml — BCM head-node checks. Each block gathers data (delegated to the BCM)
+# then appends {name, status, detail} dicts to validate_results.
+
+- name: BCM — service active states
+  ansible.builtin.command: "systemctl is-active {{ item }}"
+  loop: [cmd, dhcpd, named, nfs-server]
+  delegate_to: bcm
+  register: v_bcm_svc
+  changed_when: false
+  failed_when: false
+
+- name: Record BCM service results
+  ansible.builtin.set_fact:
+    validate_results: "{{ validate_results + [_r] }}"
+  loop: "{{ v_bcm_svc.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    _r:
+      name: "BCM service: {{ item.item }}"
+      status: "{{ 'PASS' if (item.stdout | trim) == 'active' else 'FAIL' }}"
+      detail: "{{ item.stdout | trim }}"
+
+- name: BCM — listening ports (rsyncd, image HTTP)
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: "ss -tlnH | awk '{print $4}' | grep -qE '[:.]{{ item.port }}$' && echo up || echo down"
+  loop:
+    - { name: "rsyncd (873)", port: 873, miss: WARN }
+    - { name: "image HTTP server (8888)", port: 8888, miss: FAIL }
+  delegate_to: bcm
+  register: v_bcm_ports
+  changed_when: false
+
+- name: Record BCM port results
+  ansible.builtin.set_fact:
+    validate_results: "{{ validate_results + [_r] }}"
+  loop: "{{ v_bcm_ports.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  vars:
+    _r:
+      name: "{{ item.item.name }}"
+      status: "{{ 'PASS' if (item.stdout | trim) == 'up' else item.item.miss }}"
+      detail: "{{ item.stdout | trim }}"
+
+- name: BCM — cmsh device list
+  ansible.builtin.command: cmsh -c "device; list"
+  delegate_to: bcm
+  register: v_devices
+  changed_when: false
+
+- name: BCM — target node category
+  ansible.builtin.command: cmsh -c "device; use {{ v_target_node }}; get category"
+  delegate_to: bcm
+  register: v_node_cat
+  changed_when: false
+  failed_when: false
+
+- name: Record BCM cluster results
+  ansible.builtin.set_fact:
+    validate_results: "{{ validate_results + _items }}"
+  vars:
+    _items:
+      - name: "BCM head node UP (cmsh)"
+        status: "{{ 'PASS' if 'UP' in v_devices.stdout else 'FAIL' }}"
+        detail: ""
+      - name: "{{ v_target_node }} registered"
+        status: "{{ 'PASS' if v_target_node in v_devices.stdout else 'FAIL' }}"
+        detail: ""
+      - name: "{{ v_target_node }} category"
+        status: "{{ 'PASS' if (v_node_cat.stdout | trim) == kairos_profile else 'FAIL' }}"
+        detail: "{{ v_node_cat.stdout | trim }}"
+
+- name: BCM — installer image + raw image present
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop:
+    - "/cm/images/{{ kairos_profile }}-installer"
+    - "/cm/shared/kairos/{{ kairos_profile }}/disk.raw.lz4"
+  delegate_to: bcm
+  register: v_bcm_files
+
+- name: Record BCM artifact results
+  ansible.builtin.set_fact:
+    validate_results: "{{ validate_results + [_r] }}"
+  loop: "{{ v_bcm_files.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    _r:
+      name: "{{ 'installer image' if '-installer' in item.item else 'Kairos raw image' }}"
+      status: "{{ 'PASS' if item.stat.exists else 'FAIL' }}"
+      detail: "{{ item.item }}"
+
+- name: BCM — internet reachability (soft)
+  ansible.builtin.uri:
+    url: https://google.com
+    method: HEAD
+    status_code: [200, 301, 302]
+    validate_certs: false
+    timeout: 20
+  delegate_to: bcm
+  register: v_bcm_inet
+  failed_when: false
+
+- name: Record BCM internet result
+  ansible.builtin.set_fact:
+    validate_results: "{{ validate_results + [_r] }}"
+  vars:
+    _r:
+      name: "BCM internet access"
+      status: "{{ 'PASS' if (v_bcm_inet.status | default(0)) in [200, 301, 302] else 'WARN' }}"
+      detail: "HTTP {{ v_bcm_inet.status | default('timeout') }}"

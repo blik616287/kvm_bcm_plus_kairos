@@ -1,0 +1,22 @@
+---
+# report.yml — tally validate_results, print the report, assert no FAIL.
+
+- name: Compute validation tallies
+  ansible.builtin.set_fact:
+    v_pass: "{{ validate_results | selectattr('status', 'equalto', 'PASS') | list | length }}"
+    v_warn: "{{ validate_results | selectattr('status', 'equalto', 'WARN') | list | length }}"
+    v_fail: "{{ validate_results | selectattr('status', 'equalto', 'FAIL') | list | length }}"
+
+- name: Print the validation report
+  ansible.builtin.debug:
+    msg: "{{ lookup('template', 'report.j2').split('\n') }}"
+
+- name: Assert no validation failures
+  ansible.builtin.assert:
+    that: v_fail | int == 0
+    fail_msg: >-
+      {{ v_fail }} validation check(s) FAILED:
+      {{ validate_results | selectattr('status', 'equalto', 'FAIL') | map(attribute='name') | join(', ') }}
+    success_msg: >-
+      Validation passed: {{ v_pass }} PASS / {{ v_warn }} WARN / 0 FAIL
+      ({{ validate_results | length }} checks).

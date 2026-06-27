@@ -1,0 +1,64 @@
+---
+# kairos.yml — Kairos compute-node checks. The node is password-only and reachable
+# only through the BCM, so each check runs ON the BCM (delegate_to: bcm) and sshes
+# into the node. Each remote command is base64-encoded to avoid nested-quoting,
+# then decoded + run on the node. Results are recorded into validate_results.
+
+- name: Kairos — run all node checks via the BCM
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: '{{ kairos_ssh }} "echo {{ item.cmd | b64encode }} | base64 -d | bash"'
+  delegate_to: bcm
+  loop:
+    - { key: ssh, cmd: "echo CONNECTED" }
+    - { key: os, cmd: "grep '^PRETTY_NAME' /etc/os-release | cut -d'\"' -f2" }
+    - { key: release, cmd: "grep KAIROS_VERSION /etc/kairos-release | head -1 | cut -d= -f2" }
+    - { key: agent, cmd: "kairos-agent version 2>/dev/null | head -1" }
+    - { key: kernel, cmd: "uname -r" }
+    - { key: ip, cmd: "ip -4 addr show | awk '/inet / && $2 !~ /^127/ {print $2; exit}'" }
+    - { key: gateway, cmd: "ip route | awk '/^default/ {print $3; exit}'" }
+    - { key: dns, cmd: "awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf" }
+    - { key: stylus, cmd: "systemctl is-active stylus-agent" }
+    - { key: cmdline, cmd: "cat /proc/cmdline" }
+    - { key: cos_oem, cmd: "sudo blkid -L COS_OEM" }
+    - { key: cos_recovery, cmd: "sudo blkid -L COS_RECOVERY" }
+    - { key: cos_state, cmd: "sudo blkid -L COS_STATE" }
+    - { key: cos_persistent, cmd: "sudo blkid -L COS_PERSISTENT" }
+    - { key: root, cmd: "mount | grep ' / ' | head -1" }
+    - { key: oem, cmd: "ls /oem/*.yaml 2>/dev/null | head -1" }
+    - { key: palette, cmd: "journalctl -u stylus-agent --no-pager 2>/dev/null | grep -c 'registering edge host'" }
+  loop_control:
+    label: "{{ item.key }}"
+  register: v_kairos
+  changed_when: false
+  failed_when: false
+
+- name: Index Kairos check output + rc by key
+  ansible.builtin.set_fact:
+    _ko: "{{ dict(v_kairos.results | map(attribute='item.key') | zip(v_kairos.results | map(attribute='stdout', default='') | map('trim'))) }}"
+    _kc: "{{ dict(v_kairos.results | map(attribute='item.key') | zip(v_kairos.results | map(attribute='rc', default=1))) }}"
+
+- name: Record Kairos check results
+  ansible.builtin.set_fact:
+    validate_results: "{{ validate_results + _items }}"
+  vars:
+    _reach: "{{ 'CONNECTED' in (_ko.ssh | default('')) }}"
+    _items:
+      - { name: "Kairos SSH", status: "{{ 'PASS' if _reach else 'FAIL' }}", detail: "{{ validate_kairos_ip }}" }
+      - { name: "OS", status: "{{ 'PASS' if (_ko.os | length > 0) else 'FAIL' }}", detail: "{{ _ko.os }}" }
+      - { name: "Kairos release", status: "{{ 'PASS' if (_ko.release | length > 0) else 'FAIL' }}", detail: "{{ _ko.release }}" }
+      - { name: "kairos-agent", status: "{{ 'PASS' if (_ko.agent | length > 0) else 'FAIL' }}", detail: "{{ _ko.agent }}" }
+      - { name: "Kernel", status: "{{ 'PASS' if (_ko.kernel | length > 0) else 'FAIL' }}", detail: "{{ _ko.kernel }}" }
+      - { name: "IP address", status: "{{ 'PASS' if (_ko.ip | length > 0) else 'FAIL' }}", detail: "{{ _ko.ip }}" }
+      - { name: "Gateway", status: "{{ 'PASS' if (_ko.gateway | length > 0) else 'WARN' }}", detail: "{{ _ko.gateway }}" }
+      - { name: "DNS resolver", status: "{{ 'PASS' if (_ko.dns | length > 0) else 'WARN' }}", detail: "{{ _ko.dns }}" }
+      - { name: "stylus-agent", status: "{{ 'PASS' if (_ko.stylus == 'active') else 'WARN' }}", detail: "{{ _ko.stylus }}" }
+      - { name: "net.ifnames=0", status: "{{ 'PASS' if ('net.ifnames=0' in (_ko.cmdline | default(''))) else 'WARN' }}", detail: "" }
+      - { name: "Kairos boot chain", status: "{{ 'PASS' if (('rd.immucore' in (_ko.cmdline | default(''))) or ('rd.cos' in (_ko.cmdline | default('')))) else 'WARN' }}", detail: "" }
+      - { name: "COS_OEM", status: "{{ 'PASS' if (_kc.cos_oem == 0) else 'WARN' }}", detail: "{{ _ko.cos_oem }}" }
+      - { name: "COS_RECOVERY", status: "{{ 'PASS' if (_kc.cos_recovery == 0) else 'WARN' }}", detail: "{{ _ko.cos_recovery }}" }
+      - { name: "COS_STATE", status: "{{ 'PASS' if (_kc.cos_state == 0) else 'WARN' }}", detail: "{{ _ko.cos_state }}" }
+      - { name: "COS_PERSISTENT", status: "{{ 'PASS' if (_kc.cos_persistent == 0) else 'WARN' }}", detail: "{{ _ko.cos_persistent }}" }
+      - { name: "Root immutable (ro)", status: "{{ 'PASS' if (('ro,' in (_ko.root | default(''))) or ('ro ' in (_ko.root | default('')))) else 'WARN' }}", detail: "" }
+      - { name: "OEM cloud-config", status: "{{ 'PASS' if (_ko.oem | length > 0) else 'FAIL' }}", detail: "{{ _ko.oem }}" }
+      - { name: "Palette registration", status: "{{ 'PASS' if ((_ko.palette | default('0') | int) > 0) else 'WARN' }}", detail: "{{ 'registered (stylus log)' if ((_ko.palette | default('0') | int) > 0) else 'no registration log entries' }}" }
