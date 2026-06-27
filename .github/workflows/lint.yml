@@ -1,9 +1,12 @@
 ---
 name: lint
 
-# Static quality gates. Mirrors `make lint` / `make analyze` so a green local
-# run predicts a green PR. Gates are lax during rollout (plan Part C.6) and
-# ratchet over time; gitleaks is the one job that blocks from day one.
+# Static quality gates. Runs the SAME `make` targets with the SAME pinned tool
+# versions as a local checkout, so a green `make lint && make analyze && make
+# fmt-check` locally predicts a green CI (and vice-versa). No third-party
+# lint/secret actions — they drift from the CLIs developers actually run.
+# Gates are lax during rollout (plan Part C.6) and ratchet over time; gitleaks
+# (inside `make analyze`) blocks from day one.
 on:
   pull_request:
   push:
@@ -13,65 +16,34 @@ permissions:
   contents: read
 
 jobs:
-  bash:
-    name: bash (shellcheck + shfmt)
+  quality-gates:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install shellcheck + shfmt
+        with:
+          fetch-depth: 0          # full history for gitleaks (make analyze)
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools (pinned, matching local)
         run: |
+          set -euxo pipefail
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          pip install --quiet ansible ansible-lint yamllint checkov bandit vulture
           curl -fsSL -o /usr/local/bin/shfmt \
             https://github.com/mvdan/sh/releases/download/v3.10.0/shfmt_v3.10.0_linux_amd64
           sudo chmod +x /usr/local/bin/shfmt
-      - name: shellcheck (real .sh)
-        run: |
-          files=$(git ls-files '*.sh' | grep -v -E '^(CanvOS/|build/|dist/|logs/)' || true)
-          [ -z "$files" ] || shellcheck -x --severity=error $files
-      - name: shfmt (format check)
-        run: |
-          files=$(git ls-files '*.sh' | grep -v -E '^(CanvOS/|build/|dist/|logs/)' || true)
-          [ -z "$files" ] || shfmt -i 4 -ci -bn -sr -d $files
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          shellcheck --version; shfmt --version; gitleaks version
 
-  yaml-ansible:
-    name: yaml + ansible
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install --quiet ansible-lint yamllint
-      - run: yamllint -c .yamllint .
-      - run: ansible-lint
+      - name: make fmt-check
+        run: make fmt-check
 
-  templates:
-    name: sh.j2 template lint (render bridge)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          pip install --quiet ansible
-      - run: scripts/shellcheck-templates.sh --severity=error
+      - name: make lint
+        run: make lint
 
-  security:
-    name: secrets + IaC
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # full history for gitleaks
-      - name: gitleaks (blocking)
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITLEAKS_CONFIG: .gitleaks.toml
-      - name: checkov (soft-fail during rollout)
-        uses: bridgecrewio/checkov-action@v12
-        with:
-          framework: ansible
-          soft_fail: true
-          quiet: true
+      - name: make analyze
+        run: make analyze
