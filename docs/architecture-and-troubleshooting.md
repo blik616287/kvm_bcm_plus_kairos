@@ -248,7 +248,7 @@ OS = Ubuntu …  Kernel = 6.8.0-51-generic   (a BCM default-image kernel)
 
 ## 6. The on-node install (the crux): `install-kairos.sh`
 
-Triggered by **`kairos-install.service`** (`Type=oneshot`, `ExecStartPre=sleep 10`, `ExecStart=/usr/local/sbin/install-kairos.sh`, `TimeoutStartSec=1800`, enabled via `multi-user.target.wants` symlink — injected by `deploy-dd.sh.j2`).
+Triggered by **`kairos-install.service`** (`Type=oneshot`, `ExecStartPre=sleep 10`, `ExecStart=/usr/local/sbin/install-kairos.sh`, `TimeoutStartSec=1800`, enabled via `multi-user.target.wants` symlink — injected by the `deploy_dd` role (`tasks/installer_image.yml`)).
 
 ```mermaid
 flowchart TD
