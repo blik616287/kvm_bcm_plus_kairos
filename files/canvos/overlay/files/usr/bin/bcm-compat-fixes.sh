@@ -1,46 +1,46 @@
 #!/bin/bash
-# bcm-compat-fixes.sh — fixes for BCM provisioning compatibility
+# bcm-compat-fixes.sh — patch system files for BCM-provisioned Kairos.
 #
-# BCM provisions Kairos differently from the native Kairos installer.
-# Some system files need patching for BCM's environment.
+# BCM provisions Kairos differently from the native installer, so a few system
+# files need patching for BCM's environment. Every-boot fixes run each boot;
+# one-time fixes run once (guarded by a marker file).
 #
-# One-time fixes run once (marker file). Every-boot fixes run each boot.
+# Fail-OPEN (no `set -e`): a boot hook must never break the boot if a best-effort
+# fix doesn't apply. `set -u` only.
+set -u
 
-# ---- Every-boot fixes ----
+MARKER="/var/lib/bcm-compat-fixes.done"
 
-# Set hostname from /etc/hostname
+log() { echo "bcm-compat: $*"; }
+
+# ---- Every-boot: hostname from /etc/hostname ----
 if [ -f /etc/hostname ]; then
-    EXPECTED=$(cat /etc/hostname | tr -d '[:space:]')
-    CURRENT=$(hostname)
-    if [ -n "$EXPECTED" ] && [ "$CURRENT" != "$EXPECTED" ]; then
-        hostnamectl set-hostname "$EXPECTED" 2> /dev/null || hostname "$EXPECTED"
-        echo "bcm-compat: set hostname to $EXPECTED"
+    expected="$(tr -d '[:space:]' < /etc/hostname)"
+    if [ -n "$expected" ] && [ "$(hostname)" != "$expected" ]; then
+        hostnamectl set-hostname "$expected" 2> /dev/null || hostname "$expected"
+        log "set hostname to $expected"
     fi
 fi
 
-# ---- One-time fixes ----
+# ---- One-time fixes (marker-guarded) ----
+[ -f "$MARKER" ] && exit 0
 
-MARKER="/var/lib/bcm-compat-fixes.done"
-if [ -f "$MARKER" ]; then
-    exit 0
-fi
-
-# Fix resolved hook: uses 'return' outside a function, crashes networking.service
+# Fix resolved hook: a bare `return` outside a function crashes networking.service.
 RESOLVED="/etc/network/if-up.d/resolved"
 if [ -f "$RESOLVED" ] && grep -q '^        return$' "$RESOLVED"; then
     sed -i 's/^        return$/        exit 0/' "$RESOLVED"
-    echo "bcm-compat: fixed resolved hook (return -> exit 0)"
+    log "fixed resolved hook (return -> exit 0)"
 fi
 
-# Fix resolv.conf: Kairos ships a symlink to systemd-resolved's stub resolver.
-# BCM masks systemd-resolved, leaving a dead symlink and no DNS.
-# Replace with a file that lets DHCP (dhclient) manage it directly.
+# Fix resolv.conf: Kairos ships a symlink to systemd-resolved's stub resolver;
+# BCM masks systemd-resolved, leaving a dead symlink and no DNS. Replace with a
+# plain file that DHCP (dhclient) manages directly.
 if [ -L /etc/resolv.conf ] && [ ! -e /etc/resolv.conf ]; then
     rm -f /etc/resolv.conf
-    # Use head node as fallback; dhclient will overwrite on lease renewal
+    # Head-node fallback; dhclient overwrites this on lease renewal.
     echo "nameserver 10.141.255.254" > /etc/resolv.conf
-    echo "bcm-compat: fixed resolv.conf (replaced dead symlink)"
+    log "fixed resolv.conf (replaced dead symlink)"
 fi
 
 touch "$MARKER"
-echo "bcm-compat: one-time fixes applied"
+log "one-time fixes applied"
