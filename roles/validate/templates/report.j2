@@ -1,0 +1,11 @@
+============================================
+ E2E Deployment Validation
+ BCM {{ bcm_ssh_host | default('localhost') }}:{{ bcm_ssh_port }}  |  Kairos {{ validate_kairos_ip | default('?') }}  |  profile {{ kairos_profile }}
+============================================
+{% for r in validate_results %}
+  [{{ "%-4s" | format(r.status) }}] {{ r.name }}{% if r.detail %} — {{ r.detail }}{% endif %}
+
+{% endfor %}
+--------------------------------------------
+ PASS: {{ v_pass }}   WARN: {{ v_warn }}   FAIL: {{ v_fail }}   (total {{ validate_results | length }})
+============================================

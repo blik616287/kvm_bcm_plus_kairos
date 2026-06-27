@@ -1,27 +1,61 @@
 ---
-# validate — Run comprehensive validation on Kairos node via BCM jump host.
+# validate — comprehensive deployment validation as native Ansible. The BCM is
+# a delegated managed host (add_bcm_host.yml); the Kairos node is reached as a
+# managed host too, proxied through the BCM. Each check registers a result into
+# validate_results; report.yml renders a PASS/WARN/FAIL summary and asserts no
+# FAIL (the make-validate gate).
 
-- name: Set BCM connection facts
+- name: Initialize the results accumulator
   ansible.builtin.set_fact:
-    ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
-    bcm_ssh_port: "{{ bcm_ssh_port }}"
+    validate_results: []
+    v_target_node: "{{ bcm_target_node | default(kairos_node_name | default('node001', true), true) }}"
 
-- name: Render validate script
-  ansible.builtin.template:
-    src: validate.sh.j2
-    dest: "{{ build_dir }}/validate.sh"
-    mode: "0755"
+- name: Run the BCM-side checks
+  ansible.builtin.import_tasks: bcm.yml
 
-- name: Run validation
-  ansible.builtin.shell: "{{ build_dir }}/validate.sh 2>&1 | tee {{ build_dir }}/validate.log"
-  register: validate_result
-  failed_when: false
+# ---- Discover the Kairos node IP, then register it as a proxied managed host ----
+- name: Look up the Kairos node IP from cmsh
+  ansible.builtin.command: cmsh -c "device; use {{ v_target_node }}; get ip"
+  delegate_to: bcm
+  register: v_node_ip
+  changed_when: false
 
-- name: Print validation results
-  ansible.builtin.debug:
-    msg: "{{ validate_result.stdout_lines }}"
+- name: Fall back to the BOOTIF interface IP when the device IP is 0.0.0.0
+  ansible.builtin.command: cmsh -c "device; use {{ v_target_node }}; interfaces; use BOOTIF; get ip"
+  delegate_to: bcm
+  register: v_bootif_ip
+  changed_when: false
+  when: (v_node_ip.stdout | trim) in ['', '0.0.0.0']
 
-- name: Validation failed
-  ansible.builtin.fail:
-    msg: "Validation had failures — check build/validate.log"
-  when: validate_result.rc != 0
+- name: Resolve the effective Kairos IP
+  ansible.builtin.set_fact:
+    validate_kairos_ip: >-
+      {{ (v_bootif_ip.stdout | trim)
+         if (v_node_ip.stdout | trim) in ['', '0.0.0.0']
+         else (v_node_ip.stdout | trim) }}
+
+- name: Refuse to probe an IP that would loop back to the BCM/localhost
+  ansible.builtin.assert:
+    that: validate_kairos_ip not in ['', '0.0.0.0', '127.0.0.1', '::1', bcm_internal_ip]
+    fail_msg: >-
+      Kairos IP resolved to '{{ validate_kairos_ip }}' — would loop back to BCM.
+      Check {{ v_target_node }}'s BOOTIF interface IP in cmsh.
+
+# The Kairos node is password-only and reachable only via the BCM. Ansible can't
+# natively proxy-password through a password jumphost, and injecting a key would
+# plant persistent access — so Kairos checks run AS commands ON the BCM that ssh
+# into the node (each sshpass is a single hop on the BCM, no fragile nesting).
+# kairos.yml uses `delegate_to: bcm` + `{{ kairos_ssh }} '<check>'`.
+- name: "Compose the BCM->Kairos ssh prefix (node has passwordless sudo)"
+  ansible.builtin.set_fact:
+    kairos_ssh: >-
+      sshpass -p kairos ssh -o StrictHostKeyChecking=no
+      -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+      kairos@{{ validate_kairos_ip }}
+  no_log: true
+
+- name: Run the Kairos-node checks
+  ansible.builtin.import_tasks: kairos.yml
+
+- name: Render the validation report + assert no failures
+  ansible.builtin.import_tasks: report.yml
