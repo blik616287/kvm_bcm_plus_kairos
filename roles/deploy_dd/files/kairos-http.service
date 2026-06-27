@@ -1,0 +1,12 @@
+[Unit]
+Description=Kairos image HTTP server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/cm/shared/kairos
+ExecStart=/usr/bin/python3 -m http.server 8888
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

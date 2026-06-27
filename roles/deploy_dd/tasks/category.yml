@@ -1,0 +1,88 @@
+---
+# category.yml — [6/7] configure the {{ kairos_profile }} category: clone it from
+# the source category, point it at the installer image in FULL install mode, and
+# scope out the health checks that don't fit an immutable-OS compute node.
+# Individual cmsh ops are best-effort; the load-bearing end-state (category ->
+# installer image) is asserted in ramdisk.yml.
+
+- name: Detect the installer image's kernel version
+  ansible.builtin.shell: ls "{{ dd_image_root }}/boot/vmlinuz-"* 2>/dev/null | head -1 | sed 's|.*/vmlinuz-||'
+  delegate_to: bcm
+  register: dd_kver
+  changed_when: false
+
+- name: Align the software image kernel version
+  when: dd_kver.stdout | trim | length > 0
+  delegate_to: bcm
+  block:
+    - name: Ensure lib/modules/<kver> exists in the image
+      ansible.builtin.file:
+        path: "{{ dd_image_root }}/lib/modules/{{ dd_kver.stdout | trim }}"
+        state: directory
+        mode: "0755"
+    - name: Set the software image kernel version
+      ansible.builtin.command: cmsh -c "softwareimage; use {{ dd_installer_image }}; set kernelversion {{ dd_kver.stdout | trim }}; commit"
+      changed_when: true
+      failed_when: false
+
+- name: Check whether the profile category exists
+  ansible.builtin.shell: cmsh -c "category; list" | grep -q '^{{ kairos_profile }}[[:space:]]'
+  delegate_to: bcm
+  register: dd_cat_exists
+  changed_when: false
+  failed_when: false
+
+- name: Clone the profile category from the source category
+  ansible.builtin.command: >-
+    cmsh -c "category; clone \"{{ bcm_source_category | default('default') }}\" {{ kairos_profile }}; commit"
+  delegate_to: bcm
+  when: dd_cat_exists.rc != 0
+  changed_when: true
+
+- name: Configure the profile category (image + FULL install mode)
+  ansible.builtin.command: 'cmsh -c "category; use {{ kairos_profile }}; {{ item }}; commit"'
+  loop:
+    - "set softwareimage {{ dd_installer_image }}"
+    - "set installmode FULL"
+    - "set newnodeinstallmode FULL"
+    - "set installbootrecord yes"
+  delegate_to: bcm
+  changed_when: true
+  failed_when: false
+
+- name: Set the category kernel parameters (serial console + stable NIC naming)
+  ansible.builtin.command: >-
+    cmsh -c "category; use {{ kairos_profile }}; set kernelparameters \"console=ttyS0,115200n8 net.ifnames=0 biosdevname=0\"; commit"
+  delegate_to: bcm
+  changed_when: true
+  failed_when: false
+
+- name: Strip fsmounts that don't apply to the immutable OS (/cm/shared, /home)
+  ansible.builtin.shell: |
+    if cmsh -c "category; use {{ kairos_profile }}; fsmounts; list" 2>/dev/null | grep -q " {{ item }} "; then
+      cmsh -c "category; use {{ kairos_profile }}; fsmounts; remove {{ item }}; commit"
+    fi
+  loop: ["/cm/shared", "/home"]
+  delegate_to: bcm
+  changed_when: true
+  failed_when: false
+
+- name: Exclude the profile category from incompatible health checks
+  ansible.builtin.shell: |
+    if ! cmsh -c "monitoring setup; use {{ item }}; nodeexecutionfilters; list" 2>/dev/null | grep -q 'exclude-{{ kairos_profile }}'; then
+      cmsh -c "monitoring setup; use {{ item }}; nodeexecutionfilters; add category exclude-{{ kairos_profile }}; set filteroperation Exclude; set categories {{ kairos_profile }}; commit"
+    fi
+  loop: [mounts, interfaces, ntp]
+  delegate_to: bcm
+  changed_when: true
+  failed_when: false
+
+- name: Set cluster-wide defaults (owned-BCM only)
+  ansible.builtin.command: 'cmsh -c "{{ item }}"'
+  loop:
+    - "partition; use base; set defaultcategory {{ kairos_profile }}; commit"
+    - "partition; use base; set nodebasename node; set nodedigits 3; commit"
+  delegate_to: bcm
+  when: bcm_manage_cluster_defaults | default(false) | bool
+  changed_when: true
+  failed_when: false

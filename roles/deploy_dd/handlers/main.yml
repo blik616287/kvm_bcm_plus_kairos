@@ -1,0 +1,15 @@
+---
+# deploy_dd handlers — all run on the BCM (delegated).
+
+- name: Restart dhcpd
+  ansible.builtin.systemd_service:
+    name: dhcpd
+    state: restarted
+  delegate_to: bcm
+
+- name: Restart rsync
+  ansible.builtin.systemd_service:
+    name: rsync
+    state: restarted
+    enabled: true
+  delegate_to: bcm

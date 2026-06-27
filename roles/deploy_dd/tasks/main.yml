@@ -1,48 +1,69 @@
 ---
-# deploy_dd — Upload raw image to BCM, configure installer + kairos category.
-# Runs on localhost, SSHes to BCM via port-forwarded SSH.
+# deploy_dd — push the Kairos raw image to the BCM and configure it for a
+# PXE + dd install. Native Ansible: the BCM is a delegated managed host
+# (playbooks/tasks/add_bcm_host.yml registers it as `bcm`), so every step below
+# is an idempotent, individually-logged task instead of a single 400-line bash
+# script rendered and run over ssh. Profile-namespaced so multiple profiles
+# (kairos_profile) coexist on one BCM.
 
-- name: Capture invoking user (to restore build/ ownership at end; ansible.cfg become=true)
+- name: Resolve deploy_dd facts
+  ansible.builtin.set_fact:
+    dd_installer_image: "{{ kairos_profile }}-installer"
+    dd_image_root: "/cm/images/{{ kairos_profile }}-installer"
+    dd_profile_share: "/cm/shared/kairos/{{ kairos_profile }}"
+    dd_raw_image: "{{ build_dir }}/{{ kairos_profile }}-disk.raw"
+    # The device to provision: an existing BCM device (bcm_target_node) on a
+    # remote/customer BCM, else the locally-registered node (node001).
+    dd_target_node: >-
+      {{ bcm_target_node
+         if (bcm_target_node | default('', true) | length > 0)
+         else (kairos_node_name | default('node001', true)) }}
+
+- name: Capture the invoking user (ansible.cfg become=true → restore build/ owner at end)
   ansible.builtin.command: whoami
-  register: invoking_user
   become: false
   changed_when: false
+  register: dd_invoker
 
-- name: Set BCM connection facts
-  ansible.builtin.set_fact:
-    ssh_opts: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
-    bcm_ssh_port: "{{ bcm_ssh_port }}"
-
-- name: Verify raw disk image exists for the configured profile
+- name: Verify the raw image exists for this profile (built by kairos_build)
   ansible.builtin.stat:
-    path: "{{ build_dir }}/{{ kairos_profile }}-disk.raw"
-  register: raw_image
-  failed_when: not raw_image.stat.exists
+    path: "{{ dd_raw_image }}"
+    get_checksum: false   # 80G file — don't sha1 it just to check existence
+  register: dd_raw_stat
+  failed_when: not dd_raw_stat.stat.exists
 
-- name: Render install-kairos.sh from template
-  ansible.builtin.template:
-    src: install-kairos.sh.j2
-    dest: "{{ build_dir }}/install-kairos.sh"
-    mode: "0755"
+- name: Wait for the BCM cmd daemon + cmsh to be ready
+  ansible.builtin.command: cmsh -c "device; list"
+  delegate_to: bcm
+  changed_when: false
+  register: dd_cmsh_ready
+  retries: 30
+  delay: 10
+  until: dd_cmsh_ready.rc == 0
 
-- name: Render deploy-dd.sh from template
-  ansible.builtin.template:
-    src: deploy-dd.sh.j2
-    dest: "{{ build_dir }}/deploy-dd.sh"
-    mode: "0755"
+# Each step file maps to one of the original script's [N/7] sections.
+- name: Configure BCM network egress (DNS + forwarding + NAT, owned-BCM only)
+  ansible.builtin.import_tasks: network.yml
+- name: Export image trees over NFS + align DHCP
+  ansible.builtin.import_tasks: nfs.yml
+- name: Upload the raw image + serve it over HTTP   # [1/7] + [2/7]
+  ansible.builtin.import_tasks: image_http.yml
+- name: Build the installer software image + dd service   # [3/7] + [4/7]
+  ansible.builtin.import_tasks: installer_image.yml
+- name: Prepare the PXE boot template + syslinux modules   # [5/7]
+  ansible.builtin.import_tasks: pxe.yml
+- name: Configure the profile category + health-check filters   # [6/7]
+  ansible.builtin.import_tasks: category.yml
+- name: Register / assign the target compute node
+  ansible.builtin.import_tasks: node.yml
+- name: Regenerate the installer ramdisk + verify   # [7/7]
+  ansible.builtin.import_tasks: ramdisk.yml
 
-- name: Run deploy-dd script
-  ansible.builtin.shell: "{{ build_dir }}/deploy-dd.sh"
-  environment:
-    PATH: "{{ ansible_facts['env']['PATH'] }}"
-  async: 3600
-  poll: 15
-
-- name: Restore ownership of build artifacts to invoking user
+- name: Restore build/ ownership to the invoking user
   ansible.builtin.file:
     path: "{{ build_dir }}"
     state: directory
-    owner: "{{ invoking_user.stdout }}"
-    group: "{{ invoking_user.stdout }}"
+    owner: "{{ dd_invoker.stdout }}"
+    group: "{{ dd_invoker.stdout }}"
     recurse: true
   become: true

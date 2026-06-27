@@ -1,0 +1,29 @@
+---
+# ramdisk.yml — [7/7] regenerate the installer ramdisk and ASSERT the category
+# ends up pointing at the installer image. This assertion is the load-bearing
+# end-state the old script only checked with a silent `|| true` (plan C.4 #3).
+
+- name: Regenerate the installer image ramdisk
+  ansible.builtin.command: cmsh -c "softwareimage; use {{ dd_installer_image }}; createramdisk -w"
+  delegate_to: bcm
+  changed_when: true
+
+- name: Re-affirm the category software image after ramdisk regen
+  ansible.builtin.command: cmsh -c "category; use {{ kairos_profile }}; set softwareimage {{ dd_installer_image }}; commit"
+  delegate_to: bcm
+  changed_when: true
+  failed_when: false
+
+- name: Read back the category software image
+  ansible.builtin.command: cmsh -c "category; use {{ kairos_profile }}; get softwareimage"
+  delegate_to: bcm
+  register: dd_final_img
+  changed_when: false
+
+- name: Assert the category points at the installer image
+  ansible.builtin.assert:
+    that: dd_installer_image in dd_final_img.stdout
+    fail_msg: >-
+      Category {{ kairos_profile }} softwareimage is
+      '{{ dd_final_img.stdout | trim }}', expected {{ dd_installer_image }}.
+    success_msg: "Category {{ kairos_profile }} -> {{ dd_installer_image }} (FULL install) confirmed."

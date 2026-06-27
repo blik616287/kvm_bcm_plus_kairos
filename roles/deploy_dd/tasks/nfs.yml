@@ -1,0 +1,89 @@
+---
+# nfs.yml — export the image trees to the provisioning network(s) and align the
+# DHCP pool. Exports are additive + idempotent; each profile's installer image
+# is exported separately so multiple profiles coexist.
+
+- name: Start the NFS export list with the BCM provisioning CIDR
+  ansible.builtin.set_fact:
+    dd_export_cidrs: ["{{ bcm_internal_cidr }}"]
+    dd_pool_prefix: "{{ bcm_internal_cidr.split('/')[0].rsplit('.', 1)[0] }}"
+
+# On a remote BCM the target device's BOOTIF interface can live on a different
+# internal network (a tenant VLAN reached via DHCP relay); export to that CIDR
+# too, or the cloud-config's NFS mount of /cm/images/default-image is refused
+# and the node never heartbeats back (BCM stays INSTALLER_UNREACHABLE).
+- name: Add the target node's BOOTIF network to the export list (targeted BCM)
+  when: bcm_target_node | default('', true) | length > 0
+  delegate_to: bcm
+  block:
+    - name: Look up the target node's BOOTIF network name
+      ansible.builtin.command: >-
+        cmsh -c 'device; use "{{ bcm_target_node }}"; interfaces; use BOOTIF; get network'
+      register: dd_target_net
+      changed_when: false
+      failed_when: false
+
+    - name: Look up that network's base address + prefix bits
+      ansible.builtin.command: "cmsh -c 'network; use {{ dd_target_net.stdout | trim }}; get {{ item }}'"
+      loop: [baseaddress, netmaskbits]
+      register: dd_target_netinfo
+      changed_when: false
+      failed_when: false
+      when: dd_target_net.stdout | trim | length > 0
+
+    - name: Append the target network CIDR if it differs from the provisioning CIDR
+      ansible.builtin.set_fact:
+        dd_export_cidrs: "{{ dd_export_cidrs + [_cidr] }}"
+      vars:
+        _cidr: "{{ (dd_target_netinfo.results[0].stdout | trim) }}/{{ (dd_target_netinfo.results[1].stdout | trim) }}"
+      when:
+        - dd_target_net.stdout | trim | length > 0
+        - (dd_target_netinfo.results[0].stdout | default('') | trim) | length > 0
+        - _cidr != bcm_internal_cidr
+
+# Add an export only if that (path, CIDR) isn't already exported — the BCM's cmd
+# autogenerates some (e.g. /cm/shared, tab-separated), so we match whitespace
+# robustly to avoid `exportfs: duplicated export entries`. The per-profile
+# installer image is exported later (installer_image.yml), after it's cloned.
+# /cm/shared stays rw+no_root_squash for parity (plan C.4 #5 = later tightening).
+- name: Ensure NFS export per (CIDR, filesystem) — skip if already exported
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -euo pipefail
+      if grep -qE "^{{ item.1.path | regex_escape }}[[:space:]]+{{ item.0 | regex_escape }}[(]" /etc/exports; then
+        echo NOOP
+      else
+        printf '%s %s(%s)\n' '{{ item.1.path }}' '{{ item.0 }}' '{{ item.1.opts }}' >> /etc/exports
+        echo ADDED
+      fi
+  loop: "{{ dd_export_cidrs | product(_exports) | list }}"
+  loop_control:
+    label: "{{ item.1.path }} -> {{ item.0 }}"
+  vars:
+    _exports:
+      - { path: /cm/images/default-image, opts: "ro,no_subtree_check,no_root_squash,async" }
+      - { path: /cm/shared, opts: "rw,no_subtree_check,no_root_squash,async" }
+  delegate_to: bcm
+  changed_when: "stdout is defined and 'ADDED' in stdout"
+
+- name: Make dhcpd authoritative
+  delegate_to: bcm
+  ansible.builtin.replace:
+    path: /etc/dhcpd.conf
+    regexp: 'not authoritative'
+    replace: 'authoritative'
+  failed_when: false
+  notify: Restart dhcpd
+
+- name: Point the DHCP pool at the provisioning network (.16–.250)
+  delegate_to: bcm
+  ansible.builtin.replace:
+    path: /etc/dhcpd.conf
+    regexp: 'range .*'
+    replace: "range {{ dd_pool_prefix }}.16 {{ dd_pool_prefix }}.250;"
+  failed_when: false
+  notify: Restart dhcpd
+
+- name: Apply NFS/DHCP changes now (don't wait for end-of-play flush)
+  ansible.builtin.meta: flush_handlers

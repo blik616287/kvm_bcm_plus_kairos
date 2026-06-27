@@ -1,0 +1,19 @@
+[Unit]
+Description=Install Kairos Raw Disk Image
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Brief settle before the installer runs (NICs/NFS up).
+ExecStartPre=/bin/bash -c 'sleep 10'
+ExecStart=/usr/local/sbin/install-kairos.sh
+TimeoutStartSec=1800
+StandardOutput=journal+console
+StandardError=journal+console
+# Keep the installer's mount namespace private so the dd'd partitions don't
+# leak automounts back into the live installer env (/dev/shm, /proc).
+MountFlags=private
+
+[Install]
+WantedBy=multi-user.target
