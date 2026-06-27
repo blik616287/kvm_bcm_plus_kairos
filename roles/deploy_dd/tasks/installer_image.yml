@@ -57,6 +57,13 @@
     mode: "0755"
   delegate_to: bcm
 
+- name: Stage run-dd.sh into the image (the dd program install-kairos copies to RAM)
+  ansible.builtin.copy:
+    src: run-dd.sh
+    dest: "{{ dd_image_root }}/usr/local/sbin/run-dd.sh"
+    mode: "0755"
+  delegate_to: bcm
+
 - name: Ensure the installer image brings up eth0/ens3 via DHCP
   ansible.builtin.blockinfile:
     path: "{{ dd_image_root }}/etc/network/interfaces"
