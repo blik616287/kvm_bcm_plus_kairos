@@ -1,25 +1,25 @@
 # ---------------------------------------------------------------------------
-# Example inventory. Copy to inventory/group_vars/all.yml (gitignored) and
-# fill in real values. Use `make discover` against an existing BCM to harvest
-# most of these (BCM internal IP, CIDR, internal NIC, external DNS, etc.) into
-# bcm-discovery-<bcm-hostname>.yml, then paste the suggested values here.
+# FULL variable reference — also the REMOTE / customer-BCM template.
+# Copy to inventory/group_vars/all.yml (gitignored) and fill in real values.
+# Use `make discover` against an existing BCM to harvest most of these (BCM
+# internal IP, CIDR, internal NIC, external DNS, etc.), then paste them here.
 #
-# Two deploy modes share this file:
-#  - Remote BCM   — typical customer site. Requires bcm_ssh_host + jumphost.
-#                   Stages 3, 4, 6 only. Safety flags must stay false.
-#  - Local KVM    — dev/demo. bcm_ssh_host=localhost, no jumphost. All 6
-#                   stages run; bcm-prepare downloads + remasters BCM ISO.
+# WHICH FILE DO I USE?
+#  - Local-KVM (dev/demo)   -> start from all.local-kvm.example.yml (minimal;
+#                              most values default from inventory/hosts.yml).
+#  - Remote / customer BCM  -> this file. Requires bcm_ssh_host + jumphost;
+#                              stages 3, 4, 6 only; keep the safety flags false.
+# This file documents EVERY variable for both modes regardless.
 # ---------------------------------------------------------------------------
 
 # ==== BCM connection ====
-# How deploy-dd and validate reach the BCM head node. Every SSH/SCP from the
-# build host goes through these via a per-run config file (`build/.bcm-ssh-
-# config`) — there is no Ansible delegate_to; tasks run on localhost and shell
-# out with `sshpass -p $bcm_password ssh -F <config> bcm-target`.
+# How the deploy_dd (stage 4) and validate (stage 6) roles reach the BCM head
+# node. The BCM is registered at runtime as an Ansible managed host (`add_host`,
+# playbooks/tasks/add_bcm_host.yml) and tasks run on it via `delegate_to: bcm`;
+# a jumphost is applied as an OpenSSH ProxyCommand in ansible_ssh_common_args.
 
-# Root SSH password on BCM. Used by:
-#   - roles/deploy_dd/templates/deploy-dd.sh.j2  (every BCM call during stage 4)
-#   - roles/validate/templates/validate.sh.j2    (BCM-side checks during stage 6)
+# Root SSH password on BCM. Used by add_bcm_host.yml (the BCM connection) and,
+# for stage-6 Kairos-node checks, the BCM->node ssh hop in roles/validate.
 bcm_password:        "ROOT-SSH-PASSWORD"
 
 # BCM's SSH endpoint as seen from the build host. With a jumphost, this is the
@@ -40,8 +40,8 @@ bcm_ssh_proxy_key:   "~/.ssh/bcm-jump"          # `~` expanded at template-rende
 # DHCP/PXE/TFTP/NFS/HTTP. Consumed by:
 #   - roles/deploy_dd/templates/install-kairos.sh.j2  (HEAD_IP, baked in for the
 #     compute node's `curl http://<HEAD_IP>:8888/<profile>/disk.raw.lz4`)
-#   - roles/deploy_dd/templates/deploy-dd.sh.j2       (NFS export CIDR)
-#   - roles/validate/templates/validate.sh.j2         (BCM-internal-IP check)
+#   - roles/deploy_dd/tasks/nfs.yml                  (NFS export CIDR)
+#   - roles/validate/tasks/bcm.yml                   (BCM-internal-IP check)
 #   - roles/kairos_build/templates/cloud-config.yaml.j2  (BCM-integration boot
 #     stage's NFS mount source + cmd-in-chroot Master)
 bcm_internal_ip:     "192.168.98.2"

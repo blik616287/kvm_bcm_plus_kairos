@@ -77,13 +77,15 @@ make deploy-dd
 make validate
 ```
 
-`inventory/group_vars/all.yml` is gitignored. `inventory/group_vars/all.example.yml` is the committable template and documents every variable.
+`inventory/group_vars/all.yml` is gitignored. `inventory/group_vars/all.example.yml` is the committable **remote/customer-BCM** template and documents every variable.
 
 ## Quick Start — Local KVM (dev / demo)
 
 ```bash
-cp inventory/group_vars/all.example.yml inventory/group_vars/all.yml
-# Uncomment the local-KVM section; set jfrog_token, palette_api_key, etc.
+# Minimal local-KVM config: most values default from inventory/hosts.yml,
+# so you only fill jfrog_token + kairos_target_disk (+ optional Palette).
+cp inventory/group_vars/all.local-kvm.example.yml inventory/group_vars/all.yml
+$EDITOR inventory/group_vars/all.yml
 
 make all   # runs the full 6-stage pipeline (~100-120 min)
 ```
