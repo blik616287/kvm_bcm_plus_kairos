@@ -32,8 +32,11 @@
   ansible.builtin.apt:
     name: lz4
     state: present
+    # Always refresh — do NOT use cache_valid_time. A freshly-installed BCM has a
+    # recent-but-incomplete apt cache (no full archive lists yet), so a cache-age
+    # check would skip the update and lz4 wouldn't be found. The original did an
+    # unconditional apt-get update for exactly this reason.
     update_cache: true
-    cache_valid_time: 3600
   delegate_to: bcm
 
 - name: Locate the lz4 binary on the BCM
