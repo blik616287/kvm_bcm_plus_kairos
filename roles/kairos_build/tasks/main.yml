@@ -358,6 +358,9 @@
           exit 1
         fi
         echo "install verification OK — ESP has a bootloader and active.img is populated"
+      args:
+        # Runs bash (not the default /bin/sh = dash) — the error list uses a bash array.
+        executable: /bin/bash
       become: true
       changed_when: false
 
