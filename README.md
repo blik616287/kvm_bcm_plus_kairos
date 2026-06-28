@@ -229,7 +229,7 @@ make bcm-serial         # Tail BCM serial log
 make kairos-serial      # Tail Kairos serial log
 
 # Cleanup
-make clean              # Remove build/, logs/
+make clean              # Stop VMs, then remove build/, logs/
 make clean-dist         # Remove downloaded ISOs
 make clean-canvos       # Remove cloned CanvOS repo
 make clean-all          # Stop VMs + remove everything
@@ -318,7 +318,7 @@ Both `default-kairos` and `gpu-kairos` categories, software images, image direct
 
 ### UEFI raw image + post-`dd` boot entry
 
-The Kairos raw image is built under **OVMF firmware** (not SeaBIOS), producing a real EFI System Partition with `\EFI\BOOT\bootx64.efi`. `install-kairos.sh` runs `efibootmgr --create --disk $DISK --part 1 --label Kairos --loader '\EFI\BOOT\bootx64.efi'` after `dd` so UEFI firmware boots the freshly-written disk on next power-up — no manual OneTimeBoot dance required.
+The Kairos raw image is built under **OVMF firmware** (not SeaBIOS), producing a real EFI System Partition with `\EFI\BOOT\bootx64.efi`. `run-dd.sh` (the dd-installer program `install-kairos.sh` stages into RAM and execs — see `roles/deploy_dd/files/run-dd.sh`) runs `efibootmgr --create --disk $DISK --part 1 --label Kairos --loader '\EFI\BOOT\bootx64.efi'` after `dd` so UEFI firmware boots the freshly-written disk on next power-up — no manual OneTimeBoot dance required.
 
 ### Idempotent re-deploys
 
@@ -341,7 +341,7 @@ BCM's `mounts`, `interfaces`, and `ntp` measurables flag Kairos's immutable-OS a
 
 ### Last-partition auto-grow after `dd`
 
-Right after `sgdisk -e` fixes the GPT backup header, `install-kairos.sh` deletes and recreates the **last** GPT partition (typically `COS_PERSISTENT`) from its current start sector to the disk end, then `partprobe` + `partx -u` + `e2fsck -fy` + `resize2fs`. Without this, a Kairos image dd'd from an 80 GB build VM onto a 400+ GB physical disk leaves `COS_PERSISTENT` capped at the original 30 GB (Kairos's own `Grow persistent` boot stage has a math bug that silently skips the grow on disks much larger than the source image).
+Right after `sgdisk -e` fixes the GPT backup header, `run-dd.sh` deletes and recreates the **last** GPT partition (typically `COS_PERSISTENT`) from its current start sector to the disk end, then `partprobe` + `partx -u` + `e2fsck -fy` + `resize2fs`. Without this, a Kairos image dd'd from an 80 GB build VM onto a 400+ GB physical disk leaves `COS_PERSISTENT` capped at the original 30 GB (Kairos's own `Grow persistent` boot stage has a math bug that silently skips the grow on disks much larger than the source image).
 
 ### Dynamic Palette label push
 

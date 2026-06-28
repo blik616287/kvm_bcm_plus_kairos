@@ -578,7 +578,7 @@ Enable it (`chroot $IMAGE_ROOT systemctl enable kairos-install.service` with a s
 1. **HTTP probe** — poll `HEAD http://$HEAD_IP:8888/<profile>/disk.raw.lz4` every 10 s for up to 10 minutes. Abort if unreachable.
 2. **Stage binaries to RAM** (`/dev/shm/kinstall/`) — `bash curl lz4 dd sync sleep sgdisk wipefs dmsetup efibootmgr partprobe blkid awk e2fsck resize2fs partx` and all `ldd` dependencies. This is required because the dd will overwrite the filesystem these binaries currently live on. The `awk` / `e2fsck` / `resize2fs` / `partx` additions support the post-dd partition grow step (§6.11.8).
 3. **Enable sysrq** — `echo 1 > /proc/sys/kernel/sysrq`.
-4. **Write a run-dd.sh with shebang `#!/dev/shm/kinstall/bash`**, then `exec` it — the parent process is replaced with a RAM-resident one. From here on nothing touches the target disk's filesystem.
+4. **Copy `run-dd.sh` into RAM and `exec` it** — `install-kairos.sh` copies the staged `/usr/local/sbin/run-dd.sh` (a real, shellcheck-clean file — `roles/deploy_dd/files/run-dd.sh`, no longer an inline heredoc) into `/dev/shm/kinstall/`, sed-strips the `/dev/shm` paths, then `exec`s it via the RAM-staged bash so the parent process is replaced with a RAM-resident one. From here on nothing touches the target disk's filesystem.
 5. **Wipe sibling disks** — for every name in `$WIPE_DISKS`, `dmsetup remove_all; wipefs -a -f /dev/<name>`. Clears LVM PV / DRBD / old filesystem signatures so Kairos's persistent-partition logic doesn't see stale metadata.
 6. **Stream + dd** — `curl --fail -s $RAW_URL | lz4 -d - - | dd of=$DISK bs=4M oflag=direct`. `oflag=direct` bypasses the page cache (critical — without it an 80 GB write can drive an LVM thin pool into overflow on a tight-RAM server).
 7. **Fix GPT backup header** — `sgdisk -e $DISK; partprobe $DISK`. The raw image was created on an 80 GB disk; the target disk is usually larger, so GPT's backup header ends up at the wrong offset. `sgdisk -e` moves it to the correct location.
@@ -867,7 +867,7 @@ See §1.3. Every BCM-side operation in deploy-dd, validate, and discover-bcm use
 
 - **lz4 not gzip** — decompression is faster than the `dd` write speed, so the pipeline is write-bound, not CPU-bound.
 - **`oflag=direct`** — bypasses the page cache. Without it, writing an 80 GB image can push an LVM thin pool into overflow before the sync completes.
-- **Staging binaries to `/dev/shm/kinstall` + exec before dd** — the dd overwrites the filesystem hosting the currently-running binaries; without RAM-staging + exec, the script would SIGBUS partway through. The shebang on `run-dd.sh` points at `/dev/shm/kinstall/bash`.
+- **Staging binaries to `/dev/shm/kinstall` + exec before dd** — the dd overwrites the filesystem hosting the currently-running binaries; without RAM-staging + exec, the script would SIGBUS partway through. `install-kairos.sh` execs `run-dd.sh` explicitly via the RAM-staged bash (`exec "$RAMDIR/bash" "$RAMDIR/run-dd.sh"`), so `run-dd.sh`'s own `#!/bin/bash` shebang is cosmetic.
 - **sgdisk -e + partprobe** — the raw image was created on an 80 GB virtual disk; target disks are typically larger, so the GPT backup header is at the wrong offset after dd. `sgdisk -e` relocates it; `partprobe` re-reads the corrected partition table.
 
 ---
