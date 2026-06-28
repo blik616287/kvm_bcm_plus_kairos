@@ -183,7 +183,7 @@ Then confirm the node registered in Palette:
 ```bash
 make stop           # stop both VMs (bcm-stop / kairos-stop individually)
 make teardown       # stop VMs + remove build/ + logs/ (keeps dist/ ISO + CanvOS/ clone)
-make clean          # remove build/ + logs/
+make clean          # stop VMs, then remove build/ + logs/
 make clean-canvos   # remove the CanvOS clone + per-profile raw artifacts (needed to rebake the image)
 make clean-all      # stop VMs + remove everything (build, logs, dist, CanvOS)
 ```
