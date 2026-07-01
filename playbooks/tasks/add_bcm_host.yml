@@ -15,6 +15,15 @@
 #
 # Inputs (from inventory/group_vars): bcm_ssh_host, bcm_ssh_port, bcm_password,
 # bcm_ssh_proxy_jump (default ''), bcm_ssh_proxy_key (default '').
+#
+# Auth: defaults to root + password (bcm_password) — the local-KVM and
+# password-based remote model. To use KEY auth as a non-root sudoer instead
+# (e.g. the axisapps broker bridge: a `spectro` login reached via a ProxyJump
+# that can't carry a root password), set:
+#     bcm_ssh_user:        spectro
+#     bcm_ssh_private_key: ~/.ssh/<key>      # enables key auth, omits password
+# Global become=true (ansible.cfg) then sudo's spectro -> root for every
+# `delegate_to: bcm` task, so no per-task change is needed.
 
 - name: Build the optional jumphost ProxyCommand fragment
   ansible.builtin.set_fact:
@@ -35,19 +44,33 @@
   ansible.builtin.set_fact:
     _bcm_proxy_arg: "{{ _bcm_proxy_arg | default('') }}"
 
-- name: Register the BCM as a managed host (works for local-KVM + remote/jumphost)
+- name: Resolve BCM auth mode (root+password default, or user+key)
+  ansible.builtin.set_fact:
+    _bcm_ssh_user: "{{ bcm_ssh_user | default('root') }}"
+    # `~` expanded here — OpenSSH does not expand it in this context.
+    _bcm_ssh_key: "{{ bcm_ssh_private_key | default('') | regex_replace('^~', lookup('env', 'HOME')) }}"
+
+- name: Register the BCM as a managed host (works for local-KVM + remote/jumphost/bridge)
   ansible.builtin.add_host:
     name: bcm
     groups: [bcm]
     ansible_connection: ssh
     ansible_host: "{{ bcm_ssh_host | default('localhost') }}"
     ansible_port: "{{ bcm_ssh_port }}"
-    ansible_user: root
-    ansible_password: "{{ bcm_password }}"
+    ansible_user: "{{ _bcm_ssh_user }}"
+    # Key auth when bcm_ssh_private_key is set; otherwise password auth. Only
+    # one of the two is registered so sshpass isn't invoked with an empty pw.
+    ansible_ssh_private_key_file: "{{ _bcm_ssh_key if _bcm_ssh_key | length > 0 else omit }}"
+    ansible_password: "{{ bcm_password if _bcm_ssh_key | length == 0 else omit }}"
     # BCM is a full Ubuntu head node — python3 is present, so modules work.
     ansible_python_interpreter: /usr/bin/python3
+    # ConnectTimeout is generous (60s) because a ProxyJump/broker can be slow to
+    # set up the -W channel (a 10s timeout fails with "banner exchange timeout").
+    # ServerAlive* keeps the master connection up across long module runs (e.g.
+    # checksumming a multi-GB image) so the next task doesn't hit a dead socket.
     ansible_ssh_common_args: >-
       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-      -o LogLevel=ERROR -o ConnectTimeout=10 {{ _bcm_proxy_arg }}
+      -o LogLevel=ERROR -o ConnectTimeout=60
+      -o ServerAliveInterval=15 -o ServerAliveCountMax=10 {{ _bcm_proxy_arg }}
   changed_when: false
   no_log: true   # bcm_password flows through this task

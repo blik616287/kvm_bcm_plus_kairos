@@ -55,6 +55,8 @@ CLAUDE.md
 # --- Secrets ---
 inventory/group_vars/all.yml
 bcm-discovery-*.yml
+bcm-bridge-inventory.yml
+ursa-proxmox-access/
 
 *.customer-backup
 
