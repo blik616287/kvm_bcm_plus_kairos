@@ -24,6 +24,14 @@ jfrog_token: "PASTE_YOUR_JFROG_TOKEN"
 # wrong disk bricks a real box, so it's always explicit.)
 kairos_target_disk: "/dev/vda"
 
+# Local-KVM stands up its OWN dedicated BCM head node, so deploy-dd may make the
+# cluster-wide changes it needs (make dhcpd authoritative + point the DHCP pool
+# at the provisioning network for PXE; set defaultcategory/nodebasename). These
+# stay false by default so a REMOTE/customer BCM is never touched cluster-wide —
+# here we own the box, so enable them. (Leave false only if your local BCM's
+# dhcpd is already configured for the provisioning network.)
+bcm_manage_cluster_defaults: true
+
 # ---------------------------------------------------------------------------
 # OPTIONAL — Palette registration. Leave commented for a pure bring-up + boot
 # (the node will come up but won't register; a local on-prem Palette usually
