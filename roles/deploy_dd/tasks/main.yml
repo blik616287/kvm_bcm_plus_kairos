@@ -54,6 +54,9 @@
   ansible.builtin.import_tasks: pxe.yml
 - name: Configure the profile category + health-check filters   # [6/7]
   ansible.builtin.import_tasks: category.yml
+- name: Run the dd install from the node-installer FINALIZE stage (opt-in)
+  ansible.builtin.import_tasks: finalize.yml
+  when: deploy_dd_finalize_install | default(false) | bool
 - name: Register / assign the target compute node
   ansible.builtin.import_tasks: node.yml
 - name: Regenerate the installer ramdisk + verify   # [7/7]

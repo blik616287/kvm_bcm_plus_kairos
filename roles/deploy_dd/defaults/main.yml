@@ -1,0 +1,28 @@
+---
+# Install method for landing the Kairos raw image onto the compute node's disk.
+#
+# false (default) — legacy "stage-2" install: the <profile>-installer software
+#   image is FULL-installed onto the node's local disk, the node boots it, and a
+#   kairos-install systemd unit runs run-dd.sh to dd the Kairos raw image over
+#   that same disk. Simple, and fine in local-KVM, but on a real BCM the dd
+#   overwrites the *running* rootfs, so the post-dd steps (GPT backup-header fix,
+#   COS_PERSISTENT grow, efibootmgr) execute in a torn-down environment and
+#   silently fail ("timeout: No such file or directory", "couldn't detect last
+#   partition, skipping grow"), and the console floods with kernel XFS errors.
+#
+# true — "finalize-stage" install: the dd runs as the BCM node-installer's
+#   category FINALIZE script, i.e. from the node-installer's NFS root — which the
+#   dd never overwrites. timeout/sgdisk/resize2fs all work, COS_PERSISTENT grows
+#   to fill the target disk, the console stays clean, and (on a UEFI node-installer)
+#   efibootmgr can run. The finalize script then forces a reboot so firmware boots
+#   the freshly-written Kairos; otherwise the node-installer would switch_root into
+#   the now-overwritten disk and drop to an emergency shell.
+#
+# Requirements when true (see roles/deploy_dd/tasks/finalize.yml):
+#   - the compute node's firmware boot order must be DISK-FIRST with PXE fallback
+#     — a blank disk falls through to PXE for the install; after the finalize
+#     reboot the now-bootable disk is selected (net-first would re-PXE = a
+#     reinstall loop);
+#   - the profile category gets installbootrecord=no (finalize.yml sets it) so the
+#     node-installer never tries to grub-install onto the Kairos disk.
+deploy_dd_finalize_install: false

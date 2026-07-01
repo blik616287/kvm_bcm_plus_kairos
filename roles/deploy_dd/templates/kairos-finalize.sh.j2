@@ -1,0 +1,92 @@
+#!/bin/bash
+# Kairos dd-install as a BCM node-installer FINALIZE script (profile: {{ kairos_profile }}).
+#
+# Rendered by roles/deploy_dd/tasks/finalize.yml when deploy_dd_finalize_install=true.
+# Runs in the node-installer (NFS) environment after provisioning, before reboot:
+#   - the rootfs is NFS, so the dd never overwrites what this script runs from
+#     (no "timeout: not found", no XFS console spam);
+#   - {{ kairos_target_disk }} is a clean target, so sgdisk + the COS_PERSISTENT
+#     grow work;
+#   - on a UEFI node-installer /sys/firmware/efi/efivars is present, so efibootmgr
+#     can create a boot entry (else the image's ESP fallback loader boots).
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+set +e
+DISK="{{ kairos_target_disk }}"
+HEAD_IP="{{ bcm_internal_ip }}"
+RAW_URL="http://${HEAD_IP}:8888/{{ kairos_profile }}/disk.raw.lz4"
+WIPE_DISKS="{{ kairos_wipe_disks | default('') }}"
+
+echo "[kairos-finalize $(date)] start -> ${DISK}"
+# Quiet the kernel console: the dd over the target still triggers some block noise.
+echo 1 > /proc/sys/kernel/printk 2> /dev/null || true
+
+# Release the freshly-provisioned target so dd can overwrite the WHOLE disk. We
+# unmount /localdisk here (needed so the post-dd partition-table re-read + grow
+# work); the node-installer's own post-finalize cleanup is bypassed by the forced
+# reboot at the end.
+sync
+swapoff -a 2> /dev/null || true
+for d in ${WIPE_DISKS}; do [ -b "/dev/$d" ] && wipefs -a -f "/dev/$d" 2> /dev/null || true; done
+for mp in $(awk -v d="${DISK}" '$1 ~ ("^" d) {print $2}' /proc/mounts | sort -r); do
+    umount -fl "$mp" 2> /dev/null || true
+done
+umount -Rfl /localdisk 2> /dev/null || true
+vgchange -an 2> /dev/null || true
+mdadm --stop "${DISK}"* 2> /dev/null || true
+dmsetup remove_all 2> /dev/null || true
+udevadm settle --timeout=20 2> /dev/null || true
+
+for i in $(seq 1 30); do curl --fail --silent --head "${RAW_URL}" > /dev/null 2>&1 && break; sleep 5; done
+echo "[kairos-finalize $(date)] writing image..."
+curl --fail -s "${RAW_URL}" | lz4 -d - - | dd of="${DISK}" bs=4M oflag=direct status=progress
+sync
+echo "[kairos-finalize $(date)] dd complete; fixing GPT + growing last partition..."
+sgdisk -e "${DISK}" 2>&1 || true
+partprobe "${DISK}" 2>&1 || true
+udevadm settle --timeout=30 2> /dev/null || true
+
+case "${DISK}" in *nvme* | *mmcblk* | *loop*) PSEP=p ;; *) PSEP= ;; esac
+if command -v sgdisk > /dev/null 2>&1 && command -v resize2fs > /dev/null 2>&1; then
+    LAST_NUM=$(sgdisk -p "${DISK}" 2> /dev/null | awk '/^[ ]+[0-9]+/{n=$1} END{print n}')
+    LAST_INFO=$(sgdisk -i "${LAST_NUM}" "${DISK}" 2> /dev/null)
+    LAST_START=$(echo "$LAST_INFO" | awk '/First sector:/{print $3}')
+    LAST_TYPE=$(echo "$LAST_INFO" | awk '/Partition GUID code:/{print $4}')
+    LAST_LABEL=$(echo "$LAST_INFO" | grep 'name:' | sed -e 's/.*name: //; s/^.\(.*\).$/\1/')
+    if [ -n "$LAST_NUM" ] && [ -n "$LAST_START" ]; then
+        echo "[kairos-finalize $(date)] growing partition ${LAST_NUM} (${LAST_LABEL}) from ${LAST_START}..."
+        sgdisk -d "${LAST_NUM}" -n "${LAST_NUM}:${LAST_START}:0" -t "${LAST_NUM}:${LAST_TYPE}" -c "${LAST_NUM}:${LAST_LABEL}" "${DISK}" 2>&1 || true
+        partprobe "${DISK}" 2>&1 || true
+        partx -u --nr "${LAST_NUM}" "${DISK}" 2>&1 || true
+        e2fsck -fy "${DISK}${PSEP}${LAST_NUM}" 2>&1 | tail -3 || true
+        resize2fs "${DISK}${PSEP}${LAST_NUM}" 2>&1 | tail -3 || true
+    else
+        echo "[kairos-finalize $(date)] WARN: could not detect last partition; skipping grow"
+    fi
+fi
+
+partprobe "${DISK}" 2> /dev/null || true
+udevadm settle --timeout=20 2> /dev/null || true
+if [ -d /sys/firmware/efi/efivars ] && command -v efibootmgr > /dev/null 2>&1; then
+    echo "[kairos-finalize $(date)] creating UEFI boot entry..."
+    for n in $(efibootmgr 2> /dev/null | grep 'Kairos$' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//'); do
+        efibootmgr -b "$n" -B 2> /dev/null || true
+    done
+    efibootmgr --create --disk "${DISK}" --part 1 --label Kairos --loader '\EFI\BOOT\bootx64.efi' 2>&1 || true
+else
+    echo "[kairos-finalize $(date)] no efivars/efibootmgr; relying on ESP fallback loader \\EFI\\BOOT\\bootx64.efi"
+fi
+
+# Force a real reboot instead of returning to the node-installer. BCM would
+# otherwise switch_root into /localdisk and exec its /sbin/init — but we dd'd
+# Kairos over the whole disk, so /localdisk is no longer a Linux root and
+# switch_root drops to an emergency shell. Kairos can only be started by firmware
+# (GRUB in its own ESP). The node's boot order must be disk-first / PXE-fallback,
+# so this reboot lands in the freshly-written Kairos.
+echo "[kairos-finalize $(date)] dd-install COMPLETE; rebooting into Kairos (bypassing node-installer switch_root)..."
+sync
+sleep 2
+echo 1 > /proc/sys/kernel/sysrq 2> /dev/null || true
+echo b > /proc/sysrq-trigger 2> /dev/null || true
+reboot -f 2> /dev/null || true
+systemctl --force --force reboot 2> /dev/null || true
+exit 0

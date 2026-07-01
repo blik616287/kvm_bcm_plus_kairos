@@ -99,6 +99,16 @@ kairos_target_disk:  "/dev/nvme0n1"
 # partition logic doesn't see stale metadata on next boot. Empty = no wipes.
 kairos_wipe_disks:   "nvme1n1 nvme2n1 nvme3n1 nvme4n1"
 
+# Install method for landing the raw image on the compute node. Default false =
+# legacy stage-2 install (installer image dd's Kairos over its own booted rootfs).
+# Set true on a REAL BCM to run the dd as the node-installer's category FINALIZE
+# script (from the NFS root, never the disk being overwritten) — fixes the
+# COS_PERSISTENT grow, the "timeout: not found" post-dd failures, and the XFS
+# console spam, and enables efibootmgr on UEFI. Requires the node's firmware boot
+# order to be DISK-FIRST with PXE fallback. Full detail:
+# roles/deploy_dd/defaults/main.yml.
+# deploy_dd_finalize_install: true
+
 # ==== Kairos profile (artifact + BCM-state namespacing) ====
 # A profile bundles a build artifact + its BCM-side resources under one name.
 # Multiple profiles can coexist on the same BCM — each gets its own software

@@ -1,0 +1,52 @@
+---
+# finalize.yml — run the Kairos dd-install as the BCM node-installer's category
+# FINALIZE script instead of a stage-2 systemd unit in the booted installer
+# image. Included from main.yml only when deploy_dd_finalize_install=true.
+# See roles/deploy_dd/defaults/main.yml for why this exists.
+
+- name: Ensure lz4 is present in the node-installer environment
+  # The node-installer NFS root ships dd/curl/sgdisk/resize2fs/efibootmgr but not
+  # lz4; the finalize script pipes `lz4 -d` into dd, so stage lz4 + its libs in.
+  ansible.builtin.shell: |
+    set -e
+    NI=/cm/node-installer
+    if [ -x "$NI/usr/bin/lz4" ]; then echo PRESENT; exit 0; fi
+    src=$(command -v lz4 || true)
+    [ -n "$src" ] || { echo "NO_LZ4_ON_HEADNODE" >&2; exit 1; }
+    cp "$src" "$NI/usr/bin/lz4"
+    for lib in $(ldd "$src" 2>/dev/null | awk '/=>/{print $3}'); do
+      d=$(dirname "$lib"); mkdir -p "$NI$d"; cp -n "$lib" "$NI$lib" 2>/dev/null || true
+    done
+    echo STAGED
+  args:
+    executable: /bin/bash
+  delegate_to: bcm
+  register: dd_ni_lz4
+  changed_when: "'STAGED' in dd_ni_lz4.stdout"
+
+- name: Render the Kairos finalize (dd-install) script onto the BCM
+  ansible.builtin.template:
+    src: kairos-finalize.sh.j2
+    dest: "/cm/local/kairos-finalize-{{ kairos_profile }}.sh"
+    mode: "0755"
+  delegate_to: bcm
+
+- name: Point the profile category at the finalize script + skip the boot record
+  # installbootrecord=no: the finalize dd writes Kairos (with its own bootloader /
+  # ESP) over the whole disk, so the node-installer must NOT grub-install onto it
+  # afterwards (that step fails "cannot find EFI directory" on a UEFI install and
+  # would clobber Kairos on a BIOS one).
+  ansible.builtin.command: >-
+    cmsh -c "category; use {{ kairos_profile }};
+      set finalizescript /cm/local/kairos-finalize-{{ kairos_profile }}.sh;
+      set installbootrecord no; commit"
+  delegate_to: bcm
+  changed_when: true
+
+- name: Assert the finalize script is set on the category (load-bearing end-state)
+  ansible.builtin.command: >-
+    cmsh -c "category; use {{ kairos_profile }}; get finalizescript"
+  delegate_to: bcm
+  register: dd_cat_finalize
+  changed_when: false
+  failed_when: "'kairos-finalize' not in dd_cat_finalize.stdout"
