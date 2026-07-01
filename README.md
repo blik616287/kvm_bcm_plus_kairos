@@ -441,6 +441,10 @@ Stages are idempotent:
 
 Force a full rebuild with `make clean && make all` (local-KVM) or `make clean && make kairos-build deploy-dd` (remote BCM).
 
+## License
+
+[MIT](LICENSE) © 2026 Martin Forde <mforde84@gmail.com>, [Blik Labs](https://bliklabs.com).
+
 ## Changelog
 
 Milestones and notable changes, newest first. Each entry links its JIRA ticket
