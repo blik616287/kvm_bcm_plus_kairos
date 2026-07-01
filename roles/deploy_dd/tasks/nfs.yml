@@ -23,13 +23,18 @@
       changed_when: false
       failed_when: false
 
+    # Guard against cmsh error text: when the node has no BOOTIF interface,
+    # cmsh prints "Unable to find ... (type 'list' ...)" to stdout (with rc 0),
+    # which is NOT a network name. A real network name is a single bare token,
+    # so require that shape before using it — otherwise the error string flows
+    # into the CIDR and corrupts /etc/exports.
     - name: Look up that network's base address + prefix bits
       ansible.builtin.command: "cmsh -c 'network; use {{ dd_target_net.stdout | trim }}; get {{ item }}'"
       loop: [baseaddress, netmaskbits]
       register: dd_target_netinfo
       changed_when: false
       failed_when: false
-      when: dd_target_net.stdout | trim | length > 0
+      when: dd_target_net.stdout | trim is match('^[A-Za-z0-9_.-]+$')
 
     - name: Append the target network CIDR if it differs from the provisioning CIDR
       ansible.builtin.set_fact:
@@ -37,8 +42,11 @@
       vars:
         _cidr: "{{ (dd_target_netinfo.results[0].stdout | trim) }}/{{ (dd_target_netinfo.results[1].stdout | trim) }}"
       when:
-        - dd_target_net.stdout | trim | length > 0
-        - (dd_target_netinfo.results[0].stdout | default('') | trim) | length > 0
+        - dd_target_net.stdout | trim is match('^[A-Za-z0-9_.-]+$')
+        - dd_target_netinfo is not skipped
+        # Only a well-formed dotted-quad/prefix is a valid CIDR — rejects any
+        # leftover cmsh error text so it can never reach /etc/exports.
+        - _cidr is match('^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$')
         - _cidr != bcm_internal_cidr
 
 # Add an export only if that (path, CIDR) isn't already exported — the BCM's cmd
@@ -67,23 +75,33 @@
   delegate_to: bcm
   changed_when: "stdout is defined and 'ADDED' in stdout"
 
-- name: Make dhcpd authoritative
+# DHCP-pool rewrite — cluster-wide, OWNED-BCM ONLY. These edit /etc/dhcpd.conf
+# (CMDaemon-managed, shared by EVERY subnet/category on the head node), so they
+# are gated behind bcm_manage_cluster_defaults (false by default). The pool
+# `replace` uses `regexp: 'range .*'`, which matches EVERY `range` line in the
+# file — on a single-subnet local-KVM BCM that's the one intended pool, but on a
+# multi-subnet customer BCM it would clobber every subnet's range (and a `.250`
+# upper bound is invalid for any subnet smaller than /24, breaking dhcpd
+# entirely). Only safe when we own the whole head node and it has one subnet.
+- name: Manage the cluster DHCP pool (owned-BCM only)
+  when: bcm_manage_cluster_defaults | default(false) | bool
   delegate_to: bcm
-  ansible.builtin.replace:
-    path: /etc/dhcpd.conf
-    regexp: 'not authoritative'
-    replace: 'authoritative'
-  failed_when: false
-  notify: Restart dhcpd
+  block:
+    - name: Make dhcpd authoritative
+      ansible.builtin.replace:
+        path: /etc/dhcpd.conf
+        regexp: 'not authoritative'
+        replace: 'authoritative'
+      failed_when: false
+      notify: Restart dhcpd
 
-- name: Point the DHCP pool at the provisioning network (.16–.250)
-  delegate_to: bcm
-  ansible.builtin.replace:
-    path: /etc/dhcpd.conf
-    regexp: 'range .*'
-    replace: "range {{ dd_pool_prefix }}.16 {{ dd_pool_prefix }}.250;"
-  failed_when: false
-  notify: Restart dhcpd
+    - name: Point the DHCP pool at the provisioning network (.16–.250)
+      ansible.builtin.replace:
+        path: /etc/dhcpd.conf
+        regexp: 'range .*'
+        replace: "range {{ dd_pool_prefix }}.16 {{ dd_pool_prefix }}.250;"
+      failed_when: false
+      notify: Restart dhcpd
 
 - name: Apply NFS/DHCP changes now (don't wait for end-of-play flush)
   ansible.builtin.meta: flush_handlers

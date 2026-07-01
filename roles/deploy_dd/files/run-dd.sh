@@ -12,6 +12,11 @@ export LD_LIBRARY_PATH="/dev/shm/kinstall/lib"
 # PATH: staged binaries first (from RAM), then NFS system paths as fallback.
 # The NFS rootfs is always accessible (dd only overwrites the target disk, not NFS).
 export PATH="/dev/shm/kinstall:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Quiet the kernel console before we start overwriting the disk. When the target
+# is also the running rootfs (BCM FULL/local-disk install), dd destroys the live
+# filesystem and the kernel spews XFS/EXT4 I/O errors straight to the serial,
+# burying our own progress output. Drop the console loglevel to emergency-only.
+echo 1 > /proc/sys/kernel/printk 2> /dev/null || true
 # Wipe signatures on sibling disks so stale LVM/DRBD/filesystems don't auto-activate on first Kairos boot.
 if [ -n "${WIPE_DISKS}" ]; then
     for d in ${WIPE_DISKS}; do
@@ -33,8 +38,32 @@ command -v vgchange > /dev/null 2>&1 && vgchange -an 2> /dev/null || true
 dmsetup remove_all 2> /dev/null || true
 wipefs -a -f "${DISK}" 2>&1 || true
 command -v udevadm > /dev/null 2>&1 && udevadm settle --timeout=30 2> /dev/null || true
+# --- Pin the ELF loader into RAM so the post-dd toolkit survives ---------------
+# On a BCM FULL (local-disk) install the node-installer rsyncs this installer
+# image onto ${DISK} and boots from it, so THIS script runs from ${DISK}. The
+# moment dd overwrites ${DISK} below, any binary exec'd afterward can no longer
+# load its ELF interpreter (/lib64/ld-linux-*.so.2, a symlink into the rootfs)
+# and dies with "No such file or directory" — which is exactly what silently
+# killed the GPT-backup-header fix, the COS_PERSISTENT grow, and the efibootmgr
+# step. install-kairos.sh already staged the binaries + their libraries into
+# /dev/shm/kinstall{,/lib}; pin the loader too by bind-mounting a tmpfs copy over
+# its directory (done now, while the rootfs is still intact), so every post-dd
+# exec resolves the loader from RAM. LD_LIBRARY_PATH (exported above) resolves
+# the libraries from /dev/shm/kinstall/lib. Best-effort — never block the dd.
+RAMDIR=/dev/shm/kinstall
+_ld=$(ls /lib64/ld-linux-*.so.2 /lib/ld-linux-*.so.2 /lib/x86_64-linux-gnu/ld-linux-*.so.2 2> /dev/null | head -1)
+if [ -n "$_ld" ] && command -v mount > /dev/null 2>&1; then
+    _lddir=$(dirname "$_ld")
+    mkdir -p "$RAMDIR/ramloader" 2> /dev/null || true
+    cp -L "$_ld" "$RAMDIR/ramloader/" 2> /dev/null || true
+    if mount --bind "$RAMDIR/ramloader" "$_lddir" 2> /dev/null; then
+        echo "[$(date)] Pinned ELF loader $_lddir into RAM (survives ${DISK} overwrite)."
+    else
+        echo "[$(date)] WARN: could not pin ELF loader into RAM — post-dd tools may fail if the rootfs is on ${DISK}."
+    fi
+fi
 echo "[$(date)] Writing to ${DISK}..."
-curl --fail -s "${RAW_URL}" | lz4 -d - - | dd of="${DISK}" bs=4M oflag=direct 2>&1
+curl --fail -s "${RAW_URL}" | lz4 -d - - | dd of="${DISK}" bs=4M oflag=direct status=progress 2>&1
 # sync is redundant after oflag=direct (data bypasses page cache); skip it to
 # avoid blocking while the kernel probes newly-written XFS partitions.
 timeout 10 sync 2> /dev/null || true
