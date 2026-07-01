@@ -14,7 +14,7 @@ Configures the BCM head node to PXE-install Kairos onto a target node via whole-
 ## What it does (on BCM, in order)
 
 **Pre-flight:** verify BCM reachable → wait for `cmfirstboot` to finish → wait for `cmd` active + `cmsh` answering.
-**Network:** set DNS forwarders (only if `bcm_manage_dns=true`) → enable IP-forward + NAT. **NFS exports:** `/cm/images/default-image`, `/cm/shared`, `/cm/images/<profile>-installer` → DHCP pool → rsync module.
+**Network:** set DNS forwarders (only if `bcm_manage_dns=true`) → enable IP-forward + NAT. **NFS exports:** `/cm/images/default-image`, `/cm/shared`, `/cm/images/<profile>-installer` → DHCP pool (make dhcpd authoritative + set range — **only if `bcm_manage_cluster_defaults=true`**) → rsync module.
 
 Then the seven numbered steps:
 

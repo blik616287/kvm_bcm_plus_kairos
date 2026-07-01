@@ -55,9 +55,13 @@ bcm_internal_cidr:   "192.168.98.0/24"
 # bcm_manage_dns        : when true, deploy-dd issues
 #   `cmsh -c 'partition; use base; set nameservers $bcm_external_dns'` and
 #   restarts named. Rewrites the cluster's DNS forwarders.
-# bcm_manage_cluster_defaults : when true, deploy-dd flips the `base`
-#   partition's `defaultcategory` to the new kairos_profile category and
-#   sets `nodebasename`. Affects every newly-PXE'd node on the site.
+# bcm_manage_cluster_defaults : when true, deploy-dd (a) flips the `base`
+#   partition's `defaultcategory` to the new kairos_profile category and sets
+#   `nodebasename` (affects every newly-PXE'd node on the site), and (b) rewrites
+#   /etc/dhcpd.conf — makes dhcpd authoritative and resets the pool `range` to
+#   <cidr>.16–.250. The range replace matches EVERY subnet's range line, so on a
+#   multi-subnet BCM it would clobber them all — keep false unless you own a
+#   single-subnet BCM. (Local-KVM sets this true; see all.local-kvm.example.yml.)
 bcm_manage_dns:               false
 bcm_manage_cluster_defaults:  false
 
