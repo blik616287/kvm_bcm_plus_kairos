@@ -14,8 +14,11 @@ Run these in order; each says what it tells you and where to go next.
 # 1. Most recent stage log — what failed and why
 tail -n 60 "$(ls -t logs/0*-*.log | head -1)"
 
-# 2. The EXACT commands that ran after templating (the source of truth)
-less build/deploy-dd.sh        # or build/install-kairos.sh, build/validate.sh, build/bcm-*.sh
+# 2. The EXACT commands that ran (source of truth). deploy-dd/validate run native
+#    delegated Ansible — read the structured per-task log (every cmsh/dd/exportfs on BCM):
+less logs/latest/04-deploy-dd.ansible.log      # or 06-validate.ansible.log
+#    Local-KVM QEMU launchers + the on-node dd installer are still rendered scripts:
+less build/bcm-qemu.sh build/kairos-qemu-*.sh  # ; on the node: /dev/shm/kairos-install.log
 
 # 3. Full BCM + node health (PASS / WARN / FAIL)
 make validate ANSIBLE_ARGS="-e kairos_profile=<profile> -e kairos_node_name=<node>"
@@ -43,10 +46,12 @@ An Ansible pipeline that builds a Spectro Cloud **Kairos** image and provisions 
 | **Local-KVM** | dev/demo on one host | **1–6** (`make all`) — stands up BCM + a Kairos node in QEMU | `bcm_ssh_host` = `localhost` (default) |
 | **Remote-BCM** | real site | **3, 4, 6** — deploy to bare-metal under an existing BCM | `bcm_ssh_host` = real IP + a jumphost |
 
-**The pattern that matters for debugging:** each role's `tasks/main.yml` is thin — it renders a `templates/*.sh.j2` into **`build/*.sh`** (substituting inventory vars) and then runs it. **`build/<stage>.sh` is the source of truth for what actually executed** after templating. When in doubt, read it.
+**The pattern that matters for debugging:** the BCM-facing stages (`deploy_dd`, `validate`) register the BCM as a runtime Ansible host (`playbooks/tasks/add_bcm_host.yml` → `add_host` named `bcm`) and run **native idempotent tasks** on it via `delegate_to: bcm` — there is no rendered `build/deploy-dd.sh` / `build/validate.sh` anymore (that architecture was dissolved; see the README changelog IN-2291…2293). **The source of truth is the structured per-run Ansible log** `logs/latest/<stage>.ansible.log`, which records every task and every delegated `cmsh` / `dd` / `exportfs` command with `profile_tasks` timings. The QEMU-driving local-KVM stages (`bcm_vm`, `kairos_vm`) *do* still render launcher scripts into `build/` (`bcm-qemu.sh`, `kairos-qemu-<slug>.sh`); the on-node dd installer is `install-kairos.sh` staged into the installer image (trace: `/dev/shm/kairos-install.log` on the node).
 
 ```
-make <target>  →  playbooks/0N-<stage>.yml  →  roles/<role>/  →  build/<stage>.sh  →  ssh/cmsh/dd on BCM or node
+make <target>  →  playbooks/0N-<stage>.yml  →  roles/<role>/  →
+    deploy_dd / validate:  add_host bcm  +  native tasks (delegate_to: bcm)  →  logs/latest/<stage>.ansible.log
+    bcm_vm / kairos_vm:     render build/*-qemu.sh  →  qemu-system
 ```
 
 ---
@@ -56,7 +61,7 @@ make <target>  →  playbooks/0N-<stage>.yml  →  roles/<role>/  →  build/<st
 ```mermaid
 flowchart LR
   subgraph HOST["Build / KVM host — ansible runs here"]
-    ANS["ansible-playbook<br/>renders build/*.sh"]
+    ANS["ansible-playbook<br/>native tasks + delegate_to bcm"]
     QB["QEMU: BCM head-node VM"]
     QK["QEMU: Kairos compute VM"]
   end
@@ -131,7 +136,8 @@ The hand-off at **P6** is where most "it didn't become Kairos" problems live (§
 | What | Where | Notes |
 |---|---|---|
 | Per-stage Ansible run | `logs/0N-<stage>.log` | Makefile `tee`s each `ansible-playbook` here |
-| **The rendered script that actually ran** | `build/<stage>.sh` (e.g. `build/deploy-dd.sh`, `build/install-kairos.sh`, `build/validate.sh`) | post-templating; **read this to see the concrete commands** |
+| **Structured per-task log** (source of truth for `deploy_dd`/`validate`) | `logs/latest/<stage>.ansible.log` (= `logs/run-<ts>/…`) | every task + each delegated `cmsh` / `dd` / `exportfs` on BCM, with `profile_tasks` timings — **read this to see the concrete commands** |
+| Rendered QEMU launchers (local-KVM) | `build/bcm-qemu.sh`, `build/kairos-qemu-<slug>.sh` | the exact `qemu-system` invocation for the BCM / compute VM |
 | BCM VM console (local) | `logs/bcm-install-serial.log` (stage-2 install), `logs/bcm-serial.log` (boot) | `make bcm-serial` tails it |
 | Compute node console (local) | `logs/<slug>-serial.log` (`node001`→`kairos-serial.log`) | `make kairos-serial` tails it; **truncated between PXE-install and disk-boot phases** |
 | Non-blocking finisher | `logs/<slug>-finish.log` | only when `kairos_vm_wait=false` |
@@ -197,9 +203,9 @@ ls -l build/<profile>-disk.raw     # tens of GB; .sha256 present
 | Stale CanvOS / build artifacts | leftovers from prior run | `make clean-canvos` (and `clean`) then rebuild |
 
 ### Stage 4 — `deploy-dd` (`04-deploy-dd.yml` → `deploy_dd`) — *always re-runs*
-**Does (on BCM, via `build/deploy-dd.sh`):** configures DNS/NAT, **NFS exports** (`/cm/images/default-image`, `/cm/shared`, `/cm/images/<profile>-installer`), DHCP pool, rsync module; **lz4-compresses + uploads** the raw to `/cm/shared/kairos/<profile>/disk.raw.lz4`; starts the **HTTP :8888** server; **clones** `default-image`→`<profile>-installer` and `<source_category>`→`<profile>`; **injects `install-kairos.sh` + enables `kairos-install.service`** in the installer image; sets `installmode FULL`, kernel params, health-check exclude filters; **`createramdisk`**; **registers the node** (`device add physicalnode …` for local, or sets category/image/MAC on `bcm_target_node` for remote).
+**Does (native tasks delegated to the `add_host`'d BCM — no rendered script):** configures DNS/NAT *(only if `bcm_manage_dns=true`)*, **NFS exports** (`/cm/images/default-image`, `/cm/shared`, `/cm/images/<profile>-installer`), the DHCP pool *(only if `bcm_manage_cluster_defaults=true`)*, rsync module; **lz4-compresses + uploads** the raw to `/cm/shared/kairos/<profile>/disk.raw.lz4`; starts the **HTTP :8888** server; **clones** `default-image`→`<profile>-installer` and `<source_category>`→`<profile>`; sets `installmode FULL`, kernel params, health-check exclude filters; **`createramdisk`**; **registers the node** (`device add physicalnode …` for local, or sets category/image/MAC on `bcm_target_node` for remote). By default it also **injects `install-kairos.sh` + enables `kairos-install.service`** in the installer image (stage-2 dd on first boot); with **`deploy_dd_finalize_install=true`** it instead sets the category **finalize script** (`kairos-finalize.sh`, dd from the node-installer NFS root) + `installbootrecord=no` — see §6.
 **Artifacts (on BCM):** the `<profile>-installer` software image, the `<profile>` category, `/cm/shared/kairos/<profile>/disk.raw.lz4`, `kairos-install.service` enabled in the image.
-**Logs:** `logs/04-deploy-dd.log`; **`build/deploy-dd.sh`** = exact commands; BCM-side `cmsh` echoes in the log.
+**Logs:** `logs/04-deploy-dd.log` (console) + **`logs/latest/04-deploy-dd.ansible.log`** = exact per-task commands incl. every delegated `cmsh` / `dd` / `exportfs`.
 **Validate (on BCM):**
 ```bash
 cmsh -c "softwareimage; use <profile>-installer; show" | grep -i kernelversion
@@ -212,7 +218,7 @@ ls -l /cm/images/<profile>-installer/etc/systemd/system/multi-user.target.wants/
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| SSH/sshpass to BCM fails | wrong `bcm_password`/`bcm_ssh_port`/host, jumphost | verify the `make validate` connectivity line; check `build/.bcm-ssh-config` |
+| SSH to BCM fails | wrong `bcm_password`/`bcm_ssh_user`/`bcm_ssh_port`/host, jumphost or broker ProxyJump | run `ansible-playbook playbooks/_validate-bcm-host.yml` (the `add_host` smoke test — ping + `cmsh`); check the `bcm_ssh_*` vars |
 | image clone fails / NFS not ready | BCM still settling, disk full | re-run; the script polls for the NFS mount |
 | `kairos-install.service` symlink missing | enable step didn't run (stale image) | re-run `deploy-dd` (re-injects + enables + `createramdisk`) |
 | HTTP 8888 curl fails | http service didn't start | check the `kairos-http.service` on BCM |
@@ -233,7 +239,7 @@ ls -l /cm/images/<profile>-installer/etc/systemd/system/multi-user.target.wants/
 
 ### Stage 6 — `validate` (`06-validate.yml` → `validate`)
 **Does:** ~40 checks over SSH — BCM services/cluster and the booted node's OS/network/services/boot/disk/cloud-config — printing `PASS/WARN/FAIL` and a tally (exits non-zero on any FAIL).
-**Logs:** `logs/06-validate.log`; `build/validate.sh`.
+**Logs:** `logs/06-validate.log` (console) + `logs/latest/06-validate.ansible.log` (per-check detail). validate is native assertion tasks — no rendered script.
 **Run:** `make validate ANSIBLE_ARGS="-e kairos_profile=<p> -e kairos_node_name=<node>"`.
 **Reading the result — "booted BCM image, not Kairos"** is this signature:
 ```
@@ -261,7 +267,9 @@ flowchart TD
   G --> H["sync ; sysrq reboot → Kairos"]
 ```
 
-Reads `kairos_target_disk` (e.g. `/dev/vda` local, `/dev/nvme0n1` remote). **Every step logs to `/dev/shm/kairos-install.log`** — that file tells you exactly which step failed.
+Reads `kairos_target_disk` (e.g. `/dev/vda` local, `/dev/nvme0n1` remote). **Every step logs to `/dev/shm/kairos-install.log`** — that file tells you exactly which step failed. (`install-kairos.sh` stages a real `run-dd.sh` into RAM and execs it; that's the program that does the quiesce→dd→grow→efibootmgr→reboot above.)
+
+**Alternative — finalize-stage install (`deploy_dd_finalize_install=true`).** The stage-2 flow above runs `install-kairos.sh` from the local disk it then dd's over, so on a real BCM the post-dd steps (GPT fix, grow, efibootmgr) fail in a torn-down environment and the console floods with XFS errors. With the flag set, `deploy_dd` instead runs the same dd/grow/efibootmgr as the BCM node-installer's **category finalize script** (`kairos-finalize.sh`, from the node-installer NFS root — never the disk being overwritten), then forces a reboot into the freshly-written Kairos. Its trace lands in the BCM's `/var/log/node-installer` (`Finalize script:` lines), not `/dev/shm/kairos-install.log`. Requires the node's firmware boot order to be disk-first with PXE fallback.
 
 ---
 
@@ -297,7 +305,9 @@ flowchart TD
 
 ## Appendix B — COS_PERSISTENT didn't grow
 
-`install-kairos.sh` deletes+recreates the last partition to fill the disk, then `e2fsck`+`resize2fs`. If the device node for the new partition isn't created (udev) the resize fails (`resize2fs: No such device … p5`) and persistent stays at build size → fills up → node crashes minutes after boot. Check `/dev/shm/kairos-install.log` around "Growing last partition"; ensure no `udevadm --stop-exec-queue` lingers (that bug was removed). `lsblk` should show `COS_PERSISTENT` ≈ disk size.
+`install-kairos.sh`/`run-dd.sh` deletes+recreates the last partition to fill the disk, then `e2fsck`+`resize2fs`. If the device node for the new partition isn't created (udev) the resize fails (`resize2fs: No such device … p5`) and persistent stays at build size → fills up → node crashes minutes after boot. Check `/dev/shm/kairos-install.log` around "Growing last partition". `lsblk` should show `COS_PERSISTENT` ≈ disk size.
+
+On a **real BCM** the stage-2 dd overwrites its own running rootfs, so the grow (and the whole post-dd toolkit) silently fails — the log shows `couldn't detect last partition, skipping grow` and `timeout: No such file or directory`. The fix is **`deploy_dd_finalize_install=true`** (§6): the dd + grow run from the node-installer NFS root, so `resize2fs` grows `COS_PERSISTENT` to fill the disk reliably (validated: 150 G on a 200 G disk). Its trace is on the BCM in `/var/log/node-installer`, not `/dev/shm/kairos-install.log`.
 
 ## Appendix C — Palette registration
 
