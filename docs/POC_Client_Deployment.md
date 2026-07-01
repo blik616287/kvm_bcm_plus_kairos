@@ -110,7 +110,7 @@ We SSH to the BCM head node (directly or via configured jumphost) and make the f
 *Not* changed on a remote BCM (gated off by default):
 
 - **DNS forwarders** — `bcm_manage_dns: false` by default; your site's existing DNS config is untouched. Only a fresh local-KVM BCM has its cluster-wide `nameservers` rewritten.
-- **Cluster defaults** — `bcm_manage_cluster_defaults: false` by default; `defaultcategory` and `nodebasename` on the `base` partition are not touched.
+- **Cluster defaults** — `bcm_manage_cluster_defaults: false` by default; `defaultcategory` and `nodebasename` on the `base` partition are not touched, and `/etc/dhcpd.conf` (make dhcpd authoritative + set the pool range) is not rewritten.
 
 ---
 
@@ -153,7 +153,7 @@ Copy `inventory/group_vars/all.example.yml` to `inventory/group_vars/all.yml` an
 | `bcm_internal_ip` | BCM's IP on the provisioning network (baked into the compute node's HTTP URL) | `"192.168.98.2"` |
 | `bcm_internal_cidr` | CIDR for NFS exports and DHCP pool scope | `"192.168.98.0/24"` |
 | `bcm_manage_dns` | **Must stay `false`** on a customer BCM — skips the cluster-wide DNS rewrite | `false` |
-| `bcm_manage_cluster_defaults` | **Must stay `false`** on a customer BCM — skips flipping `defaultcategory` / `nodebasename` | `false` |
+| `bcm_manage_cluster_defaults` | **Must stay `false`** on a customer BCM — skips flipping `defaultcategory` / `nodebasename` **and** rewriting `/etc/dhcpd.conf` (authoritative + pool range) | `false` |
 | `bcm_target_node` | Existing cmsh device name to re-image | `"edge-4c4c454400485610804bc3c04f4e4434"` |
 | `kairos_target_mac` | **Optional.** MAC of the compute node's provisioning NIC. When set, `deploy-dd` does `set mac <value>` on `bcm_target_node` — mirrors the local-KVM path so the MAC mapping is owned by this deploy rather than pre-configured in cmsh. Leave empty to keep the existing MAC | `"4c:4c:45:44:00:48"` |
 | `kairos_target_ip` | **Optional.** IP to assign on the provisioning network. When set, `deploy-dd` does `set ip <value>` on `bcm_target_node`. Must be inside `bcm_internal_cidr` and outside the DHCP pool (`.16`–`.250`). Leave empty to keep the existing IP | `"192.168.98.10"` |

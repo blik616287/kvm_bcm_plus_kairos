@@ -254,7 +254,7 @@ Single source of truth: `inventory/group_vars/all.yml` (copied from `all.example
 | `bcm_ssh_proxy_key` | Path to the jumphost key (`~` expanded at render time) |
 | `bcm_internal_ip` / `bcm_internal_cidr` | BCM's IP on the provisioning network (baked into the installer's HTTP URL and NFS exports) |
 | `bcm_manage_dns` | **Default `false`** on remote BCM — don't rewrite the site's cluster DNS. Set `true` only when you own the whole BCM |
-| `bcm_manage_cluster_defaults` | **Default `false`** — don't flip `defaultcategory` / `nodebasename` cluster-wide on a customer's BCM |
+| `bcm_manage_cluster_defaults` | **Default `false`** — don't make cluster-wide changes on a customer's BCM: flip `defaultcategory` / `nodebasename`, **or** rewrite `/etc/dhcpd.conf` (make dhcpd authoritative + set the pool range). Local-KVM sets this `true` (it owns its BCM). |
 
 ### Target compute node
 

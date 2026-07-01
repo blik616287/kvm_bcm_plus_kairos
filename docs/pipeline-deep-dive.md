@@ -526,9 +526,9 @@ exportfs -ra
 
 Each profile adds its own `<profile>-installer` export; existing profiles' lines are untouched. **Required for tenant-VLAN devices** (where the host PXE-boots through a DHCP relay onto a network BCM has no direct interface on): without the second ACL, the cloud-config's `mount -t nfs /cm/images/default-image` is rejected by the kernel NFS server and the BCM-integration cmd-in-chroot never starts → BCM stays on `INSTALLER_UNREACHABLE`.
 
-### 6.6 DHCP authoritative + pool range
+### 6.6 DHCP authoritative + pool range *(gated by `bcm_manage_cluster_defaults`)*
 
-`sed 's/not authoritative/authoritative/'` on `/etc/dhcpd.conf`; rewrite the `range` line so the pool fits inside $bcm_internal_cidr (e.g. `.16` through `.250` when CIDR is /24). `systemctl restart dhcpd`.
+**Skipped entirely when `bcm_manage_cluster_defaults=false`** (the default on a customer BCM) — `/etc/dhcpd.conf` is cluster-wide and shared by every subnet/category. When `true` (local-KVM / owned BCM): `sed 's/not authoritative/authoritative/'` on `/etc/dhcpd.conf`; rewrite the `range` line so the pool fits inside $bcm_internal_cidr (e.g. `.16` through `.250` when CIDR is /24); `systemctl restart dhcpd`. The `range` replace matches **every** `range` line, so it is only safe on a single-subnet owned BCM — on a multi-subnet BCM it would clobber every subnet's range (which is exactly why it is gated).
 
 ### 6.7 rsyncd
 
@@ -825,7 +825,7 @@ Script `exit 1` if any `FAIL`, which fails the Ansible playbook.
 Two safety flags in `inventory/group_vars/all.yml` gate the only operations that would be cluster-wide:
 
 - `bcm_manage_dns` (default in discover output: `false`) — §6.2 — when false, the cmsh DNS-nameserver rewrite + `systemctl restart named` is skipped entirely. Rewriting this on a customer BCM would break every non-Kairos node on the site.
-- `bcm_manage_cluster_defaults` (default: `false`) — §6.15 — when false, `partition base set defaultcategory`/`nodebasename` is skipped. Flipping defaultcategory would make every newly-added compute node on the customer's BCM try to install Kairos.
+- `bcm_manage_cluster_defaults` (default: `false`) — §6.6 + §6.15 — when false, both the `partition base set defaultcategory`/`nodebasename` (§6.15) **and** the `/etc/dhcpd.conf` authoritative + pool-range rewrite (§6.6) are skipped. Flipping defaultcategory would make every newly-added compute node on the customer's BCM try to install Kairos; the DHCP-range rewrite would clobber every subnet's pool. Local-KVM sets this `true` (it owns its BCM, so it configures its own DHCP for PXE).
 
 Beyond these flags, `deploy-dd` is additive: it creates a *new* `kairos` category (cloned from `bcm_source_category`, inheriting site-specific disksetup / FinalizeXML) and moves exactly one device — `bcm_target_node` — into it. Moving the device back to its original category and re-PXE'ing reverts it to standard HPC provisioning.
 
