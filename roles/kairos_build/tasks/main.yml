@@ -72,11 +72,14 @@
         - "{{ canvos_dir }}/overlay/files/usr/bin/palette-cleanup-stale.sh"
       failed_when: false
 
-    - name: Patch Earthfile — add BCM packages
+    - name: Patch Earthfile — add BCM packages (+ mdadm when kairos_build_mdraid)
+      # mdadm must be installed HERE (the Earthfile core build), not via the
+      # Dockerfile layer / kairos_extra_apt_packages — the initramfs is built in
+      # this stage, so dracut's mdraid module needs the mdadm binary present now.
       ansible.builtin.replace:
         path: "{{ canvos_dir }}/Earthfile"
         regexp: 'apt-get install --no-install-recommends kbd'
-        replace: 'apt-get install --no-install-recommends wget ifupdown nfs-common kbd'
+        replace: 'apt-get install --no-install-recommends wget ifupdown nfs-common {{ "mdadm " if (kairos_build_mdraid | default(false) | bool) else "" }}kbd'
 
     - name: Patch Earthfile — skip dracut nfit
       ansible.builtin.lineinfile:
@@ -97,6 +100,19 @@
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
         line: "                RUN echo 'install_items+=\" /usr/lib/x86_64-linux-gnu/libapparmor.so.1 \"' > /etc/dracut.conf.d/10-apparmor.conf"
+      failed_when: false
+
+    # Pull the dracut `mdraid` module (+ its mdadm binary) into the initramfs so
+    # the node can `mdadm --assemble` its OS array in the initqueue, before the
+    # cOS root pivot — otherwise COS_STATE living on /dev/md0 is never found and
+    # boot drops to the dracut emergency shell. Paired with rd.auto=1 (below) and
+    # the Earthfile mdadm install (above). Gated: default build is unchanged.
+    - name: Patch Earthfile — include dracut mdraid module (kairos_build_mdraid)
+      ansible.builtin.lineinfile:
+        path: "{{ canvos_dir }}/Earthfile"
+        insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
+        line: "                RUN echo 'add_dracutmodules+=\" mdraid \"' > /etc/dracut.conf.d/15-mdraid.conf"
+      when: kairos_build_mdraid | default(false) | bool
       failed_when: false
 
     - name: Patch Dockerfile — add BCM scripts (COPY + chmod +x as real Dockerfile instructions)
@@ -398,7 +414,9 @@
           IMG_LOOP=$(losetup -f --show "/tmp/kairos-patch-state/$IMG")
           mount "$IMG_LOOP" /tmp/kairos-patch-img 2>/dev/null || { losetup -d "$IMG_LOOP"; umount /tmp/kairos-patch-state; continue; }
           if [ -f /tmp/kairos-patch-img/etc/cos/bootargs.cfg ]; then
-            sed -i 's/net.ifnames=1/net.ifnames=0 biosdevname=0/' /tmp/kairos-patch-img/etc/cos/bootargs.cfg
+            # rd.auto=1 (kairos_build_mdraid) makes dracut scan+assemble md arrays
+            # before the root pivot, so COS_STATE on /dev/md0 is found at boot.
+            sed -i 's/net.ifnames=1/net.ifnames=0 biosdevname=0{{ " rd.auto=1" if (kairos_build_mdraid | default(false) | bool) else "" }}/' /tmp/kairos-patch-img/etc/cos/bootargs.cfg
             echo "Patched bootargs in $IMG"
           fi
           if [ -d /tmp/kairos-patch-img/etc/network/interfaces.d ] && [ ! -f /tmp/kairos-patch-img/etc/network/interfaces.d/ifcfg-eth0 ]; then
@@ -445,6 +463,65 @@
         losetup -d "$LOOP"
         rmdir /tmp/kairos-patch-grub 2>/dev/null || true
       become: true
+
+    # When building the RAID-capable image, assert the load-bearing outputs
+    # actually landed — otherwise the failure only surfaces as a dracut
+    # emergency shell on the real node, after a full deploy. Checks the mdadm
+    # binary is in the rootfs (dracut sources the initramfs copy from here), the
+    # initramfs carries the mdraid module (best-effort lsinitrd), and rd.auto is
+    # on the kernel cmdline. No-op unless kairos_build_mdraid is true.
+    - name: Assert mdraid capability landed in the built image (kairos_build_mdraid)
+      when: kairos_build_mdraid | default(false) | bool
+      become: true
+      changed_when: false
+      args:
+        executable: /bin/bash
+      ansible.builtin.shell: |
+        set -eu
+        LOOP=$(losetup -fP --show {{ raw_disk_path }})
+        cleanup() {
+          umount /tmp/kairos-mdraid-img 2>/dev/null || true
+          umount /tmp/kairos-mdraid-state 2>/dev/null || true
+          losetup -d "$LOOP" 2>/dev/null || true
+          rmdir /tmp/kairos-mdraid-img /tmp/kairos-mdraid-state 2>/dev/null || true
+        }
+        trap cleanup EXIT
+        mkdir -p /tmp/kairos-mdraid-state /tmp/kairos-mdraid-img
+        errs=()
+        mounted=0
+        for p in ${LOOP}p4 ${LOOP}p3 ${LOOP}p2; do
+          [ -b "$p" ] || continue
+          mount "$p" /tmp/kairos-mdraid-state 2>/dev/null || continue
+          IMG=""
+          for cand in cOS/active.img cOS/recovery.img cOS/passive.img; do
+            [ -f "/tmp/kairos-mdraid-state/$cand" ] && { IMG="/tmp/kairos-mdraid-state/$cand"; break; }
+          done
+          [ -n "$IMG" ] || { umount /tmp/kairos-mdraid-state; continue; }
+          IMG_LOOP=$(losetup -f --show "$IMG")
+          if mount "$IMG_LOOP" /tmp/kairos-mdraid-img 2>/dev/null; then
+            mounted=1
+            R=/tmp/kairos-mdraid-img
+            { [ -e "$R/usr/sbin/mdadm" ] || [ -e "$R/sbin/mdadm" ] || [ -e "$R/usr/bin/mdadm" ]; } \
+              || errs+=("[mdadm binary not found in image rootfs]")
+            INITRD=$(ls "$R"/boot/initrd* 2>/dev/null | head -1 || true)
+            if [ -n "$INITRD" ] && command -v lsinitrd >/dev/null 2>&1; then
+              lsinitrd "$INITRD" 2>/dev/null | grep -qiE 'mdadm|mdraid' \
+                || errs+=("[initramfs has no mdraid/mdadm module]")
+            fi
+            [ -f "$R/etc/cos/bootargs.cfg" ] && { grep -q 'rd.auto' "$R/etc/cos/bootargs.cfg" \
+              || errs+=("[rd.auto missing from bootargs.cfg — array will not assemble]"); }
+            umount /tmp/kairos-mdraid-img
+          fi
+          losetup -d "$IMG_LOOP" 2>/dev/null || true
+          umount /tmp/kairos-mdraid-state
+          break
+        done
+        [ "$mounted" = 1 ] || errs+=("[could not mount any cOS image to inspect]")
+        if [ -n "${errs[*]:-}" ]; then
+          echo "kairos_build_mdraid verification FAILED: ${errs[*]}" >&2
+          exit 1
+        fi
+        echo "mdraid verification OK — mdadm in rootfs + rd.auto on cmdline"
 
     - name: Trim sparse zeros
       ansible.builtin.shell: fallocate --dig-holes {{ raw_disk_path }}
