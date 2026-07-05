@@ -26,3 +26,26 @@
 #   - the profile category gets installbootrecord=no (finalize.yml sets it) so the
 #     node-installer never tries to grub-install onto the Kairos disk.
 deploy_dd_finalize_install: false
+
+# Software-RAID layout (opt-in; requires deploy_dd_finalize_install=true and a
+# RAID-capable image built with kairos_build_mdraid=true). Both are UNSET by
+# default — the finalize tasks guard on `is defined`, so a normal single-disk
+# deploy is byte-identical. Array CREATION happens in the finalize script (on the
+# node), NOT the BCM disksetup, so we control mdadm metadata (1.0 for the OS
+# mirror = UEFI-readable ESP; disksetup would use 1.2 and break boot).
+#
+# kairos_os_raid — the OS mirror that becomes the dd target. Must be a RAID1
+#   (level 1) mirror; metadata 1.0; >=2 members. Set kairos_target_disk: /dev/md0.
+#   RAID0/5/6/10 for the OS cannot boot (no member holds a complete ESP) and are
+#   rejected by finalize.yml's assert.
+#     kairos_os_raid: {level: 1, metadata: "1.0", devices: [nvme2n1, nvme3n1]}
+#     kairos_target_disk: /dev/md0
+#
+# kairos_data_raid — zero or more data arrays (off the boot path → any level).
+#   Each is created + mkfs'd with a stable LABEL; the finalize script then injects
+#   a mountpoint + a systemd .mount unit (mount by-label, noatime, nofail) into the
+#   cOS root images so it auto-mounts FAIL-OPEN at boot — a dead member never
+#   blocks boot. (A baked systemd unit, not an /oem cloud-config: cOS's yip no-ops
+#   /oem command steps and regenerates /etc/fstab, and its root is sealed RO.)
+#     kairos_data_raid:
+#       - {name: raid, level: 0, devices: [nvme0n1, nvme1n1], filesystem: ext4, mount: /raid}
