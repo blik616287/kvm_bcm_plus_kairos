@@ -65,6 +65,21 @@ kairos_user_data: ""
 # `make kairos-image` flips this to false automatically.
 kairos_build_raw_disk: true
 
+# Build a RAID-capable Kairos image (opt-in; default false = byte-identical to
+# today). When true, the build makes the image's initramfs able to assemble a
+# Linux software-RAID (mdadm) array at boot, so the raw image can later be
+# dd'd onto a /dev/md* device (e.g. an OS RAID1 mirror) by stage-4 deploy-dd
+# and still boot. It does NOT create any array here — the raw image is still a
+# single-disk image; only the on-boot *assembly* capability is added:
+#   1. mdadm is added to the Earthfile apt line (present before the initramfs
+#      is generated — the Dockerfile layer would be too late for dracut),
+#   2. a dracut drop-in pulls the `mdraid` module into the initramfs,
+#   3. `rd.auto=1` is appended to the cOS kernel cmdline so dracut scans and
+#      assembles arrays before the root pivot.
+# Array creation (mdadm --create, metadata=1.0 for UEFI), the dd target
+# /dev/md0, and the /raid data array are stage-4 concerns, gated separately.
+kairos_build_mdraid: false
+
 # Optional override for CanvOS/k8s_version.json. CanvOS reads that file when
 # K8S_VERSION is empty in .arg, building one container image per
 # (distribution, version) entry. Empty dict (default) leaves whatever ships

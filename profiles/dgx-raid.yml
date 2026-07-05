@@ -1,0 +1,47 @@
+---
+# Build/deploy profile for a RAID DGX-style node (OS RAID1 mirror + data RAID0).
+# Reproduces the engineer's BCM disksetup for dgx03 under the Kairos/dd model.
+#
+# Pass to every stage:
+#   make kairos-build ANSIBLE_ARGS="-e @profiles/dgx-raid.yml"
+#   make deploy-dd    ANSIBLE_ARGS="-e @profiles/dgx-raid.yml"
+#   make validate     ANSIBLE_ARGS="-e @profiles/dgx-raid.yml"
+#
+# STATUS: the STAGE-3 (kairos-build) half is wired — kairos_build_mdraid below
+# makes the image's initramfs assemble an mdadm array at boot. The STAGE-4
+# (deploy-dd) half — actually creating /dev/md0 (metadata=1.0 for UEFI),
+# dd'ing onto it, and building the /raid RAID0 — is NOT wired yet; the
+# kairos_os_raid / kairos_data_raid keys below are the intended contract for
+# that follow-up and are inert until stage 4 consumes them.
+
+kairos_profile: "dgx-raid"
+
+# --- Stage 3: RAID-capable image (WIRED) ---
+# Adds mdadm + the dracut mdraid module + rd.auto=1 so the raw image can be
+# dd'd onto /dev/md0 and still boot. Off = today's single-disk image.
+kairos_build_mdraid: true
+
+kairos_canvos_args:
+  # Distinct ISO_NAME so the "ISO already exists" short-circuit doesn't reuse
+  # another profile's (non-mdraid) ISO from build/.
+  ISO_NAME: "palette-edge-dgxraid"
+
+# --- Stage 4: array layout (CONTRACT — not consumed yet) ---
+# ⚠️ Device names are the engineer's assumed enumeration (OS on nvme2/nvme3,
+# NOT nvme0/1). Confirm against `nvme list` / `lsblk` on the live box (the
+# discovery ISO) before deploying — BMC Device# != Linux /dev/nvmeXn1.
+kairos_os_raid:
+  level: 1
+  metadata: "1.0"          # superblock at END so UEFI can read the ESP off a member
+  devices: [nvme2n1, nvme3n1]
+kairos_target_disk: /dev/md0    # dd target = the assembled OS mirror
+
+kairos_data_raid:
+  - name: raid
+    level: 0
+    devices: [nvme0n1, nvme1n1, nvme4n1, nvme5n1, nvme6n1, nvme7n1, nvme8n1, nvme9n1]
+    filesystem: ext4
+    mount: /raid
+
+# Big disks → the finalize-stage install (grow/timeout/efibootmgr fix) matters.
+deploy_dd_finalize_install: true
