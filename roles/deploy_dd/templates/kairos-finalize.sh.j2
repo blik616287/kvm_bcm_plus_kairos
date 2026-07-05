@@ -36,6 +36,25 @@ mdadm --stop "${DISK}"* 2> /dev/null || true
 dmsetup remove_all 2> /dev/null || true
 udevadm settle --timeout=20 2> /dev/null || true
 
+{% if kairos_os_raid is defined and kairos_os_raid %}
+# --- Assemble the OS RAID1 mirror BEFORE the dd. metadata=1.0 puts the superblock
+# at the END of each member, so the ESP the image writes at LBA0 stays readable by
+# UEFI firmware off either member. dd then targets ${DISK} (= the array). ---
+OS_MEMBERS="{% for d in kairos_os_raid.devices %}/dev/{{ d }} {% endfor %}"
+echo "[kairos-finalize $(date)] building OS RAID1 ${DISK} (metadata {{ kairos_os_raid.metadata | default('1.0') }}) over: ${OS_MEMBERS}"
+mdadm --stop "${DISK}" 2> /dev/null || true
+for m in ${OS_MEMBERS}; do
+    for mp in $(awk -v d="$m" '$1 ~ ("^" d) {print $2}' /proc/mounts | sort -r); do umount -fl "$mp" 2> /dev/null || true; done
+    wipefs -a -f "$m" 2> /dev/null || true
+    mdadm --zero-superblock "$m" 2> /dev/null || true
+done
+yes | mdadm --create "${DISK}" --level=1 --metadata={{ kairos_os_raid.metadata | default('1.0') }} \
+    --raid-devices={{ kairos_os_raid.devices | length }} --run ${OS_MEMBERS} \
+    || echo "[kairos-finalize $(date)] FATAL: mdadm --create ${DISK} failed"
+udevadm settle --timeout=20 2> /dev/null || true
+mdadm --detail "${DISK}" 2>&1 | grep -E 'Raid Level|State|Active Devices' || true
+{% endif %}
+
 for i in $(seq 1 30); do curl --fail --silent --head "${RAW_URL}" > /dev/null 2>&1 && break; sleep 5; done
 echo "[kairos-finalize $(date)] writing image..."
 curl --fail -s "${RAW_URL}" | lz4 -d - - | dd of="${DISK}" bs=4M oflag=direct status=progress
@@ -45,7 +64,7 @@ sgdisk -e "${DISK}" 2>&1 || true
 partprobe "${DISK}" 2>&1 || true
 udevadm settle --timeout=30 2> /dev/null || true
 
-case "${DISK}" in *nvme* | *mmcblk* | *loop*) PSEP=p ;; *) PSEP= ;; esac
+case "${DISK}" in *nvme* | *mmcblk* | *loop* | *md*) PSEP=p ;; *) PSEP= ;; esac
 if command -v sgdisk > /dev/null 2>&1 && command -v resize2fs > /dev/null 2>&1; then
     LAST_NUM=$(sgdisk -p "${DISK}" 2> /dev/null | awk '/^[ ]+[0-9]+/{n=$1} END{print n}')
     LAST_INFO=$(sgdisk -i "${LAST_NUM}" "${DISK}" 2> /dev/null)
@@ -68,13 +87,84 @@ partprobe "${DISK}" 2> /dev/null || true
 udevadm settle --timeout=20 2> /dev/null || true
 if [ -d /sys/firmware/efi/efivars ] && command -v efibootmgr > /dev/null 2>&1; then
     echo "[kairos-finalize $(date)] creating UEFI boot entry..."
-    for n in $(efibootmgr 2> /dev/null | grep 'Kairos$' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//'); do
+    for n in $(efibootmgr 2> /dev/null | grep 'Kairos' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//'); do
         efibootmgr -b "$n" -B 2> /dev/null || true
     done
+{% if kairos_os_raid is defined and kairos_os_raid %}
+    # ESP is mirrored onto each member (metadata 1.0) — firmware can't boot /dev/md0
+    # directly, so register one entry per member disk for redundant boot.
+    for m in ${OS_MEMBERS}; do
+        efibootmgr --create --disk "$m" --part 1 --label "Kairos (${m##*/})" --loader '\EFI\BOOT\bootx64.efi' 2>&1 || true
+    done
+{% else %}
     efibootmgr --create --disk "${DISK}" --part 1 --label Kairos --loader '\EFI\BOOT\bootx64.efi' 2>&1 || true
+{% endif %}
 else
     echo "[kairos-finalize $(date)] no efivars/efibootmgr; relying on ESP fallback loader \\EFI\\BOOT\\bootx64.efi"
 fi
+
+{% if kairos_data_raid is defined and kairos_data_raid %}
+# --- Data arrays (off the boot path → any level). Create + label each, then make
+# them auto-mount by injecting a mountpoint + a systemd .mount unit into the cOS
+# root images (active + passive). Why a baked systemd unit and not a /oem cloud-
+# config: cOS's yip skips or no-ops /oem command steps at boot, cOS regenerates
+# /etc/fstab, and its root is sealed read-only (can't mkdir a top-level mountpoint
+# at runtime). A unit in active.img's /etc (which cOS overlays, so it shows
+# through) mounts by-label at the local-fs stage, read-write, nofail = fail-open:
+# a dead member never blocks boot. Mount by LABEL so it survives md renumbering. ---
+{% for arr in kairos_data_raid %}
+DATA_MEMBERS="{% for d in arr.devices %}/dev/{{ d }} {% endfor %}"
+echo "[kairos-finalize $(date)] building data array {{ arr.name }} (raid{{ arr.level }}) over: ${DATA_MEMBERS}"
+mdadm --stop "/dev/md/{{ arr.name }}" 2> /dev/null || true
+for m in ${DATA_MEMBERS}; do wipefs -a -f "$m" 2> /dev/null || true; mdadm --zero-superblock "$m" 2> /dev/null || true; done
+yes | mdadm --create "/dev/md/{{ arr.name }}" --level={{ arr.level }} \
+    --raid-devices={{ arr.devices | length }} --run ${DATA_MEMBERS} \
+    || echo "[kairos-finalize $(date)] WARN: data array {{ arr.name }} create failed"
+mkfs.{{ arr.filesystem | default('ext4') }} {{ '-f' if (arr.filesystem | default('ext4')) == 'xfs' else '-F' }} -L "{{ arr.name }}" "/dev/md/{{ arr.name }}" 2>&1 | tail -2 || true
+{% endfor %}
+
+echo "[kairos-finalize $(date)] injecting data mounts into cOS root images..."
+STATE_DEV=$(blkid -L COS_STATE 2> /dev/null || echo "${DISK}${PSEP}4")
+KF_STATE=/tmp/kfin-state
+KF_IMG=/tmp/kfin-img
+mkdir -p "$KF_STATE" "$KF_IMG"
+if mount "$STATE_DEV" "$KF_STATE" 2> /dev/null; then
+    for img in "$KF_STATE"/cOS/active.img "$KF_STATE"/cOS/passive.img; do
+        [ -f "$img" ] || continue
+        IL=$(losetup -f --show "$img")
+        if mount "$IL" "$KF_IMG" 2> /dev/null; then
+            mkdir -p "$KF_IMG/etc/systemd/system/local-fs.target.wants"
+{% for arr in kairos_data_raid %}
+            UNIT=$(systemd-escape -p --suffix=mount "{{ arr.mount }}" 2> /dev/null)
+            [ -n "$UNIT" ] || UNIT="$(printf '%s' "{{ arr.mount }}" | sed 's|^/||; s|/|-|g').mount"
+            mkdir -p "$KF_IMG{{ arr.mount }}"
+            cat > "$KF_IMG/etc/systemd/system/${UNIT}" << 'UNITEOF'
+[Unit]
+Description=Kairos data array {{ arr.name }}
+DefaultDependencies=no
+Conflicts=umount.target
+Before=local-fs.target umount.target
+[Mount]
+What=/dev/disk/by-label/{{ arr.name }}
+Where={{ arr.mount }}
+Type={{ arr.filesystem | default('ext4') }}
+Options=noatime,nofail
+[Install]
+WantedBy=local-fs.target
+UNITEOF
+            ln -sf "../${UNIT}" "$KF_IMG/etc/systemd/system/local-fs.target.wants/${UNIT}"
+{% endfor %}
+            sync
+            umount "$KF_IMG" 2> /dev/null || true
+            echo "[kairos-finalize $(date)] injected data mounts into $(basename "$img")"
+        fi
+        losetup -d "$IL" 2> /dev/null || true
+    done
+    umount "$KF_STATE" 2> /dev/null || true
+else
+    echo "[kairos-finalize $(date)] WARN: could not mount COS_STATE (${STATE_DEV}) to inject data mounts"
+fi
+{% endif %}
 
 # Force a real reboot instead of returning to the node-installer. BCM would
 # otherwise switch_root into /localdisk and exec its /sbin/init — but we dd'd

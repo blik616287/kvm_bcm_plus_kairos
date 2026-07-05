@@ -125,6 +125,37 @@ iDRAC/IPMI/Redfish.
 
 ---
 
+## RAID layouts (OS mirror + data arrays)
+
+A profile can declare a software-RAID disk layout — the roles are a generic engine,
+so a new layout is just a new profile file, no code changes. Requires a RAID-capable
+image (`kairos_build_mdraid: true`, stage 3) **and** the finalize-stage install
+(`deploy_dd_finalize_install: true`, stage 4). Arrays are created by the finalize
+script on the node (not the BCM disksetup), so we control mdadm metadata.
+
+```yaml
+# capability (stage 3): build an image whose initramfs can assemble mdadm at boot
+kairos_build_mdraid: true
+deploy_dd_finalize_install: true
+
+# OS mirror → the dd target. MUST be level 1 (only a mirror gives each member a
+# UEFI-readable ESP under metadata 1.0); >=2 members. Set target to the array.
+kairos_os_raid: {level: 1, metadata: "1.0", devices: [nvme2n1, nvme3n1]}
+kairos_target_disk: /dev/md0
+
+# data arrays (off the boot path → any level 0/1/5/6/10). Each is created + mkfs'd
+# with a stable LABEL and mounted FAIL-OPEN (a dead RAID0 member never blocks boot).
+kairos_data_raid:
+  - {name: raid, level: 0, devices: [nvme0n1, nvme1n1, nvme4n1], filesystem: ext4, mount: /raid}
+```
+
+Guardrails (asserted in `deploy_dd/tasks/finalize.yml`): the **OS array must be
+RAID1** — RAID0/5/6/10 for the root can't boot (no single member holds a complete
+ESP), so use `kairos_data_raid` for striped/parity storage. `profiles/dgx-raid.yml`
+is a worked example (2-drive OS mirror + 8-drive data RAID0). ⚠️ Confirm the
+`/dev/nvme*` enumeration on the live box before deploying — BMC `Device#` ≠ Linux
+device name.
+
 ## Notes
 
 - **ISO_NAME must differ per profile** — the build's "ISO already exists" short-circuit

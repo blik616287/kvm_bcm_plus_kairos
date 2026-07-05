@@ -4,6 +4,25 @@
 # image. Included from main.yml only when deploy_dd_finalize_install=true.
 # See roles/deploy_dd/defaults/main.yml for why this exists.
 
+- name: Validate the RAID schema before configuring the category (fail fast on unbootable layouts)
+  # Only a RAID1 mirror gives each member a UEFI-readable ESP under metadata 1.0;
+  # RAID0/5/6/10 for the OS cannot boot (no member holds a complete ESP). Striped/
+  # parity storage must go in kairos_data_raid (data arrays are off the boot path).
+  ansible.builtin.assert:
+    that:
+      - kairos_os_raid.level | int == 1
+      - (kairos_os_raid.metadata | default('1.0')) == '1.0'
+      - kairos_target_disk is match('^/dev/md')
+      - kairos_os_raid.devices | length >= 2
+    fail_msg: >-
+      Invalid kairos_os_raid: need level=1, metadata='1.0', >=2 devices, and
+      kairos_target_disk pointing at the array (e.g. /dev/md0). Use kairos_data_raid
+      for any non-mirror (striped/parity) storage.
+    success_msg: "OS RAID1 schema OK — level 1, metadata 1.0, target {{ kairos_target_disk }}"
+  when: kairos_os_raid is defined and kairos_os_raid
+  delegate_to: bcm
+  run_once: true
+
 - name: Ensure lz4 is present in the node-installer environment
   # The node-installer NFS root ships dd/curl/sgdisk/resize2fs/efibootmgr but not
   # lz4; the finalize script pipes `lz4 -d` into dd, so stage lz4 + its libs in.
