@@ -19,7 +19,7 @@
       kairos_target_disk pointing at the array (e.g. /dev/md0). Use kairos_data_raid
       for any non-mirror (striped/parity) storage.
     success_msg: "OS RAID1 schema OK — level 1, metadata 1.0, target {{ kairos_target_disk }}"
-  when: kairos_os_raid is defined and kairos_os_raid
+  when: (kairos_os_raid | default({})) | length > 0
   delegate_to: bcm
   run_once: true
 
@@ -55,10 +55,11 @@
   # ESP) over the whole disk, so the node-installer must NOT grub-install onto it
   # afterwards (that step fails "cannot find EFI directory" on a UEFI install and
   # would clobber Kairos on a BIOS one).
+  # Single line: a YAML folded scalar keeps newlines on more-indented lines, and
+  # `set finalizescript` (which reads the file) silently no-ops if the cmsh -c arg
+  # carries embedded newlines. Keep the whole cmsh command on one physical line.
   ansible.builtin.command: >-
-    cmsh -c "category; use {{ kairos_profile }};
-      set finalizescript /cm/local/kairos-finalize-{{ kairos_profile }}.sh;
-      set installbootrecord no; commit"
+    cmsh -c "category; use {{ kairos_profile }}; set finalizescript /cm/local/kairos-finalize-{{ kairos_profile }}.sh; set installbootrecord no; commit"
   delegate_to: bcm
   changed_when: true
 
