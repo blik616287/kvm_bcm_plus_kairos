@@ -85,7 +85,15 @@ fi
 
 partprobe "${DISK}" 2> /dev/null || true
 udevadm settle --timeout=20 2> /dev/null || true
-if [ -d /sys/firmware/efi/efivars ] && command -v efibootmgr > /dev/null 2>&1; then
+# The BCM node-installer PXE-boots UEFI but does NOT mount efivarfs, so
+# /sys/firmware/efi/efivars exists yet is empty and efibootmgr fails with "EFI
+# variables are not supported" — its --create calls silently no-op and NO boot
+# entry is written, so the node falls back to UEFI-PXE and reinstall-loops. Mount
+# efivarfs ourselves, then gate on efibootmgr actually working (not just the dir).
+if [ -d /sys/firmware/efi ]; then
+    mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2> /dev/null || true
+fi
+if command -v efibootmgr > /dev/null 2>&1 && efibootmgr > /dev/null 2>&1; then
     echo "[kairos-finalize $(date)] creating UEFI boot entry..."
     for n in $(efibootmgr 2> /dev/null | grep 'Kairos' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//'); do
         efibootmgr -b "$n" -B 2> /dev/null || true
