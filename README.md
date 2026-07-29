@@ -441,10 +441,6 @@ Stages are idempotent:
 
 Force a full rebuild with `make clean && make all` (local-KVM) or `make clean && make kairos-build deploy-dd` (remote BCM).
 
-## License
-
-[MIT](LICENSE) © 2026 Martin Forde <mforde84@gmail.com>, [Blik Labs](https://bliklabs.com).
-
 ## Changelog
 
 Milestones and notable changes, newest first. Each entry links its JIRA ticket
@@ -479,3 +475,7 @@ Milestones and notable changes, newest first. Each entry links its JIRA ticket
 - **BCM-as-managed-host foundation** ([IN-2291](https://insightsoftmax.atlassian.net/browse/IN-2291) · [#25](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/25)) — `playbooks/tasks/add_bcm_host.yml` registers the BCM as a runtime-managed Ansible host (`add_host`), one connection model for both local-KVM and remote/jumphost, so stages can run native delegated tasks (`delegate_to: bcm`) instead of shelling in through rendered bash. The groundwork for dissolving the 300–400-line orchestration scripts into idempotent tasks. Validated against the live BCM.
 - **Logging & observability** ([IN-2290](https://insightsoftmax.atlassian.net/browse/IN-2290) · [#24](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/24)) — per-run timestamped `logs/run-<ts>/` directories with a `latest` symlink (reruns no longer clobber a prior run's evidence), a structured `*.ansible.log` capturing per-task detail incl. delegated hosts, `profile_tasks` slowest-step timings, failed-task stderr surfaced to the console, and a `V=-vv` verbosity knob.
 - **Lint + static-analysis + CI quality gates** ([IN-2289](https://insightsoftmax.atlassian.net/browse/IN-2289) · [#23](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/23)) — the repo's first code-quality gates: shellcheck/shfmt, yamllint, ansible-lint, checkov, gitleaks (blocking), bandit/vulture, pre-commit, `make lint/fmt/analyze`, GitHub Actions CI, and a render-bridge to lint bash embedded in `.sh.j2` templates. Lax baseline-then-ratchet so the existing tree is green; CI runs the same `make` targets as a local checkout for local↔CI parity.
+
+## License
+
+[MIT](LICENSE) © 2026 Martin Forde <mforde84@gmail.com>, [Blik Labs](https://bliklabs.com).
