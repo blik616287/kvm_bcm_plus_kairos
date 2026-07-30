@@ -28,10 +28,16 @@ kairos_canvos_args:
 # The DGX A100 is a fixed-layout appliance and these device names are the
 # engineer's authoritative disksetup — `make validate` re-confirms the live
 # /dev/nvme* names on the node at deploy time (BMC Device# != Linux name).
+# DGX NVMe naming is unstable across boots (nvmeXn1 -> different physical drive per
+# install), so select mirror/data drives by SIZE, not name (else the OS mirror can
+# span a 3.84TB data disk + a 1.9TB OS disk -> mismatched -> boot hangs). Alternative:
+# kairos_raid_select: path (pin by PCIe slot; see the by-path map the finalize logs).
+kairos_raid_select: size
+
 kairos_os_raid:
   level: 1
   metadata: "1.0"          # superblock at END so UEFI can read the ESP off a member
-  devices: [nvme2n1, nvme3n1]
+  devices: [nvme2n1, nvme3n1]   # under 'size' only the count (2) is used, not the names
 kairos_target_disk: /dev/md0    # dd target = the assembled OS mirror
 
 kairos_data_raid:

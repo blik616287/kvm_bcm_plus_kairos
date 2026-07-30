@@ -17,6 +17,23 @@ RAW_URL="http://${HEAD_IP}:8888/{{ kairos_profile }}/disk.raw.lz4"
 WIPE_DISKS="{{ kairos_wipe_disks | default('') }}"
 
 echo "[kairos-finalize $(date)] start -> ${DISK}"
+
+# --- Drive inventory (name/size/model). NVMe naming is NOT stable across machines,
+# so log the physical layout to verify kairos_os_raid/kairos_data_raid target the
+# intended drives (e.g. the OS mirror must land on the two matched OS disks, not a
+# data disk). A size-mismatched OS mirror thrashes and hangs boot. ---
+echo "[kairos-finalize $(date)] === drive inventory ==="
+for _dev in /sys/block/nvme*n1; do
+    [ -e "${_dev}" ] || continue
+    _n=$(basename "${_dev}")
+    _gb=$(($(cat "${_dev}/size" 2> /dev/null || echo 0) / 2 / 1024 / 1024))
+    _model=$(tr -s ' ' < "${_dev}/device/model" 2> /dev/null)
+    echo "  DRIVE ${_n} ${_gb}GB ${_model}"
+done
+# Stable identifiers, to populate a kairos_raid_select: path (or id) profile.
+echo "[kairos-finalize $(date)] by-path map (for kairos_raid_select: path):"
+ls -l /dev/disk/by-path/ 2> /dev/null | awk '/nvme/{print "  "$(NF-2)" -> "$NF}' || true
+
 # Quiet the kernel console: the dd over the target still triggers some block noise.
 echo 1 > /proc/sys/kernel/printk 2> /dev/null || true
 
@@ -36,11 +53,48 @@ mdadm --stop "${DISK}"* 2> /dev/null || true
 dmsetup remove_all 2> /dev/null || true
 udevadm settle --timeout=20 2> /dev/null || true
 
+# --- Drive selection. kairos_raid_select controls how the kairos_os_raid /
+# kairos_data_raid device specs resolve to real block devices:
+#   name (default) -> /dev/<spec>
+#   path           -> /dev/disk/by-path/<spec>  (stable per PCIe slot)
+#   id             -> /dev/disk/by-id/<spec>     (stable per model+serial)
+#   size           -> ignore specs; OS mirror = the smallest N drives, data = the rest
+# nvmeXn1 names are NOT stable across boots on these DGX systems (a name maps to a
+# different physical drive per install), so a name-pinned OS mirror can span a large
+# data disk -> size-mismatched -> thrashes and hangs boot. Prefer size or path. ---
+_SELECT="{{ kairos_raid_select | default('name') }}"
+_resolve_dev() {
+    case "${_SELECT}" in
+        path) readlink -f "/dev/disk/by-path/$1" 2> /dev/null ;;
+        id) readlink -f "/dev/disk/by-id/$1" 2> /dev/null ;;
+        *) echo "/dev/$1" ;;
+    esac
+}
+{% if (kairos_raid_select | default('name')) == 'size' %}
+# size mode: OS mirror = smallest N (N = len(kairos_os_raid.devices)), data = the rest.
+# Assumes a single data array (the DGX 2x-OS + 8x-data layout).
+_OSN={{ kairos_os_raid.devices | length }}
+_ALL=$(for _d in /sys/block/nvme*n1; do [ -e "${_d}" ] || continue; printf '%s %s\n' "$(cat "${_d}/size" 2> /dev/null || echo 0)" "$(basename "${_d}")"; done | sort -n | awk '{print $2}')
+AUTO_OS_MEMBERS=""
+AUTO_DATA_MEMBERS=""
+_i=0
+for _n in ${_ALL}; do
+    if [ "${_i}" -lt "${_OSN}" ]; then AUTO_OS_MEMBERS="${AUTO_OS_MEMBERS}/dev/${_n} "; else AUTO_DATA_MEMBERS="${AUTO_DATA_MEMBERS}/dev/${_n} "; fi
+    _i=$((_i + 1))
+done
+echo "[kairos-finalize $(date)] size-selected OS mirror : ${AUTO_OS_MEMBERS}"
+echo "[kairos-finalize $(date)] size-selected data array: ${AUTO_DATA_MEMBERS}"
+{% endif %}
 {% if kairos_os_raid is defined and kairos_os_raid %}
 # --- Assemble the OS RAID1 mirror BEFORE the dd. metadata=1.0 puts the superblock
 # at the END of each member, so the ESP the image writes at LBA0 stays readable by
 # UEFI firmware off either member. dd then targets ${DISK} (= the array). ---
-OS_MEMBERS="{% for d in kairos_os_raid.devices %}/dev/{{ d }} {% endfor %}"
+{% if (kairos_raid_select | default('name')) == 'size' %}
+OS_MEMBERS="${AUTO_OS_MEMBERS}"
+{% else %}
+OS_MEMBERS=""
+for _s in {% for d in kairos_os_raid.devices %}{{ d }} {% endfor %}; do OS_MEMBERS="${OS_MEMBERS}$(_resolve_dev "${_s}") "; done
+{% endif %}
 echo "[kairos-finalize $(date)] building OS RAID1 ${DISK} (metadata {{ kairos_os_raid.metadata | default('1.0') }}) over: ${OS_MEMBERS}"
 mdadm --stop "${DISK}" 2> /dev/null || true
 for m in ${OS_MEMBERS}; do
@@ -95,18 +149,29 @@ if [ -d /sys/firmware/efi ]; then
 fi
 if command -v efibootmgr > /dev/null 2>&1 && efibootmgr > /dev/null 2>&1; then
     echo "[kairos-finalize $(date)] creating UEFI boot entry..."
+    # drop any stale Kairos entries first
     for n in $(efibootmgr 2> /dev/null | grep 'Kairos' | grep -oE '^Boot[0-9A-Fa-f]+' | sed 's/^Boot//'); do
         efibootmgr -b "$n" -B 2> /dev/null || true
     done
-{% if kairos_os_raid is defined and kairos_os_raid %}
-    # ESP is mirrored onto each member (metadata 1.0) — firmware can't boot /dev/md0
-    # directly, so register one entry per member disk for redundant boot.
-    for m in ${OS_MEMBERS}; do
-        efibootmgr --create --disk "$m" --part 1 --label "Kairos (${m##*/})" --loader '\EFI\BOOT\bootx64.efi' 2>&1 || true
-    done
-{% else %}
+    # Create a labelled entry off the (assembled) target. On RAID we deliberately point
+    # --disk at ${DISK} (= /dev/md0), NOT at the member disks: the members are busy mdraid
+    # devices whose partition 1 is not exposed, so "--disk <member> --part 1" fails with
+    # "Could not prepare Boot variable: No such file or directory". partprobe exposed
+    # ${DISK}p1 (the ESP) and the cOS image's partition GUIDs are fixed, so the resulting
+    # HD(GPT,<uuid>) entry matches the ESP physically mirrored on every member (metadata 1.0).
     efibootmgr --create --disk "${DISK}" --part 1 --label Kairos --loader '\EFI\BOOT\bootx64.efi' 2>&1 || true
-{% endif %}
+    # Load-bearing: make an OS entry boot BEFORE PXE. Our Kairos --create may not stick,
+    # but the firmware always auto-discovers the ESP fallback as a "UEFI OS" entry
+    # (\EFI\BOOT\bootx64.efi, fixed image PARTUUID). This DGX firmware otherwise rebuilds
+    # BootOrder PXE-first on every POST — which is exactly what makes the node re-PXE and
+    # reinstall-loop after the finalize reboot. Reorder: OS entries first, PXE entries last.
+    os_boot=$(efibootmgr 2> /dev/null | grep -iE 'Kairos|UEFI OS' | grep -oE '^Boot[0-9A-Fa-f]{4}' | sed 's/^Boot//' | paste -sd, -)
+    pxe_boot=$(efibootmgr 2> /dev/null | grep -iE 'PXE|Network' | grep -oE '^Boot[0-9A-Fa-f]{4}' | sed 's/^Boot//' | paste -sd, -)
+    if [ -n "${os_boot}" ]; then
+        neworder=$(echo "${os_boot},${pxe_boot}" | sed 's/,,*/,/g; s/,$//')
+        echo "[kairos-finalize $(date)] setting BootOrder OS-first: ${neworder}"
+        efibootmgr -o "${neworder}" 2>&1 || true
+    fi
 else
     echo "[kairos-finalize $(date)] no efivars/efibootmgr; relying on ESP fallback loader \\EFI\\BOOT\\bootx64.efi"
 fi
@@ -121,12 +186,18 @@ fi
 # through) mounts by-label at the local-fs stage, read-write, nofail = fail-open:
 # a dead member never blocks boot. Mount by LABEL so it survives md renumbering. ---
 {% for arr in kairos_data_raid %}
-DATA_MEMBERS="{% for d in arr.devices %}/dev/{{ d }} {% endfor %}"
+{% if (kairos_raid_select | default('name')) == 'size' %}
+DATA_MEMBERS="${AUTO_DATA_MEMBERS}"
+{% else %}
+DATA_MEMBERS=""
+for _s in {% for d in arr.devices %}{{ d }} {% endfor %}; do DATA_MEMBERS="${DATA_MEMBERS}$(_resolve_dev "${_s}") "; done
+{% endif %}
+DATA_COUNT=$(set -- ${DATA_MEMBERS}; echo $#)
 echo "[kairos-finalize $(date)] building data array {{ arr.name }} (raid{{ arr.level }}) over: ${DATA_MEMBERS}"
 mdadm --stop "/dev/md/{{ arr.name }}" 2> /dev/null || true
 for m in ${DATA_MEMBERS}; do wipefs -a -f "$m" 2> /dev/null || true; mdadm --zero-superblock "$m" 2> /dev/null || true; done
 yes | mdadm --create "/dev/md/{{ arr.name }}" --level={{ arr.level }} \
-    --raid-devices={{ arr.devices | length }} --run ${DATA_MEMBERS} \
+    --raid-devices="${DATA_COUNT}" --run ${DATA_MEMBERS} \
     || echo "[kairos-finalize $(date)] WARN: data array {{ arr.name }} create failed"
 mkfs.{{ arr.filesystem | default('ext4') }} {{ '-f' if (arr.filesystem | default('ext4')) == 'xfs' else '-F' }} -L "{{ arr.name }}" "/dev/md/{{ arr.name }}" 2>&1 | tail -2 || true
 {% endfor %}
