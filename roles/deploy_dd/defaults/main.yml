@@ -49,3 +49,17 @@ deploy_dd_finalize_install: false
 #   /oem command steps and regenerates /etc/fstab, and its root is sealed RO.)
 #     kairos_data_raid:
 #       - {name: raid, level: 0, devices: [nvme0n1, nvme1n1], filesystem: ext4, mount: /raid}
+#
+# kairos_raid_select — how the device specs in kairos_os_raid.devices /
+#   kairos_data_raid[].devices are resolved to real block devices at finalize time:
+#     name (default) — literal kernel names: /dev/<spec>            (e.g. nvme2n1)
+#     path           — udev by-path symlinks: /dev/disk/by-path/<spec>  (stable slot)
+#     id             — udev by-id symlinks:   /dev/disk/by-id/<spec>    (model+serial)
+#     size           — IGNORE the specs; OS mirror = the smallest N drives
+#                      (N = len(kairos_os_raid.devices)), data array = the rest.
+#   NVMe kernel names (nvmeXn1) are NOT stable across boots on some hardware (DGX A100:
+#   a name maps to a different physical drive per install), so a name-pinned OS mirror
+#   can span a large data disk — a size-mismatched mirror that thrashes and hangs boot.
+#   Use 'size' (node-agnostic; assumes ONE data array) or 'path' (per PCIe slot; use
+#   the by-path names the finalize logs in its drive inventory). 'id' pins exact serials.
+kairos_raid_select: name
