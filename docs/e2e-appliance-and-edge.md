@@ -40,6 +40,11 @@ went to the local appliance: `api.spectrocloud.com` is unreachable from the node
    ```
    See [`artifacts/README.md`](../artifacts/README.md). An appliance build also
    pulls whatever is missing, so on a fresh rig you can skip this step.
+   **Which** bundle is group_vars, not a profile setting: `appliance_bundle_version`
+   derives the three filenames, `appliance_pe_version` is the stylus agent version
+   inside it, and `appliance_jfrog_repo` / `appliance_artifacts_dir` say where they
+   come from and land — defaults in `inventory/hosts.yml`, overrides in
+   `inventory/group_vars/all.yml`.
 3. **A multi-peer provisioning LAN.** The appliance and the edge node must be up
    **at the same time** — the edge node has to reach the appliance's VIP to
    register. `inventory/hosts.yml` ships `bcm_internal_net_mode: bridge` for this.

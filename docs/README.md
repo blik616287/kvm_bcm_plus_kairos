@@ -30,7 +30,7 @@ BCM + Kairos provisioning pipeline. Start with the runbook; drop into a stage do
 ## Reference
 - [pipeline-deep-dive.md](pipeline-deep-dive.md) — engineer-level per-stage walkthrough.
 - [LOCAL_KVM_DEPLOYMENT.md](LOCAL_KVM_DEPLOYMENT.md) · [POC_Client_Deployment.md](POC_Client_Deployment.md) · [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
-- Repo root `README.md` — variables, make targets, modes. `profiles/README.md` — per-profile schema, RAID layouts, and the local-KVM RAID emulation. `artifacts/README.md` — the licensed Spectro downloads the appliance needs. `inventory/group_vars/all.example.yml` — full variable reference; `all.local-kvm.example.yml` — minimal local-KVM config.
+- Repo root `README.md` — variables, make targets, modes. `profiles/README.md` — per-profile schema, RAID layouts, and the local-KVM RAID emulation. `artifacts/README.md` — the licensed Spectro downloads the appliance needs, how a file is resolved (explicit path → configured name → glob), and the group_vars that name and locate the set. `inventory/group_vars/all.example.yml` — full variable reference; `all.local-kvm.example.yml` — minimal local-KVM config.
 
 ## Partner / field notes (NVIDIA DGX)
 - [nvidia-dgx-fixes-and-asks.md](nvidia-dgx-fixes-and-asks.md) — consolidated fixes + open asks.
