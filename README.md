@@ -227,7 +227,8 @@ make discover           # Interactive: prompts for BCM IP/user/pass + optional j
 
 # Self-hosted Palette appliance (optional; local-KVM only)
 # The appliance is a BUILD PROFILE: BCM provisions it over the ordinary
-# stage 3 -> 4 -> 5 path. See docs/e2e-appliance-and-edge.md for the full runbook.
+# stage 3 -> 4 -> 5 path. docs/REPRODUCE.md is the from-scratch reproduction
+# guide; docs/e2e-appliance-and-edge.md is the operational runbook.
 make palette-appliance  # Build image + BCM deploy + boot node + cluster + tenant
 make palette-build      # Stage 3 only — build the appliance raw disk
 make palette-deploy     # Stage 4 only — push to BCM, configure PXE/category
