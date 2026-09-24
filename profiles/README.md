@@ -202,14 +202,25 @@ role logic, not as sign-off for a DGX deploy.
 
 ## Notes
 
-- **`PE_VERSION` is the stylus *agent* version, not the bundle filename.** A
+- **`PE_VERSION` is the stylus *agent* version, not the bundle filename, and no
+  profile should carry it as a literal.** A
   `palette-enterprise-appliance-4.10.17.tar.zst` bundle ships stylus `v4.10.4`;
-  `4.10.17` is the package/manifest version. Any profile that talks to a
-  self-hosted appliance — the appliance profile itself and every edge profile
-  registering to it — must pin the *stylus* version, and they must all match.
+  `4.10.17` is the package/manifest version. Every profile that talks to a
+  self-hosted appliance passes `PE_VERSION: "{{ appliance_pe_version }}"`, so the
+  appliance image and every edge image registering to it cannot disagree — that
+  one variable is group_vars (`inventory/hosts.yml` default,
+  `inventory/group_vars/all.yml` override) and is checked against the bundle by
+  `playbooks/tasks/appliance_credentials.yml`.
   `python3 playbooks/files/bundle_stylus_version.py artifacts/<bundle>.tar.zst`
-  prints the real one. Unset on an edge profile, CanvOS picks its own default and
-  the node registers healthy but retries a self-upgrade forever.
+  prints the real one. Left unset on an edge profile — as it once was — CanvOS
+  picks its own default and the node registers healthy but retries a self-upgrade
+  forever.
+
+- **The licensed artifact set is not profile-shaped either.**
+  `appliance_bundle_version`, the three `appliance_*_filename` names,
+  `appliance_jfrog_repo` and `appliance_artifacts_dir` are group_vars. A profile
+  pins them only to run two Palette versions side by side on one rig, where each
+  build also needs its own `kairos_profile` namespace on BCM.
 
 - **ISO_NAME must differ per profile** — the build's "ISO already exists" short-circuit
   keys on `build/<ISO_NAME>.iso`. Same name across profiles would reuse the wrong ISO.

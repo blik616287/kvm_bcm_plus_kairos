@@ -119,12 +119,19 @@ the browser warning is expected.
 
 ## Inputs
 
-Licensed artifacts go in `artifacts/`, auto-discovered by extension — see
-[`artifacts/README.md`](../artifacts/README.md).
+Licensed artifacts go in `artifacts/` — see
+[`artifacts/README.md`](../artifacts/README.md). **Which** artifacts is group_vars,
+not a profile setting: `appliance_bundle_version` derives the three filenames,
+`appliance_jfrog_repo` / `appliance_artifacts_dir` say where they come from and
+land, and a file is resolved as *explicit path → the configured name → glob by
+extension*. Defaults are in `inventory/hosts.yml`, overrides go in
+`inventory/group_vars/all.yml`, and a profile pins them only to run two Palette
+versions side by side.
 
 | Var | Purpose |
 |---|---|
-| `appliance_pe_version` | the **stylus agent** version in the bundle — *not* the filename (a `…-4.10.17.tar.zst` bundle ships stylus `v4.10.4`) |
+| `appliance_bundle_version` | the **package** version, i.e. the `.tar.zst` filename (`4.10.17`) |
+| `appliance_pe_version` | the **stylus agent** version in that bundle — *not* the filename (`…-4.10.17.tar.zst` ships stylus `v4.10.4`). Checked against the bundle, and both profiles derive their CanvOS `PE_VERSION` from it |
 | `appliance_vip` | management-cluster VIP; see Addressing above |
 | `appliance_storage_pool_drive` | second disk on the node, **wiped** at deploy (`/dev/vdb` on local-KVM virtio) |
 | `kairos_vm_disks` | the node's extra disks — a list of `{size, bus}`; `bus: nvme` emulates an NVMe controller |

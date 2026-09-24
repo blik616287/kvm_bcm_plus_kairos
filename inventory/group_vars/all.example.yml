@@ -248,6 +248,43 @@ palette_ca_cert: |
 # jfrog_repo:     "iso-releases"
 # iso_filename:   "bcm-11.0-ubuntu2404.iso"
 
+# ==== Self-hosted Palette appliance — the licensed artifact set ====
+# The counterpart of the JFrog block above, for `make palette-appliance`: same
+# instance and credential, different repo, because a content bundle is not an
+# ISO release. Defaults live in inventory/hosts.yml and NONE of this lives in
+# profiles/palette-appliance.yml, so pointing a build at another version or
+# another mirror never means editing a committed profile.
+#
+# WHICH VERSION — two numbers, and they are not the same one. The package
+# version is the filename; the stylus AGENT version is what is inside the
+# bundle. appliance_pe_version must be the second, is checked against the bundle
+# at build time, and both profiles derive their CanvOS PE_VERSION from it, so
+# this is the only place it is written:
+#   python3 playbooks/files/bundle_stylus_version.py artifacts/<bundle>.tar.zst
+# appliance_bundle_version: "4.10.17"     # package version = the filename
+# appliance_pe_version:     "v4.10.4"     # stylus agent version inside it
+#
+# WHICH FILES, by name — derived from appliance_bundle_version; override one
+# outright if your mirror names it differently. The JFrog path and the local
+# filename are deliberately the same string, which is what lets discovery find a
+# pulled file with no further configuration. Empty drops that file from the
+# transfer, so a site that mirrors only the bundle still works.
+# appliance_bundle_filename:           "palette-enterprise-appliance-4.10.17.tar.zst"
+# appliance_bundle_signature_filename: "palette-enterprise-appliance-4.10.17.tar.sig.bin"
+# appliance_signing_key_filename:      "spectro_public_key.pem"
+#
+# WHERE — the mirror, and the local directory those three land in.
+# appliance_jfrog_instance: "{{ jfrog_instance }}"
+# appliance_jfrog_repo:     "palette-content"
+# appliance_jfrog_token:    "{{ jfrog_token }}"
+# appliance_artifacts_dir:  "<repo>/artifacts"
+#
+# Absolute-path escape hatches, for artifacts kept outside that directory. A
+# path here wins over the names above; empty means derive one from them.
+# appliance_content_bundle:           ""
+# appliance_content_bundle_signature: ""
+# appliance_signing_public_key:       ""
+
 # ==== Local-KVM Kairos compute VM (only for kairos-vm stage) ====
 # kairos_vm_mac:       "52:54:00:00:02:01"
 # kairos_vm_ram:       4096
