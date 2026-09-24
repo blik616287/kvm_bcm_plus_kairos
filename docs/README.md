@@ -21,6 +21,7 @@ BCM + Kairos provisioning pipeline. Start with the runbook; drop into a stage do
 
 ## Optional — self-hosted Palette
 - **[e2e-appliance-and-edge.md](e2e-appliance-and-edge.md)** — **the runbook**: stand up the appliance, then provision a Kairos edge node that registers to *it* instead of Palette SaaS. Exact commands, timings, node/IP/MAC layout, how to prove registration went to the local appliance, re-run recipes, and the failure signatures. Start here for the full flow.
+- **[REPRODUCE.md](REPRODUCE.md)** — the same flow written for someone starting from an empty machine and no context: what must be obtained under entitlement, which command stages which licensed input *where* (the BCM ISO and the Palette bundle come from different repos into different directories), the complete `group_vars/all.yml`, and the commands in order with the output each should produce. Hand this to a researcher reproducing the run.
 - **[stage-palette-appliance.md](stage-palette-appliance.md)** — `make palette-appliance` builds a **Palette management appliance** image and has **BCM provision it** onto a managed node, over the same PXE + `dd` path used for edge nodes. It is a build profile (`profiles/palette-appliance.yml`) flowing through stages 3 → 4 → 5, not a parallel pipeline; `deploy_dd` needed no changes. BCM must already be up. The doc lists the five profile settings that make an appliance build differ from an edge build, and the failure signature of each.
 
 ## Targeted troubleshooting

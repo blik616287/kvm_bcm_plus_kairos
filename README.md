@@ -532,6 +532,23 @@ Force a full rebuild with `make clean && make all` (local-KVM) or `make clean &&
 Milestones and notable changes, newest first. Each entry links its JIRA ticket
 (project `IN`) and PR. New milestones append here as part of the same PR.
 
+### 2026-09-24
+
+- **A from-scratch reproduction guide, and the staging step it was missing**
+  ([IN-2663](https://insightsoftmax.atlassian.net/browse/IN-2663) · [#60](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/60)) —
+  `docs/REPRODUCE.md` is the researcher-facing walkthrough of the validated BCM → appliance →
+  registered-edge-node run: the complete seven-key `group_vars/all.yml`, the commands in order,
+  and what each phase should print. Its first version staged only the Palette bundle, which is
+  a real trap rather than an omission: `make palette-artifacts-pull` fetches the content bundle
+  from `appliance_jfrog_repo` into `artifacts/` and never touches the BCM ISO, which comes from
+  `jfrog_repo` into `dist/` and is pulled by `bcm-prepare` itself. Someone following the guide
+  with no JFrog mirror therefore had no `dist/<iso_filename>` and found out mid-stage. Step 1 is
+  now explicitly two halves, section 1 maps every licensed input to its repo variable,
+  destination and fetching command, and the truncated-ISO case is called out because
+  `bcm-prepare` never re-downloads a file that already exists — a short ISO surfaces as a `7z x`
+  archive error during the remaster, and re-running does not fix it. The JFrog token appears in
+  the guide only as `<PLACE JFROG TOKEN HERE>`.
+
 ### 2026-09-23
 
 - **Fix: the appliance shipped a stylus hook whose scripts it does not carry** ([IN-2649](https://insightsoftmax.atlassian.net/browse/IN-2649) · [#58](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/58)) —
@@ -595,8 +612,8 @@ Milestones and notable changes, newest first. Each entry links its JIRA ticket
   boot disk entirely. Together these let a local-KVM VM stand in for a DGX, where **every**
   drive is NVMe and the OS mirror *is* the boot target — a separate boot disk would also break
   array selection, since finalize takes the smallest N drives as the mirror.
-  `profiles/dgx-raid-kvm.yml` is that emulation: four NVMe namespaces (2 × 24 G mirror,
-  2 × 48 G stripe), no boot disk, exercising the RAID path from `profiles/dgx-raid.yml`
+  `profiles/dgx-raid-kvm.yml` is that emulation: four NVMe namespaces (2 × 96 G mirror,
+  2 × 128 G stripe), no boot disk, exercising the RAID path from `profiles/dgx-raid.yml`
   against something other than real DGX hardware.
 - **`kairos_raw_disk_size` + a pre-`dd` capacity check** (same ticket) — the raw image size was
   hardcoded at 80 GiB, and stage 4 `dd`s it onto the target byte for byte. On a RAID profile

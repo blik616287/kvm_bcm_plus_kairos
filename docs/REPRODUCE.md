@@ -28,14 +28,25 @@ them itself. If you have your own mirror, read access to exactly two repo paths
 is enough — nothing else is fetched from JFrog by this experiment:
 
 ```
-<repo-for-isos>/bcm-11.0-ubuntu2404.iso
-<repo-for-content>/palette-enterprise-appliance-<ver>.tar.zst
-<repo-for-content>/palette-enterprise-appliance-<ver>.tar.sig.bin
-<repo-for-content>/spectro_public_key.pem
+<jfrog_repo>/bcm-11.0-ubuntu2404.iso                                -> dist/
+<appliance_jfrog_repo>/palette-enterprise-appliance-<ver>.tar.zst   -> artifacts/
+<appliance_jfrog_repo>/palette-enterprise-appliance-<ver>.tar.sig.bin
+<appliance_jfrog_repo>/spectro_public_key.pem
 ```
 
-Without a mirror, drop the three Palette files into `artifacts/` by hand and put
-the BCM ISO in `dist/`.
+The two halves are fetched by **different commands into different directories**,
+and that is the step most easily missed: `make palette-artifacts-pull` stages the
+Palette bundle only — it never touches the BCM ISO. Step 1 below does both.
+
+| Input | JFrog repo variable | Lands in | Fetched by |
+|---|---|---|---|
+| BCM ISO (~13 GB) | `jfrog_repo` (default `iso-releases`) | `dist/<iso_filename>` | `make bcm-prepare`, if the file is absent |
+| bundle + `.sig.bin` + `.pem` (~10 GB) | `appliance_jfrog_repo` (default `palette-content`) | `artifacts/` | `make palette-artifacts-pull`, or any appliance build with an empty `artifacts/` |
+
+Without a mirror, copy each set into its directory by hand. **Filenames matter** —
+discovery is by name, so the ISO must be called exactly what `iso_filename` says
+and the Palette files exactly what the three `appliance_*_filename` settings in
+`profiles/palette-appliance.yml` say.
 
 > **The edge node needs no licensed artifacts of its own.** It is built from
 > upstream `ubuntu` via CanvOS plus credentials minted from your own appliance.
@@ -51,7 +62,7 @@ The validated host:
 | Kernel | 7.0.0-28-generic (x86_64) |
 | CPUs | 32 |
 | RAM | 125 GiB |
-| Free disk | ≥ 400 GB (three 80 GiB raw images + lz4 copies + qcow2 growth) |
+| Free disk | ≥ 400 GB (the ~23 GB of licensed inputs, plus three 80 GiB raw images + lz4 copies + qcow2 growth) |
 | Virtualisation | `/dev/kvm` present |
 | ansible-core | 2.20.2 |
 | QEMU | 8.2.2 |
@@ -169,6 +180,43 @@ make install-deps && make setup             # no MISSING lines
 ```
 
 ### Step 1 — stage the licensed inputs
+
+Two sets, two destinations (section 1). Do **both** — the BCM ISO is not part of
+`palette-artifacts-pull`.
+
+**1a — BCM ISO into `dist/`.** With a mirror configured this is optional:
+`make bcm-prepare` in step 2 downloads
+`https://<jfrog_instance>/artifactory/<jfrog_repo>/<iso_filename>` itself when
+`dist/<iso_filename>` is missing, and skips the download when it is already
+there. Stage it up front if you want the ~13 GB transfer to fail early rather
+than 90 minutes into the run, or if you have no mirror and are copying the ISO
+straight off your NVIDIA/Bright entitlement download:
+
+```bash
+mkdir -p dist
+# no mirror — just place the entitlement download, under its exact iso_filename:
+cp /path/to/bcm-11.0-ubuntu2404.iso dist/
+
+# or pull it from your mirror. The token goes in a 0600 file, never in argv:
+# (this is the same thing roles/bcm_prepare does, and why)
+umask 077
+printf 'header = "Authorization: Bearer %s"\n' "$JFROG_TOKEN" > "$HOME/.jfrog-curl.cfg"
+curl --fail -L --progress-bar -K "$HOME/.jfrog-curl.cfg" \
+  -o dist/bcm-11.0-ubuntu2404.iso \
+  "https://insightsoftmax.jfrog.io/artifactory/iso-releases/bcm-11.0-ubuntu2404.iso"
+rm -f "$HOME/.jfrog-curl.cfg"
+
+ls -lh dist/     # ~13 GB, and the name must equal iso_filename
+```
+
+A 401/403 here means the token lacks read on the ISO repo. Check the size
+afterwards either way: `--fail` stops an error page being saved, but nothing
+catches an interrupted transfer, and a truncated ISO is the worst case:
+`bcm-prepare` never re-downloads a file that already exists, so the run reports
+an archive error out of `7z x` during the remaster rather than a download error,
+and re-running changes nothing. Delete a short file and pull it again.
+
+**1b — Palette bundle into `artifacts/`.**
 
 ```bash
 make palette-artifacts-pull      # JFrog -> artifacts/   (~10 GB)

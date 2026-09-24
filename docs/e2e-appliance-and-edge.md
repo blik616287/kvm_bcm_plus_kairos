@@ -28,7 +28,11 @@ went to the local appliance: `api.spectrocloud.com` is unreachable from the node
 ## Prerequisites
 
 1. **BCM up** (stages 1–2). The appliance and the edge node are both BCM-provisioned
-   nodes; BCM is what serves DHCP, TFTP, NFS and the node-installer.
+   nodes; BCM is what serves DHCP, TFTP, NFS and the node-installer. Stage 1 needs
+   the **BCM ISO** at `dist/<iso_filename>`; it downloads it from `jfrog_repo` when
+   absent, or you copy it in by hand. That is a *different* input from the licensed
+   Spectro artifacts below, out of a different JFrog repo into a different directory —
+   `make palette-artifacts-pull` does not fetch it.
 2. **Licensed Spectro artifacts** in `artifacts/` — content bundle, its detached
    signature, and the content-signing public key. Either copy them in or pull them:
    ```bash
