@@ -156,6 +156,41 @@ is a worked example (2-drive OS mirror + 8-drive data RAID0). ⚠️ Confirm the
 `/dev/nvme*` enumeration on the live box before deploying — BMC `Device#` ≠ Linux
 device name.
 
+### Testing a RAID layout without the hardware
+
+`profiles/dgx-raid-kvm.yml` runs the same RAID path on a local-KVM node, so the
+array creation, the `dd`-to-`/dev/md0` and the UEFI boot off a mirror member can
+be exercised on the rig instead of on a DGX. Two things make it a faithful stand-in:
+
+- **Every disk is NVMe** (`bus: nvme` in `kairos_vm_disks` attaches an emulated
+  NVMe controller, not virtio). `kairos_raid_select: size` globs `/sys/block/nvme*n1`
+  — virtio disks would be `vd*` and the selector would find nothing.
+- **There is no separate boot disk** (`kairos_vm_disk_size: ""`). A DGX has none,
+  and here it would actively break selection: the smallest N drives become the OS
+  mirror, so a small boot disk would be chosen as a member.
+
+```yaml
+kairos_vm_disk_size: ""          # no boot disk; the mirror IS the boot target
+kairos_vm_disks:
+  - {size: "24G", bus: nvme}     # \
+  - {size: "24G", bus: nvme}     #  > smallest two -> OS mirror
+  - {size: "48G", bus: nvme}     # \
+  - {size: "48G", bus: nvme}     #  > the rest -> /raid stripe
+```
+
+Two sizing floors apply, to different things — get either wrong and the error names neither:
+
+| Floor | Applies to | Symptom if too small |
+|---|---|---|
+| BCM installer env (disksetup: 100M ESP + 16G swap + ~9.4G image) | each **OS mirror member** | `An error occurred while provisioning. Ran out of disk space!` — before finalize ever runs |
+| `kairos_raw_disk_size` | the assembled **array** | `dd` stops at `No space left on device` (now caught before the write, naming both numbers) |
+| the image's own layout (OEM + recovery + state, ~51 GiB on the edge image) | `kairos_raw_disk_size` itself | `the requested partitions size (50960MiB) does not fit in the target disk` during the stage-3 install |
+
+What it does **not** cover: real NVMe enumeration instability (the reason
+`kairos_raid_select` exists at all — QEMU enumerates deterministically), drive
+count, and anything vendor-firmware shaped. Treat it as a regression test for the
+role logic, not as sign-off for a DGX deploy.
+
 ## Notes
 
 - **ISO_NAME must differ per profile** — the build's "ISO already exists" short-circuit

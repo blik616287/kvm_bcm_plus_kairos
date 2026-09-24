@@ -1,0 +1,68 @@
+---
+# appliance_fetch_artifacts.yml — pull the licensed Palette artifacts from
+# JFrog into artifacts/, mirroring how roles/bcm_prepare pulls the BCM ISO.
+#
+# Each file is fetched only when it is missing locally, so a populated
+# artifacts/ dir is left alone and re-runs cost nothing. The credential goes in
+# a 0600 curl config read with -K rather than on the command line: process
+# arguments are world-readable via /proc, and these are multi-GB downloads.
+#
+# A profile names the files it wants (appliance_bundle_filename etc.), which is
+# what makes per-version profiles work without anyone hand-copying ~10 GB.
+
+- name: Ensure the artifacts directory exists
+  ansible.builtin.file:
+    path: "{{ appliance_artifacts_dir }}"
+    state: directory
+    mode: "0755"
+  become: false
+
+- name: Decide which artifacts still need fetching
+  ansible.builtin.stat:
+    path: "{{ appliance_artifacts_dir }}/{{ item }}"
+  register: appliance_artifact_stats
+  loop: "{{ appliance_jfrog_files | select | list }}"
+
+- name: Fetch the licensed artifacts from JFrog
+  when: appliance_artifact_stats.results | rejectattr('stat.exists') | list | length > 0
+  block:
+    - name: Stage a 0600 curl config holding the JFrog credential
+      ansible.builtin.copy:
+        dest: "{{ appliance_artifacts_dir }}/.jfrog-curl.cfg"
+        mode: "0600"
+        content: |
+          header = "Authorization: Bearer {{ appliance_jfrog_token }}"
+      become: false
+      no_log: true
+
+    - name: Download each missing artifact
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --fail
+          - --location
+          - --progress-bar
+          - -K
+          - "{{ appliance_artifacts_dir }}/.jfrog-curl.cfg"
+          - -o
+          - "{{ appliance_artifacts_dir }}/{{ item.item }}"
+          - "https://{{ appliance_jfrog_instance }}/artifactory/{{ appliance_jfrog_repo }}/{{ item.item }}"
+      loop: "{{ appliance_artifact_stats.results | rejectattr('stat.exists') | list }}"
+      loop_control:
+        label: "{{ item.item }}"
+      become: false
+      changed_when: true
+      async: "{{ appliance_jfrog_fetch_timeout }}"
+      poll: 15
+  always:
+    - name: Remove the staged curl config
+      ansible.builtin.file:
+        path: "{{ appliance_artifacts_dir }}/.jfrog-curl.cfg"
+        state: absent
+      become: false
+
+- name: Report the artifacts in place
+  ansible.builtin.debug:
+    msg: >-
+      artifacts/: {{ appliance_jfrog_files | select | list | join(', ') }}
+      ({{ 'fetched from ' ~ appliance_jfrog_repo if appliance_artifact_stats.results | rejectattr('stat.exists') | list | length > 0 else 'already present' }})

@@ -44,6 +44,48 @@
   changed_when: false
   failed_when: false
 
+# Only relevant in socket mode. There, the provisioning "network" is a QEMU
+# socket netdev -- BCM holds the `listen=` end and each compute VM `connect=`s
+# to it -- which is POINT-TO-POINT and carries ONE compute VM at a time.
+# bcm_internal_net_mode: bridge replaces it with a real LAN and lifts this. Start a second while
+# another is attached and it gets no carrier at all, dying with
+# `PXE-E18: Server response timeout`, which reads like broken DHCP/TFTP on BCM
+# and sends you looking in entirely the wrong place.
+#
+# BCM keeps listening the whole time, so nothing needs restarting — stopping
+# the VM that holds the link is the whole fix. (Checking this by hand needs
+# root: an unprivileged `ss -ltn` does not show a root-owned listening socket,
+# which makes it look like BCM has stopped listening when it has not.)
+#
+# Multicast, QEMU's N-peer socket mode, is not a drop-in alternative: it needs
+# a multicast-capable interface, and `lo` is not one, so it would put the rig's
+# DHCP and PXE traffic on the physical network.
+- name: Refuse to start a second compute VM on the same provisioning link
+  ansible.builtin.shell:
+    # /bin/sh here is dash, which has no `set -o pipefail`.
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      pgrep -af 'qemu-system.*-name Kairos-ComputeNode-' 2>/dev/null \
+        | grep -v -- '-name {{ kairos_vm_name }} ' \
+        | grep -oE 'Kairos-ComputeNode-[A-Za-z0-9_-]+' | sort -u | tr '\n' ' '
+  register: kairos_vm_other_nodes
+  changed_when: false
+  failed_when: false
+
+- name: Fail with the reason, not with PXE-E18 twenty minutes later
+  # Only a socket-mode link is point-to-point. On a bridge the whole point is
+  # that several nodes coexist -- an edge node registering to an appliance on
+  # the same provisioning LAN needs exactly that.
+  when: (bcm_internal_net_mode | default('socket')) != 'bridge'
+  ansible.builtin.assert:
+    that: kairos_vm_other_nodes.stdout | trim | length == 0
+    fail_msg: >-
+      {{ kairos_vm_other_nodes.stdout | trim }} is already attached to the
+      provisioning link, which is point-to-point — {{ kairos_vm_name }} would
+      get no network and fail PXE. Stop it first:
+      make kairos-stop NODE={{ (kairos_vm_other_nodes.stdout | trim | split(' ') | first | default('')) | regex_replace('^Kairos-ComputeNode-', '') }}
+
 - name: Reset {{ kairos_node_name }} install mode to FULL before recreating disk
   ansible.builtin.shell: |
     {{ bcm_ssh_cmd }} "echo -e 'device\nuse {{ kairos_node_name }}\nset installmode FULL\ncommit' | cmsh 2>&1"
@@ -52,13 +94,30 @@
 - name: Create fresh Kairos disk + OVMF vars
   ansible.builtin.shell: |
     rm -f "{{ kairos_disk }}" "{{ kairos_ovmf_vars }}"
-    qemu-img create -f qcow2 "{{ kairos_disk }}" {{ kairos_vm_disk_size }}
+    # kairos_vm_disk_size empty = no separate boot disk (RAID profiles: the
+    # mirror assembled from the NVMe members is the boot target).
+    if [ -n "{{ kairos_vm_disk_size | default('') }}" ]; then
+      qemu-img create -f qcow2 "{{ kairos_disk }}" {{ kairos_vm_disk_size }}
+    fi
     # Per-VM writable copy of OVMF UEFI vars — matches the OVMF firmware used by
     # kairos_build. Shared between PXE-install and disk-boot phases so efibootmgr
     # entries created during install persist into the post-install boot.
     OVMF_VARS_SRC=/usr/share/OVMF/OVMF_VARS_4M.fd
     [ -f "$OVMF_VARS_SRC" ] || OVMF_VARS_SRC=/usr/share/ovmf/OVMF.fd
     cp -f "$OVMF_VARS_SRC" "{{ kairos_ovmf_vars }}"
+
+- name: Create the extra disks
+  # Recreated alongside the boot disk so a reinstall never inherits a previous
+  # deployment's storage state — for a RAID profile that would mean stale
+  # mdadm superblocks left on the members.
+  ansible.builtin.shell: |
+    rm -f "{{ build_dir }}/{{ kairos_vm_slug }}-d{{ ansible_loop.index }}.qcow2"
+    qemu-img create -f qcow2 "{{ build_dir }}/{{ kairos_vm_slug }}-d{{ ansible_loop.index }}.qcow2" {{ item.size }}
+  loop: "{{ kairos_vm_disks | default([]) }}"
+  loop_control:
+    extended: true
+    label: "d{{ ansible_loop.index }} {{ item.size }} ({{ item.bus | default('virtio') }})"
+  changed_when: true
 
 - name: Detect KVM acceleration
   ansible.builtin.shell: test -e /dev/kvm && echo "-enable-kvm" || echo ""
@@ -70,6 +129,16 @@
     src: kairos-qemu.sh.j2
     dest: "{{ build_dir }}/kairos-qemu-{{ kairos_vm_slug }}.sh"
     mode: "0755"
+
+- name: Baseline the node-installer's fatal count before this boot
+  # Taken before the VM starts, so the wait below can tell a NEW failure from
+  # the one that is already in the log from a previous attempt.
+  ansible.builtin.shell: |
+    {{ bcm_ssh_cmd }} "grep -ac 'There was a fatal problem' /var/log/node-installer 2>/dev/null" || echo 0
+  register: kairos_vm_installer_fatals
+  changed_when: false
+  failed_when: false
+  when: kairos_vm_wait | default(true) | bool
 
 - name: Launch Kairos compute VM (PXE boot, OVMF/UEFI)
   # order=cn = PXE then disk; -no-reboot powers the VM off after dd so the
@@ -120,13 +189,31 @@
 
 - name: Wait for dd install to complete (VM powers off, up to 30 min)
   when: kairos_vm_wait | default(true) | bool
+  # The VM staying up is the only success signal, so a node the installer has
+  # already given up on looks identical to one still working -- and burns the
+  # full 30 minutes.
+  #
+  # BCM's device status is NOT a usable signal here: it keeps the previous
+  # attempt's verdict until the new installer overwrites it, so a re-run after
+  # any failure reads INSTALLER_FAILED for the first minutes of a perfectly
+  # healthy install. Count the node-installer's own fatal lines instead, from a
+  # baseline taken just before this VM boots -- a new one is unambiguous.
   ansible.builtin.shell: |
     TIMEOUT=1800
     ELAPSED=0
     PID=$(cat "{{ kairos_pid_file }}" 2>/dev/null)
-    echo "Waiting for Kairos VM to power off after dd (PID $PID)..."
+    BASE={{ kairos_vm_installer_fatals.stdout | default('0') | trim }}
+    echo "Waiting for Kairos VM to power off after dd (PID $PID); installer fatals at start: $BASE"
     while [ $ELAPSED -lt $TIMEOUT ]; do
       kill -0 "$PID" 2>/dev/null || { echo "VM powered off at ${ELAPSED}s"; exit 0; }
+      if [ $((ELAPSED % 60)) -eq 0 ]; then
+        NOW=$({{ bcm_ssh_cmd }} "grep -ac 'There was a fatal problem' /var/log/node-installer 2>/dev/null" 2>/dev/null | tr -d '\r')
+        if [ -n "$NOW" ] && [ "$NOW" -gt "${BASE:-0}" ] 2>/dev/null; then
+          echo "BCM node-installer reported a new fatal problem at ${ELAPSED}s:"
+          {{ bcm_ssh_cmd }} "grep -a 'The error was:' /var/log/node-installer | tail -3" 2>/dev/null || true
+          exit 1
+        fi
+      fi
       sleep 10
       ELAPSED=$((ELAPSED + 10))
     done

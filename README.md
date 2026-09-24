@@ -43,6 +43,7 @@ End state in both cases: compute nodes PXE boot from BCM, `dd` a pre-built Kairo
 
 - Ansible
 - `sshpass`, `jq` (always)
+- `zstd`, `bsdtar`, `xxd`, `openssl` — only for the optional [self-hosted Palette appliance](#self-hosted-palette-optional-local-kvm)
 - `qemu-system-x86_64` + `/dev/kvm`, Docker, `xorriso`, `p7zip`, `lz4`, `mtools`, `dosfstools`, OVMF (UEFI) firmware — required for the **kairos-build** stage (CanvOS + Earthly + UEFI raw-image generator). Also required for all stages when running in **local KVM** mode.
 
 ```bash
@@ -204,6 +205,9 @@ Remote-BCM deploy ─┤                            ├─> deploy-dd ──> va
 
 Stages **bcm-vm** and **kairos-build** can run in parallel.
 
+Optionally, a **self-hosted Palette appliance** slots between stages 2 and 3 —
+see [Self-hosted Palette](#self-hosted-palette-optional-local-kvm) below.
+
 ## Make Targets
 
 ```bash
@@ -220,6 +224,15 @@ make all                # Stages 1–6 (local-KVM mode)
 # Discovery
 make discover           # Interactive: prompts for BCM IP/user/pass + optional jumphost,
                         # emits bcm-discovery-<hostname>.yml with suggested group_vars
+
+# Self-hosted Palette appliance (optional; local-KVM only)
+make palette-appliance  # Build appliance ISO + install VM + deploy cluster + create tenant
+make palette-iso        # ISO only            (--tags build)
+make palette-vm         # Install + boot only (--tags vm)
+make palette-cluster    # Content + cluster   (--tags cluster)
+make palette-tenant     # First tenant only   (--tags tenant)
+make palette-stop       # Stop the appliance VM
+make palette-serial     # Tail the appliance serial log
 
 # VM management (local-KVM mode)
 make bcm-stop           # Stop BCM VM
@@ -290,10 +303,60 @@ Single source of truth: `inventory/group_vars/all.yml` (copied from `all.example
 
 See `inventory/group_vars/all.example.yml` for the complete list with inline commentary.
 
+## Self-hosted Palette appliance (optional, local-KVM)
+
+`make palette-appliance` builds a **Palette management appliance** image and has **BCM
+provision it** onto a managed node — the same PXE + `dd` path BCM uses for Kairos edge nodes.
+The rig then has its own Palette, so edge nodes register against it instead of SaaS. The
+local-KVM defaults otherwise ship `palette_*` placeholders.
+
+The appliance is a **build profile**, not a parallel pipeline:
+
+```
+make palette-build    # stage 3: build/palette-appliance-disk.raw
+make palette-deploy   # stage 4: BCM software image + category + PXE + node registration
+make palette-node     # stage 5: PXE boot; BCM dd's the image onto the node
+make palette-appliance  # all of the above, then the mgmt cluster + first tenant
+```
+
+Each stage can also be run directly with `-e @profiles/palette-appliance.yml`. BCM must
+already be up (stages 1–2) — it is what provisions the node.
+
+`roles/deploy_dd` needed **no changes**: it was already generic over `kairos_profile`.
+
+### What makes an appliance build differ from an edge build
+
+Five profile settings, each required:
+
+| Setting | Why |
+|---|---|
+| `kairos_cloud_config_template` | swaps the image's cloud-config wholesale — `kairos_user_data` only layers on top |
+| `kairos_build_self_install` | the appliance image boots its own installer; an injected `kairos-agent install` races the labels it writes and fails `device or resource busy` |
+| `deploy_dd_finalize_install` | dd from the node-installer NFS root, else the post-`dd` GPT fix / grow / `efibootmgr` all silently fail and the disk is unbootable |
+| `kairos_edge_custom_config` | bakes in the content-signing public key, else the bundle upload fails `public key to verify content not found` |
+| `kairos_vm_probe_user` / `_password` | the post-boot probe defaults to the edge image's `kairos` account, which an appliance does not have |
+
+### Addressing
+
+`deploy_dd` **derives** the local-KVM node address as `bcm_internal_ip` prefix + `(9 + node
+number)` — node002 is always `192.168.98.11` — and ignores `kairos_target_ip` there (that is
+remote-BCM only). The VIP must avoid BCM's DHCP pool (`.16`–`.250`), `bcm_internal_ip`, and
+that derived address; `.251` clears all three, and `palette_cluster` asserts it.
+
+Everything reaches the appliance **through BCM** (`delegate_to: bcm`), including the ~10 GB
+bundle, which is staged under `/cm/shared/kairos/<profile>/` and removed afterwards.
+
+Credentials are **sticky** (`inventory > .run-credentials.yml > generated`): the image carries
+a *hash* of the Local UI password, so a regenerated one strands the appliance.
+
+Full detail, including the failure signatures for each of the five settings, is in
+[`docs/stage-palette-appliance.md`](docs/stage-palette-appliance.md).
+
 ## Documentation
 
 - `docs/POC_Client_Deployment.md` — client-facing POC deployment document (also rendered to `docs/POC_Client_Deployment.pdf`)
 - `docs/pipeline-deep-dive.md` — engineer-level walkthrough of every stage, including the exact commands each role issues and why
+- `docs/stage-palette-appliance.md` — the optional self-hosted Palette appliance (networking, ordering, troubleshooting)
 
 ## Key Design Points
 
@@ -371,6 +434,7 @@ kvm_bcm_plus_kairos/
 ├── playbooks/
 │   ├── 01-bcm-prepare.yml  …  06-validate.yml
 │   ├── discover-bcm.yml         # remote BCM discovery (supports jumphost)
+│   ├── palette-appliance.yml    # optional self-hosted Palette (unnumbered)
 │   ├── site.yml                 # full pipeline
 │   ├── teardown.yml
 │   └── install-dependencies.yml
@@ -381,15 +445,21 @@ kvm_bcm_plus_kairos/
 │   ├── deploy_dd/               # Upload + configure BCM for PXE deploy
 │   ├── kairos_vm/               # PXE boot compute VM (local-KVM)
 │   ├── validate/                # ~40-point health checks
-│   └── dependencies/
+│   ├── dependencies/
+│   ├── appliance_iso/           # Palette appliance ISO (CanvOS, separate checkout)
+│   ├── appliance_vm/            # Palette appliance QEMU VM (raw QEMU, socket net)
+│   ├── palette_cluster/         # content bundle + management cluster
+│   └── palette_tenant/          # first tenant
 ├── files/canvos/                # CanvOS overlay
 │   └── overlay/files/usr/bin/palette-cleanup-stale.sh   # pre-registration hook
+├── artifacts/                   # licensed Spectro downloads for the appliance — gitignored
 ├── docs/
 │   ├── POC_Client_Deployment.md   # client-facing POC doc
 │   ├── POC_Client_Deployment.pdf  # rendered via weasyprint
 │   └── pipeline-deep-dive.md      # engineer walkthrough
 ├── build/   dist/   logs/       # generated artifacts — gitignored
-└── CanvOS/                      # cloned at build time — gitignored
+├── CanvOS/                      # cloned at build time (Kairos edge image) — gitignored
+└── CanvOS-appliance/            # cloned at build time (Palette appliance) — gitignored
 ```
 
 ## Logs
@@ -445,6 +515,180 @@ Force a full rebuild with `make clean && make all` (local-KVM) or `make clean &&
 
 Milestones and notable changes, newest first. Each entry links its JIRA ticket
 (project `IN`) and PR. New milestones append here as part of the same PR.
+
+### 2026-09-23
+
+- **Fix: the appliance shipped a stylus hook whose scripts it does not carry** (IN-TBD · #TBD) —
+  the overlay's `bcm-sync.conf` adds `ExecStartPre=/usr/bin/palette-cleanup-stale.sh` (and
+  `bcm-sync-userdata.sh`) to `stylus-agent`. Those arrive only via the Dockerfile `COPY`, and an
+  appliance build installs a **different rootfs** than the one CanvOS customises — the ISO's
+  `rootfs.squashfs` has all three scripts, the deployed system (`KAIROS_VARIANT="core"`) has
+  none. systemd then failed the unit `203/EXEC` and restarted it forever (675 attempts when
+  this was found), so stylus never ran and Palette never deployed. Nothing pointed at it: the
+  node booted clean, the Local UI answered 200, the 11 GB bundle uploaded, `spc.tgz` landed,
+  and the cluster simply sat at `Provisioning`. Clearing `ExecStartPre` on the box brought
+  stylus `active` instantly, which then created kube-vip and the VIP came up. The hook is now
+  gated behind `kairos_build_bcm_integration` (default true; false for the appliance, which is
+  not a BCM-registered edge node and needs neither hostname sync nor Palette pre-registration
+  cleanup).
+- **Fix: the cluster→tenant hand-off green-lit on the static UI** (same ticket) — the VIP
+  readiness probe was `GET <vip>/system` expecting 200, which the static frontend answers the
+  moment ingress is up: roughly **half an hour** before Palette's API exists. The tenant role
+  therefore started against a server that answers `405` to every POST, and its 10×15 s budget
+  expired long before the API appeared — surfacing as a censored `no_log` timeout that said
+  nothing about the cause. `palette_cluster` now also waits for the API itself, using POST as
+  the discriminator (static handler → `405`; real API → `401/403` to a credential-less login),
+  bounded by `appliance_api_timeout`. Verified both ways against a live appliance. The tenant
+  login keeps its `no_log` but gets a larger budget, since readiness is now proven upstream.
+- **Licensed Palette artifacts move through JFrog** (IN-TBD · #TBD) — the ~10 GB content
+  bundle, its detached signature and the content-signing key are mirrored to JFrog and fetched
+  the same way stage 1 fetches the BCM ISO, instead of someone hand-copying them onto each rig.
+  `make palette-artifacts-push` publishes (deliberately explicit — it pushes licensed Spectro
+  Cloud content to a shared repo, which no ordinary build should do as a side effect);
+  `make palette-artifacts-pull` fetches, and an appliance build pulls automatically for whatever
+  `artifacts/` is missing, so a fresh rig runs `make palette-appliance` and proceeds. Same
+  credential and instance as the BCM ISO (`jfrog_token`), different repo (`palette-content`) —
+  a content bundle is not an ISO release. The JFrog path and the local filename are deliberately
+  identical, which is what lets the existing extension-based discovery find a pulled file with
+  no further configuration. The credential goes in a `0600` curl config read with `-K`, removed
+  in an `always:`, for the same `/proc` reason as `bcm_prepare`.
+- **Fix: a cloud-config stage key with no entries crashed the installer** (same ticket) —
+  `cloud-config.yaml.j2` always emitted `stages.initramfs:`, but only ever wrote into it when
+  `palette_api_key` *and* `palette_project_uid` were both set. An empty mapping key is YAML
+  null, and kairos-sdk's collector dereferences it — `kairos-agent` segfaults in `DeepMerge`
+  (`collector.go:201`) before the install begins, three retries deep. The visible symptom is
+  90 seconds later and points somewhere else entirely: a blank disk and
+  `no EFI System Partition (vfat) found` from the verify step. `projectUid:` had the same shape
+  (`is defined` is true for an empty string). Both keys are now emitted only when populated,
+  and `check-cloud-config.py` fails the build at **render** time, naming the offending key —
+  where it still has a name and a line number.
+- **`kairos_vm`: several disks, any bus, optional boot disk** (same ticket) — `kairos_vm_disks`
+  replaces the single `kairos_vm_data_disk_size` with a list of `{size, bus}`, where `bus: nvme`
+  attaches an emulated NVMe controller rather than virtio. `kairos_vm_disk_size: ""` omits the
+  boot disk entirely. Together these let a local-KVM VM stand in for a DGX, where **every**
+  drive is NVMe and the OS mirror *is* the boot target — a separate boot disk would also break
+  array selection, since finalize takes the smallest N drives as the mirror.
+  `profiles/dgx-raid-kvm.yml` is that emulation: four NVMe namespaces (2 × 24 G mirror,
+  2 × 48 G stripe), no boot disk, exercising the RAID path from `profiles/dgx-raid.yml`
+  against something other than real DGX hardware.
+- **`kairos_raw_disk_size` + a pre-`dd` capacity check** (same ticket) — the raw image size was
+  hardcoded at 80 GiB, and stage 4 `dd`s it onto the target byte for byte. On a RAID profile
+  the target is the **array**, which is easy to undersize: members look roomy individually
+  while a mirror is one member wide. `kairos-finalize.sh` now compares the two before writing
+  and fails naming both numbers, rather than hitting `No space left on device` minutes in with
+  a half-written GPT. The size is a profile knob (default unchanged), so a test rig can build a
+  small image instead of dd'ing 56 GiB of empty `COS_PERSISTENT` twice into a mirror.
+  `profiles/dgx-raid-kvm.yml` also grew its members 24G → 96G, against **three** floors that
+  each fail somewhere other than the profile that set the size: a mirror member must first
+  hold **BCM's own installer environment** (disksetup is 100M ESP + 16G swap + the ~9.4G
+  software image — under ~28G the run dies mid-provision with *"An error occurred while
+  provisioning. Ran out of disk space!"*, pointing at BCM); the **array** must hold the whole
+  image; and the image itself cannot go much below ~56 GiB, because the edge layout asks for
+  OEM 5120 + recovery 20200 + state 25576 MiB before `COS_PERSISTENT` gets anything, and
+  kairos-agent refuses with *"the requested partitions size (50960MiB) does not fit in the
+  target disk"*. All three are documented where the sizes are set.
+- **Fix: the compute VM's NIC name moved when the disk layout changed** (same ticket) — QEMU
+  hands out PCI slots to `-device` entries in command-line order, and the launcher wrote the
+  disks first. Four `-device nvme` namespaces therefore pushed the NIC from `enp0s2` to
+  `enp0s6`, while `roles/deploy_dd` registers the node against a fixed provisioning interface
+  name. PXE succeeded and the node-installer then refused the node: *"booted using an interface
+  (enp0s6) which is not defined in the node object"* — which reads as a BCM misconfiguration,
+  three layers from the cause. The NIC is now declared before any disk, so it takes the first
+  free slot whatever the layout is. (`-drive ... if=virtio` disks never disturbed it, which is
+  why this only appeared with the NVMe profile.) Stage 5 also polls BCM's device status during
+  the dd wait and fails on `INSTALLER_FAILED` with BCM's own reason, instead of treating "the
+  VM is still up" as progress for the full 30-minute timeout.
+- **`deploy_dd` checks `bcm_target_node` actually exists** (same ticket) — the cmsh assign
+  carries `failed_when: false` (cmsh reports benign conditions on stderr), so a device name
+  that is not on this BCM passed silently and the run went on to PXE a node it had never put
+  in the category.
+- **Fix: two compute VMs cannot share the provisioning link** (same ticket) — the local-KVM
+  provisioning "network" is a QEMU socket netdev (BCM `listen=`, each node `connect=`), which
+  is point-to-point: it carries **one** compute VM at a time. Starting a second while another
+  is attached gives it no carrier at all, and it dies twenty minutes later with
+  `PXE-E18: Server response timeout` — which reads like broken DHCP/TFTP on BCM. Nothing in
+  the role said so; its comments assumed concurrent nodes worked ("so a second concurrent node
+  gets a non-colliding set"). Stage 5 now refuses to start, naming the VM that holds the link
+  and the `make kairos-stop NODE=<it>` to free it. `make kairos-stop` gained that `NODE=`
+  argument so one node can be stopped without killing the rest, and the port is now
+  `bcm_internal_socket_port` rather than three separate literals.
+  **Note for anyone debugging this by hand:** an unprivileged `ss -ltn` does not show a
+  root-owned listening socket, so BCM looks like it has stopped listening when it has not —
+  check as root. Separately, a freshly booted node takes roughly two minutes to answer on the
+  network; `No route to host` before then is normal, not a failed deploy.
+- **`make palette-console`** (same ticket) — the appliance sits on the provisioning network and
+  the build host has no interface on it, so `https://<vip>/` from a desktop browser reaches
+  nothing even when the appliance is perfectly healthy and `ansible bcm -m uri` gets a 200.
+  That is indistinguishable from a failed deploy, and the workaround was a hand-rolled `ssh -L`.
+  The target tunnels the VIP and the node's Local UI through BCM, which *is* on that network,
+  asking BCM for the node's current IP rather than trusting a var. Read-only; Ctrl-C closes it.
+- **Fix: `deploy_dd` wrote into a software image that was still being cloned** (same ticket) —
+  `cmsh`'s clone returns long before the copy does, and the readiness gate only stat'd the
+  image's `/usr`, which appears a second or two into a clone that takes minutes. The next task
+  then failed with `Destination directory /cm/images/<profile>-installer/usr/local/bin does not
+  exist`. A race, so it passed on a re-run and on any profile whose image already existed —
+  which is how it survived this long, and why it first appeared on a brand-new profile. The
+  gate now waits for the image size to stop moving, which is true of a finished clone and of a
+  pre-existing image alike.
+- **`deploy_dd` stops checksumming 80 GB to compare two timestamps** (same ticket) — the stat
+  that decides whether the lz4 archive is stale read only `.exists` and `.mtime`, but the
+  module checksums by default, so every stage-4 run began with a SHA-1 pass over the raw image
+  and its archive.
+- **`palette_cluster`: the appliance password stops riding in argv** (same ticket) — the
+  `spc.tgz` placement passed it to `sshpass -p`, so it was readable via `/proc` and the task
+  needed `no_log: true` — which is what made its one real failure unreadable (a censored
+  `FAILED!` and nothing else). It now goes in a `0600` file on BCM consumed with `sshpass -f`
+  and removed in an `always:`, and the task logs normally.
+
+### 2026-09-22
+
+- **Self-hosted Palette appliance, provisioned BY BCM** (IN-TBD · #TBD) — brings
+  [palette-appliance-automation](https://github.com/blik616287/palette-appliance-automation)
+  (`8f29a40`) in as `make palette-appliance`. The appliance is a **build profile**
+  (`profiles/palette-appliance.yml`) flowing through the ordinary stage 3 → 4 → 5 pipeline, so
+  BCM provisions it over PXE + `dd` exactly as it provisions Kairos edge nodes.
+  `roles/deploy_dd` needed **no changes** — it was already generic over `kairos_profile`.
+  Upstream drove libvirt; nothing libvirt-shaped survives, and no libvirt dependency is added.
+  Validated end to end on the local-KVM rig: image built and verified bootable, BCM deployed it
+  to node002, the node booted Kairos, and the appliance Local UI answered with the seeded
+  admin account.
+- **`kairos_build` gains four profile hooks** (same ticket), each with defaults that leave
+  every existing edge profile byte-identical: `kairos_cloud_config_template` (swap the image's
+  cloud-config wholesale — `kairos_user_data` only layers on top, so it cannot express a
+  non-edge image); `kairos_build_self_install` (let an image that boots its own installer
+  install itself, instead of injecting `kairos-agent install` — a stylus image mounts
+  `COS_PERSISTENT` the instant those labels appear, so the injected installer loses a race
+  against the labels it just wrote and fails `device or resource busy` on every retry);
+  `kairos_dockerfile_extra` (raw Dockerfile instructions `kairos_extra_apt_packages` cannot
+  express, e.g. the DRBD kernel-headers `COPY`); and `kairos_edge_custom_config` (bake the
+  content-signing public key in, else the appliance rejects the bundle with
+  `public key to verify content not found`).
+- **`kairos_vm`: optional data disk + profile-overridable boot probe** (same ticket) —
+  `kairos_vm_data_disk_size` gives a node a second disk (the appliance keeps its
+  Piraeus/LINSTOR storage pool there, and that disk is wiped at deploy). The post-boot probe
+  no longer hardcodes the edge image's `kairos`/`kairos` account, which an appliance image does
+  not have; it would otherwise burn its whole 10-minute timeout while the appliance sat there
+  serving.
+- **Fix Dockerfile-block leakage between profiles** (same ticket) — `kairos_extra_apt_packages`
+  guarded its `blockinfile` with `when:`, so the block stayed in the **shared** CanvOS checkout
+  when the next profile set none. Live as soon as the appliance became the first profile to use
+  it: building the appliance then an edge profile would have shipped `lvm2`/`drbd-utils` in the
+  edge image. Both that block and the new one now use `state: present/absent`.
+- **`kairos_build`: deactivate LVM before the install teardown** (same ticket) — an image that
+  ships `lvm2` starts LVM2 monitoring in the live installer environment, which holds the target
+  disk; `kairos-agent`'s own `blkdeactivate` then fails `device or resource busy`. Guarded on
+  the binaries existing, so images without `lvm2` are unaffected.
+- **`bcm_prepare`: keep the JFrog token out of `ps`** (same ticket) — the ISO download passed
+  the credential in `curl`'s argv, and process arguments are world-readable via `/proc`, so any
+  local user could read it off `ps` for the whole multi-GB download. It now goes in a `0600`
+  curl config consumed with `-K`, removed in an `always:` block.
+- **Defects found by running it** (same ticket), none visible to review: `make setup` checked
+  the invoking user's PATH while the tasks run under `become: true`, so a conda-shadowed
+  `bsdtar` reported green while root had none; `zstd` silently refuses a **symlinked** bundle
+  and exits 0 having written nothing, surfacing as `tarfile.ReadError: empty file`
+  (`extract_spc.py` now resolves with `realpath`); an unanchored `pkill` could match the shell
+  running it; and `appliance_pe_version` is the **stylus agent** version, not the bundle
+  filename — a `…-4.10.17.tar.zst` bundle ships stylus `v4.10.4`.
 
 ### 2026-07-05
 

@@ -54,3 +54,10 @@ qemu_display_type:
 palette_endpoint: "palette.example.com"
 palette_api_key: ""
 palette_project_uid: ""
+
+
+# --- Palette appliance ---
+# The appliance is built/deployed through kairos_build + deploy_dd via
+# profiles/palette-appliance.yml, so it needs no template fixtures of its own;
+# only the shared values a role default might reference.
+appliance_vip: "192.168.98.11"

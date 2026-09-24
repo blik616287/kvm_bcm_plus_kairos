@@ -1,0 +1,87 @@
+#cloud-config
+# Palette management appliance — base cloud-config for the image.
+#
+# Selected by profiles/palette-appliance.yml via kairos_cloud_config_template,
+# and delivered as /oem/90_custom.yaml during the OVMF install, exactly like
+# the Kairos edge config it replaces. The resulting raw disk is then deployed
+# BY BCM (stage 4 deploy-dd, PXE + dd) onto a managed node, so nothing here
+# configures the network: the appliance is a BCM node and takes its address
+# from BCM like any other, pinned with kairos_target_ip.
+install:
+  auto: true
+  reboot: false
+  poweroff: true
+  grub_options:
+    # console=ttyS0 makes the deployed node's serial capture useful; without it
+    # the log goes silent a few seconds into boot, right before anything
+    # interesting happens. net.ifnames=0 matches the Kairos edge image so the
+    # provisioning NIC is eth0 on the installed system.
+{% if appliance_fips_enabled | default(false) %}
+    extra_cmdline: "fips=1 selinux=0 net.ifnames=0 biosdevname=0 console=tty1 console=ttyS0,115200"
+{% else %}
+    # Set appliance_fips_enabled for a FIPS build; fips=1 on a non-FIPS kernel
+    # can fail to boot.
+    extra_cmdline: "selinux=0 net.ifnames=0 biosdevname=0 console=tty1 console=ttyS0,115200"
+{% endif %}
+  # Piraeus/LINSTOR keeps state on these; they must survive image rotation.
+  bind_mounts:
+    - /etc/lvm
+    - /var/lib/drbd
+    - /var/lib/linstor.d
+    - /var/lib/piraeus-datastore
+    - /var/lib/calico
+
+stylus:
+  debug: false
+  trace: false
+  # airgap: content comes from the bundle uploaded to the Local UI after boot,
+  # never from a registry.
+  installationMode: airgap
+  applianceType: palette
+  includeTui: true
+
+stages:
+  initramfs:
+    - name: "Seed appliance administrative account"
+      # Seeded so the deployment completes without console interaction. The
+      # hash is computed in playbooks/tasks/appliance_credentials.yml; the
+      # matching plaintext is persisted in .run-credentials.yml, and the two
+      # MUST stay in step across invocations.
+      users:
+        {{ appliance_admin_user }}:
+          passwd: "{{ appliance_admin_password_hash }}"
+          groups:
+            - "{{ appliance_admin_group }}"
+          homedir: "/home/{{ appliance_admin_user }}"
+          shell: /bin/bash
+
+  boot:
+    - name: "Permit password SSH for the seeded admin"
+      # Two things in the pipeline reach this box over SSH from BCM, both as
+      # appliance_admin_user: roles/kairos_vm's post-boot probe, and
+      # palette_cluster placing spc.tgz in /usr/local/spectrocloud/spc (the
+      # Local UI upload-clusterconfig endpoint is skipped when content signing
+      # is enabled, so the file has to arrive over SSH). The Kairos EDGE image
+      # enables this the same way; the appliance image does not by default, and
+      # without it those tasks fail "Permission denied" with a CORRECT password.
+      #
+      # Deliberately narrower than the edge image, which also sets
+      # PermitRootLogin yes: this box runs the management plane, so only the
+      # seeded admin gets in, and only from the provisioning LAN.
+      files:
+        - path: /etc/ssh/sshd_config.d/99-palette-appliance.conf
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            PasswordAuthentication yes
+            PermitRootLogin no
+      commands:
+        - systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+
+    - name: "Record the resulting addresses on the console"
+      # Diagnostic only. The first question when the Local UI or the VIP is
+      # unreachable is "what address did BCM actually give this node", and
+      # without this the serial capture cannot answer it.
+      commands:
+        - ip -4 -br addr 2>&1 | logger -s -t palette-appliance || true

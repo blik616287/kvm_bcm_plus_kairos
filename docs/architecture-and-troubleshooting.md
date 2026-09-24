@@ -92,6 +92,30 @@ flowchart LR
 
 **Networks (local-KVM):** BCM and the compute VM share a QEMU **socket network** — BCM `listen=:31337`, node `connect=:31337` — which is the *provisioning network* (`bcm_internal_cidr`, default `192.168.98.0/24`; your site may use another, e.g. `10.184.70.0/x`). BCM also has a user-mode NAT NIC with **host-forwards**: `bcm_ssh_port`→22, `bcm_https_port`→443. Kernel args force `net.ifnames=0` so NICs are `ethN`.
 
+> **That socket network is point-to-point.** It carries **one** compute VM at a time: start a
+> second while another is attached and it gets no carrier at all, dying with
+> `PXE-E18: Server response timeout`, which reads like broken DHCP/TFTP on BCM and sends you
+> looking in the wrong place. `roles/kairos_vm` now refuses to start in that case, naming the
+> VM that holds the link. BCM keeps listening throughout, so nothing needs restarting —
+> stopping the other VM (`make kairos-stop NODE=<it>`) is the whole fix.
+>
+> Two things will mislead you here. An unprivileged `ss -ltn` does **not** show a root-owned
+> listening socket, so BCM looks like it has stopped listening when it has not — check as
+> root. And a freshly booted node takes roughly **two minutes** to answer on the network, so
+> `No route to host` immediately after a successful install is normal.
+>
+> Multicast — QEMU's N-peer socket mode — is not a drop-in fix: it needs a multicast-capable
+> interface, and `lo` is not one, so it would put the rig's DHCP and PXE traffic on the
+> physical network.
+
+> **A stale ISO in `build/` silently wins over your profile changes.** Stage 3 skips the whole
+> input-generation block — `.arg`, the overlay copy, the Dockerfile patches,
+> `.edge-custom-config.yaml` *and* the cloud-config bake — whenever
+> `build/<ISO_NAME>.iso` already exists. The check is file existence only; it does not look at
+> whether any input changed. So editing a profile or a cloud-config template and re-running
+> stage 3 rebuilds **nothing**, and the old image deploys looking like a successful build.
+> Delete `build/<ISO_NAME>.iso` (and the matching `-disk.raw*`) to force a real rebuild.
+
 **Ports in play:** DHCP 67/udp, TFTP 69/udp, NFS 111+2049, **HTTP 8888 (Kairos raw image)**, rsync 873, cmd 8081 (node→BCM heartbeat), SSH 22.
 
 ---

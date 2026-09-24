@@ -34,8 +34,17 @@ bcm_manage_cluster_defaults: true
 
 # ---------------------------------------------------------------------------
 # OPTIONAL — Palette registration. Leave commented for a pure bring-up + boot
-# (the node will come up but won't register; a local on-prem Palette usually
-# isn't reachable from the KVM rig anyway). Uncomment + fill to register.
+# (the node will come up but won't register). Uncomment + fill to register
+# against SaaS or an existing on-prem Palette.
+#
+# OR stand up your OWN Palette on this rig: `make palette-appliance` builds a
+# management appliance and runs it as a third VM on the SAME provisioning
+# network, so the node CAN reach it. Run it after `make bcm-vm` and before
+# `make kairos-build`, then copy its endpoint + API key into the values below.
+# See "Self-hosted Palette" in README.md and docs/stage-palette-appliance.md.
+#
+#   appliance_pe_version  must match the agent version your content bundle
+#   ships — set it here if it differs from the default in inventory/hosts.yml.
 # ---------------------------------------------------------------------------
 # palette_endpoint:     "palette.example.com"     # SaaS: api.spectrocloud.com
 # palette_project_uid:  "your-project-uid"
@@ -53,6 +62,8 @@ bcm_manage_cluster_defaults: true
 #   bcm_vm_ram / bcm_vm_cpus / bcm_vm_disk_size
 #   jfrog_instance / jfrog_repo / iso_filename
 #   kairos_vm_mac / kairos_vm_ram / kairos_vm_cpus / kairos_vm_disk_size
+#   appliance_* (self-hosted Palette: addressing, hostfwd ports, VM sizing,
+#     artifacts dir, admin login) — see the SELF-HOSTED PALETTE APPLIANCE block
 # Kairos build knobs (OS_VERSION etc.) default in roles/kairos_build/defaults;
 # override via kairos_canvos_args here if needed. See all.example.yml.
 # ---------------------------------------------------------------------------

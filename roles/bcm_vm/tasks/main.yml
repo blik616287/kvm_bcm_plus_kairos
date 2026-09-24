@@ -43,7 +43,7 @@
     pkill -f "qemu-system.*BCM-HeadNode" 2>/dev/null || true
     sleep 2
     # Verify ports are free
-    ss -tlnp 2>/dev/null | grep -q ":31337 " && { echo "WARN: port 31337 still in use"; exit 1; } || true
+    ss -tlnp 2>/dev/null | grep -q ":{{ bcm_internal_socket_port | default(31337) }} " && { echo "WARN: port {{ bcm_internal_socket_port | default(31337) }} still in use"; exit 1; } || true
     ss -tlnp 2>/dev/null | grep -q ":{{ bcm_ssh_port }} " && { echo "WARN: port {{ bcm_ssh_port }} still in use"; exit 1; } || true
     echo "Clean"
   become: true

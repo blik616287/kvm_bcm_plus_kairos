@@ -207,6 +207,8 @@ palette_management_mode:    "central"
 
 # PEM block for a private CA signing the Palette endpoint's cert. Required for
 # on-prem Palette with non-public certs; leave empty for SaaS Palette.
+# For the self-hosted appliance (`make palette-appliance`, local-KVM only), grab
+# it with: openssl s_client -connect <appliance_vip>:443 -showcerts
 palette_ca_cert: |
   -----BEGIN CERTIFICATE-----
   ...

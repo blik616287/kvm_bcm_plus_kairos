@@ -1,0 +1,308 @@
+---
+# palette_cluster (main) — upload the staged bundle to the appliance, create
+# the management cluster, wait for Palette.
+#
+# Runs AFTER tasks/preflight.yml (localhost) and the bcm transfer play. It
+# depends on facts those set: appliance_node_ip, appliance_localui_url,
+# appliance_vip_url, palette_share, palette_workdir.
+#
+# Ported from palette-appliance-automation (upstream 8f29a40), then re-pointed
+# when the appliance became a BCM-provisioned node rather than a VM the build
+# host owns. Consequences, and they shape this whole file:
+#
+#   * The appliance lives on BCM's provisioning network, which the build host
+#     cannot route to. Every call to it therefore runs `delegate_to: bcm`.
+#   * Its address is whatever BCM gave the node, so it is looked up from cmsh
+#     rather than configured here (same approach as roles/validate).
+#   * The ~10 GB content bundle has to be staged ON BCM first, because the
+#     upload is a push to the appliance's Local UI and only BCM can reach it.
+#     It is removed again at the end - on a customer head node that is a large
+#     temporary footprint under /cm/shared.
+#
+# TLS: the appliance serves a self-signed certificate that does not exist until
+# it is built, and the VIP is private to the provisioning LAN, so there is
+# nothing to pin against. The CKV_ANSIBLE_1 skips record that deliberately.
+
+# ---- Talk to the appliance's Local UI, from BCM ----
+
+- name: Log in to the Local UI
+  # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP; see the role header.
+  ansible.builtin.uri:
+    url: "{{ appliance_localui_url }}/v1/users/default/login"
+    method: POST
+    validate_certs: false
+    body_format: json
+    body:
+      username: "{{ appliance_admin_user }}"
+      password: "{{ appliance_admin_password }}"
+    status_code: [200]
+  delegate_to: bcm
+  register: palette_login
+  no_log: true
+
+- name: Save the session cookie for the curl uploads
+  ansible.builtin.copy:
+    dest: "{{ palette_share }}/cookies"
+    mode: "0600"
+    # Netscape cookie jar; curl needs the header line and tab-separated fields.
+    content: "# Netscape HTTP Cookie File\n{{ appliance_node_ip }}\tFALSE\t/\tTRUE\t0\tAuthorization\t{{ palette_login.cookies.Authorization }}\n"
+  delegate_to: bcm
+  no_log: true
+
+- name: Upload the content bundle
+  # curl rather than uri: streams ~10 GB as multipart, from BCM to the node
+  # across the provisioning LAN.
+  ansible.builtin.command:
+    argv: "{{ ['curl', '-sk', '-b', palette_share ~ '/cookies', '-X', 'POST',
+               '-F', 'uploadFile=@' ~ palette_share ~ '/content-bundle.tar.zst']
+              + (['-F', 'signature=@' ~ palette_share ~ '/content.sig.hex']
+                 if appliance_content_bundle_signature | length > 0 else [])
+              + ['-o', palette_share ~ '/upload.json', '-w', '%{http_code}',
+                 appliance_localui_url ~ '/v1/edge-mgmt/edgehosts/current/actions/upload-content'] }}"
+  delegate_to: bcm
+  register: palette_content_upload
+  changed_when: true
+  failed_when: palette_content_upload.stdout | trim not in ['200', '201']
+  # NO async/poll here, deliberately. This task is delegate_to: bcm, so the
+  # async job file is written on BCM — but Ansible runs ASYNC POLL against
+  # localhost, never finds it, and reports finished=False forever. The upload
+  # completes, the content lands, and the play hangs until the async timeout.
+  # Upstream could use async because it ran this on localhost; delegating it
+  # through BCM changed that. The SSH keepalives in add_bcm_host.yml
+  # (ServerAliveInterval=15, ServerAliveCountMax=10) are what keep a long
+  # synchronous upload alive instead.
+
+- name: Upload the cluster definition
+  # Installed directly on the appliance when content signing is enabled.
+  when: appliance_signing_public_key | length == 0
+  ansible.builtin.command:
+    argv:
+      - curl
+      - -sk
+      - -b
+      - "{{ palette_share }}/cookies"
+      - -X
+      - POST
+      - -F
+      - "uploadFile=@{{ palette_share }}/spc.tgz"
+      - -o
+      - "{{ palette_share }}/spc-upload.json"
+      - -w
+      - "%{http_code}"
+      - "{{ appliance_localui_url }}/v1/edge-mgmt/edgehosts/current/actions/upload-clusterconfig"
+  delegate_to: bcm
+  register: palette_spc_upload
+  changed_when: true
+  failed_when: palette_spc_upload.stdout | trim not in ['200', '201']
+
+- name: Stage the appliance password for sshpass
+  # Same pattern as the JFrog token in roles/bcm_prepare: the secret goes into
+  # a 0600 file rather than into a command line, so it never appears in argv
+  # (world-readable via /proc) -- and so the task that uses it needs no
+  # no_log, which is what made the previous failure here unreadable.
+  ansible.builtin.copy:
+    content: "{{ appliance_admin_password }}"
+    dest: "{{ palette_share }}/.appliance-pw"
+    mode: "0600"
+  delegate_to: bcm
+  no_log: true
+
+- name: Install the cluster definition on the appliance
+  # scp from BCM, not an Ansible managed host: the appliance is password-only
+  # and reachable only through BCM, and Ansible cannot cleanly proxy a password
+  # through a password jumphost. roles/validate reaches the Kairos node the
+  # same way, for the same reason.
+  block:
+    - name: Copy spc.tgz to the appliance over SSH
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          PW={{ palette_share | quote }}/.appliance-pw
+          OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15"
+          SSH="sshpass -f $PW ssh $OPTS"
+          $SSH {{ appliance_admin_user }}@{{ appliance_node_ip }} \
+            "sudo mkdir -p /usr/local/spectrocloud/spc"
+          sshpass -f "$PW" scp $OPTS \
+            {{ palette_share | quote }}/spc.tgz {{ appliance_admin_user }}@{{ appliance_node_ip }}:/tmp/spc.tgz
+          $SSH {{ appliance_admin_user }}@{{ appliance_node_ip }} \
+            "sudo install -m 0644 /tmp/spc.tgz /usr/local/spectrocloud/spc/spc.tgz && sudo test -s /usr/local/spectrocloud/spc/spc.tgz && echo SPC""OK"
+        executable: /bin/bash
+      delegate_to: bcm
+      register: palette_spc_install
+      changed_when: true
+      failed_when: "'SPCOK' not in palette_spc_install.stdout"
+  always:
+    - name: Remove the staged appliance password from BCM
+      ansible.builtin.file:
+        path: "{{ palette_share }}/.appliance-pw"
+        state: absent
+      delegate_to: bcm
+
+- name: Wait for the profiles to be readable
+  # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP; see the role header.
+  ansible.builtin.uri:
+    url: "{{ appliance_localui_url }}/v1/edge-mgmt/cluster/applications"
+    validate_certs: false
+    headers:
+      Cookie: "Authorization={{ palette_login.cookies.Authorization }}"
+    status_code: [200]
+  delegate_to: bcm
+  register: palette_apps
+  until: palette_apps.status == 200 and (palette_apps.json.clusterProfileTemplates | default([]) | length > 0)
+  retries: 20
+  delay: 15
+
+- name: Get the edge host identity
+  # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP; see the role header.
+  ansible.builtin.uri:
+    url: "{{ appliance_localui_url }}/v1/edge-mgmt/edgehosts/current"
+    validate_certs: false
+    headers:
+      Cookie: "Authorization={{ palette_login.cookies.Authorization }}"
+    status_code: [200]
+  delegate_to: bcm
+  register: palette_edgehost
+
+- name: Build the create-cluster payload
+  # --host-ip is the node's provisioning-LAN address: it is how the cluster
+  # addresses itself and how kube-vip picks the interface for the VIP.
+  ansible.builtin.script:
+    cmd: >-
+      build_cluster_payload.py
+      --spc-dir '{{ palette_workdir.path }}/spc-tree'
+      --spc-archive '{{ palette_workdir.path }}/spc.tgz'
+      --out '{{ palette_workdir.path }}/create-cluster.json'
+      --name '{{ appliance_cluster_name }}'
+      --vip '{{ appliance_vip }}'
+      --host-uid '{{ palette_edgehost.json.metadata.id }}'
+      --host-ip '{{ appliance_node_ip }}'
+      --arch '{{ appliance_arch | default("amd64") }}'
+      --set 'csi.placementCount={{ appliance_csi_placement_count }}'
+      --set 'mgmtplane.mongoReplicas={{ appliance_mongo_replicas }}'
+      --set 'csi.storagepoolDrive={{ appliance_storage_pool_drive }}'
+      --set 'registry.password={{ palette_registry_password_effective }}'
+    executable: python3
+  become: false
+  register: palette_payload_build
+  changed_when: true
+  no_log: true
+
+- name: Stage the create-cluster payload on BCM
+  ansible.builtin.copy:
+    src: "{{ palette_workdir.path }}/create-cluster.json"
+    dest: "{{ palette_share }}/create-cluster.json"
+    mode: "0600"
+  delegate_to: bcm
+  no_log: true
+
+- name: Create the cluster
+  # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP; see the role header.
+  ansible.builtin.uri:
+    url: "{{ appliance_localui_url }}/v1/edge-mgmt/cluster"
+    method: POST
+    validate_certs: false
+    headers:
+      Cookie: "Authorization={{ palette_login.cookies.Authorization }}"
+    body_format: json
+    src: "{{ palette_share }}/create-cluster.json"
+    remote_src: true
+    status_code: [200, 201, 202]
+  delegate_to: bcm
+  register: palette_cluster_create
+
+- name: Wait for the cluster to reach Running
+  # Sessions are short-lived, so re-authenticate on each poll.
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      curl -sk -c '{{ palette_share }}/poll.cookies' -X POST -H 'Content-Type: application/json' \
+        -d '{"username":"{{ appliance_admin_user }}","password":"{{ appliance_admin_password }}"}' \
+        --max-time 20 "{{ appliance_localui_url }}/v1/users/default/login" -o /dev/null
+      curl -sk -b '{{ palette_share }}/poll.cookies' --max-time 20 \
+        "{{ appliance_localui_url }}/v1/edge-mgmt/cluster/details" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",{}).get("clusterState","?"))'
+    executable: /bin/bash
+  delegate_to: bcm
+  register: palette_cluster_state
+  until: palette_cluster_state.stdout | trim in ['Running', 'Error', 'Failed']
+  retries: "{{ (appliance_cluster_timeout | int / 30) | int }}"
+  delay: 30
+  changed_when: false
+  failed_when: palette_cluster_state.stdout | trim in ['Error', 'Failed']
+  no_log: true
+
+- name: Wait for Palette to answer on the VIP
+  # From BCM, which shares the provisioning LAN — the same path a Kairos edge
+  # node will use to register, so this proves that path as a side effect.
+  # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP; see the role header.
+  ansible.builtin.uri:
+    url: "{{ appliance_vip_url }}/system"
+    validate_certs: false
+    status_code: [200]
+  delegate_to: bcm
+  register: palette_vip_probe
+  until: palette_vip_probe.status == 200
+  retries: 40
+  delay: 30
+
+- name: Wait for the Palette API behind the VIP to accept requests
+  # A GET on /system is answered 200 by the static UI the moment ingress is up,
+  # which is roughly half an hour before Palette's API exists. On its own it
+  # therefore green-lights the tenant role far too early, and that failure
+  # surfaces there as an opaque timeout rather than here as "the API is not up
+  # yet". POST is the discriminator: the static handler rejects it 405, while
+  # the real API answers 401/403 to a credential-less login. No body, so
+  # nothing to hide with no_log and the failure stays readable.
+  # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP; see the role header.
+  ansible.builtin.uri:
+    url: "{{ appliance_vip_url }}/v1/auth/syslogin"
+    method: POST
+    validate_certs: false
+    body_format: json
+    body: {}
+    status_code: [200, 401, 403]
+  delegate_to: bcm
+  register: palette_api_probe
+  until: palette_api_probe.status in [200, 401, 403]
+  retries: "{{ (appliance_api_timeout | int / 30) | int }}"
+  delay: 30
+
+# ---- Clean up the staged bundle ----
+
+- name: Remove the staged content bundle from BCM
+  # ~10 GB under /cm/shared; leaving it there is rude on a customer head node.
+  ansible.builtin.file:
+    path: "{{ palette_share }}/{{ item }}"
+    state: absent
+  loop:
+    - content-bundle.tar.zst
+    - content.sig.bin
+    - content.sig.hex
+    - cookies
+    - poll.cookies
+    - create-cluster.json
+  delegate_to: bcm
+
+- name: Record the registry credentials
+  ansible.builtin.blockinfile:
+    path: "{{ e2e_dir }}/.run-credentials.yml"
+    create: true
+    mode: "0600"
+    owner: "{{ palette_cluster_invoker.stdout }}"
+    group: "{{ palette_cluster_invoker.stdout }}"
+    marker: "# {mark} registry"
+    block: |
+      registry_admin_user: admin
+      registry_admin_password: {{ palette_registry_password_effective }}
+  no_log: true
+
+- name: Summary
+  ansible.builtin.debug:
+    msg:
+      - "Palette is up, deployed by BCM onto {{ palette_node }}."
+      - "  Appliance node:  {{ appliance_node_ip }} (BCM-managed)"
+      - "  Tenant console:  {{ appliance_vip_url }}          (from the provisioning net)"
+      - "  System console:  {{ appliance_vip_url }}/system   (from the provisioning net)"
+      - "  Local UI:        {{ appliance_localui_url }} ({{ appliance_admin_user }})"
+      - "  Cluster:         {{ appliance_cluster_name }} ({{ palette_cluster_state.stdout | trim }})"
+      - "  Credentials:     {{ e2e_dir }}/.run-credentials.yml"

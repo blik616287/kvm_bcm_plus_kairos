@@ -62,6 +62,26 @@
     - name: Copy overlay files into CanvOS
       ansible.builtin.shell: cp -rp {{ e2e_dir }}/files/canvos/overlay/* {{ canvos_dir }}/overlay/ 2>/dev/null || true
 
+    - name: Drop the BCM stylus-agent hook for images that do not carry its scripts
+      # bcm-sync.conf adds ExecStartPre=/usr/bin/palette-cleanup-stale.sh and
+      # bcm-sync-userdata.sh to stylus-agent. Those scripts reach an image ONLY
+      # through the Dockerfile COPY above, and an appliance build installs a
+      # different rootfs than the one CanvOS customises -- so the unit ships
+      # referencing executables that are not there. systemd then fails it
+      # 203/EXEC and restarts forever (675 attempts on the run that found
+      # this), stylus never starts, and Palette never deploys: the node boots
+      # clean, the Local UI answers, the bundle uploads, and the cluster simply
+      # stops at Provisioning with nothing pointing at the cause.
+      #
+      # The appliance is not a BCM-registered edge node -- it neither syncs a
+      # hostname from BCM nor pre-cleans a Palette registration -- so the hook
+      # is pure liability there. The next edge build's `cp -rp` above restores
+      # the file, so this cannot leak in the other direction.
+      ansible.builtin.file:
+        path: "{{ canvos_dir }}/overlay/files/etc/systemd/system/stylus-agent.service.d/bcm-sync.conf"
+        state: absent
+      when: not (kairos_build_bcm_integration | default(true) | bool)
+
     - name: Ensure overlay scripts are executable
       ansible.builtin.file:
         path: "{{ item }}"
@@ -126,6 +146,12 @@
           COPY overlay/files/usr/bin/palette-cleanup-stale.sh /usr/bin/palette-cleanup-stale.sh
           RUN chmod +x /usr/bin/bcm-compat-fixes.sh /usr/bin/bcm-sync-userdata.sh /usr/bin/palette-cleanup-stale.sh
 
+    # `state:` rather than `when:` for the same reason as the block below: all
+    # profiles share one CanvOS checkout, so a `when:`-guarded blockinfile
+    # leaves the previous profile's packages in place when the next profile
+    # sets none. Live since profiles/palette-appliance.yml became the first
+    # profile to use this — building it then an edge profile would otherwise
+    # ship lvm2/drbd-utils in the edge image.
     - name: Patch Dockerfile — install user-supplied apt packages
       ansible.builtin.blockinfile:
         path: "{{ canvos_dir }}/Dockerfile"
@@ -133,7 +159,18 @@
         marker: "# {mark} user extra packages"
         block: |
           RUN apt-get update && apt-get install -y --no-install-recommends {{ kairos_extra_apt_packages | join(' ') }} && rm -rf /var/lib/apt/lists/*
-      when: kairos_extra_apt_packages | default([]) | length > 0
+        state: "{{ 'present' if kairos_extra_apt_packages | default([]) | length > 0 else 'absent' }}"
+
+    # state is driven by whether the profile sets the block, NOT `when:` —
+    # profiles share one CanvOS checkout, so a block left behind by a previous
+    # profile's build would silently contaminate the next profile's image.
+    - name: Patch Dockerfile — profile-supplied extra instructions
+      ansible.builtin.blockinfile:
+        path: "{{ canvos_dir }}/Dockerfile"
+        insertafter: "user extra packages END"
+        marker: "# {mark} profile extra dockerfile"
+        block: "{{ kairos_dockerfile_extra }}"
+        state: "{{ 'present' if kairos_dockerfile_extra | default('') | length > 0 else 'absent' }}"
 
     - name: Render custom k8s_version.json (overrides upstream CanvOS file)
       ansible.builtin.copy:
@@ -151,6 +188,44 @@
     # image tag and rolling-upgrades cluster nodes — no PXE/dd needed.
     # The `--push` CLI flag is load-bearing — without it `SAVE IMAGE --push`
     # in the Earthfile is a no-op (image only goes to local Docker daemon).
+    # Written before the ISO build so CanvOS can bake it in. state: is driven by
+    # the variable, not `when:`, because profiles share one CanvOS checkout and
+    # a leftover file would silently apply to the next profile's image.
+    - name: Write .edge-custom-config.yaml (content-signing key, etc.)
+      ansible.builtin.copy:
+        content: "{{ kairos_edge_custom_config }}"
+        dest: "{{ canvos_dir }}/.edge-custom-config.yaml"
+        mode: "0644"
+      when: kairos_edge_custom_config | default('') | length > 0
+
+    - name: Remove a stale .edge-custom-config.yaml left by another profile
+      ansible.builtin.file:
+        path: "{{ canvos_dir }}/.edge-custom-config.yaml"
+        state: absent
+      when: kairos_edge_custom_config | default('') | length == 0
+
+    # Self-install images carry their config INSIDE the ISO: CanvOS ships
+    # CanvOS/user-data as files-iso/config.yaml, which the image installer
+    # reads on boot. The CIDATA path further down is the edge mechanism and is
+    # not used in that mode.
+    - name: Bake the cloud-config into the ISO (self-install images)
+      ansible.builtin.template:
+        src: "{{ kairos_cloud_config_template }}"
+        dest: "{{ canvos_dir }}/user-data"
+        mode: "0644"
+      when: kairos_build_self_install | default(false) | bool
+
+    # All profiles share one CanvOS checkout and CanvOS bakes user-data into
+    # EVERY ISO as files-iso/config.yaml. A `when:`-guard alone therefore leaks:
+    # after an appliance build, the next edge build inherits the APPLIANCE
+    # cloud-config in its ISO. Remove it explicitly, the same way the
+    # Dockerfile blocks and .edge-custom-config.yaml are handled.
+    - name: Remove a user-data left by a self-install profile
+      ansible.builtin.file:
+        path: "{{ canvos_dir }}/user-data"
+        state: absent
+      when: not (kairos_build_self_install | default(false) | bool)
+
     - name: Run CanvOS build (day-1 — build ISO)
       ansible.builtin.shell: |
         cd {{ canvos_dir }}
@@ -206,10 +281,25 @@
         bcm_ssh_key_content: "{{ bcm_key_file.content | b64decode }}"
 
     - name: Render cloud-config
+      # Template is profile-selectable (kairos_cloud_config_template) so a
+      # profile can build a non-edge image — e.g. the Palette appliance —
+      # through this same pipeline. Default is unchanged for every profile.
       ansible.builtin.template:
-        src: cloud-config.yaml.j2
+        src: "{{ kairos_cloud_config_template }}"
         dest: "{{ build_dir }}/cloud-config.yaml"
         mode: "0644"
+
+    - name: Validate the rendered cloud-config
+      # A stage key with nothing under it is YAML null, and kairos-agent
+      # segfaults merging it rather than reporting a config error -- the
+      # symptom is a blank disk and "no EFI System Partition found" from the
+      # verify step, minutes later. Fail here, naming the key.
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ role_path }}/files/check-cloud-config.py"
+          - "{{ build_dir }}/cloud-config.yaml"
+      changed_when: false
 
     # User-supplied additional cloud-config YAML, layered into /oem/99_userdata.yaml.
     # Only written when kairos_user_data is non-empty; the FAT32 image and the
@@ -237,12 +327,13 @@
         fi
 
     - name: Create blank raw disk
-      ansible.builtin.shell: truncate -s 81920M {{ raw_disk_path }}
+      ansible.builtin.shell: truncate -s {{ kairos_raw_disk_size }} {{ raw_disk_path }}
 
     # OVMF (UEFI) so kairos-agent detects UEFI and installs GRUB-EFI into an ESP.
     # The resulting raw image is bootable on UEFI hardware (physical Dell servers etc.).
     # BIOS-only platforms would need a separate image built with SeaBIOS.
     - name: Run kairos-agent install in QEMU (OVMF / UEFI)
+      when: not (kairos_build_self_install | default(false) | bool)
       ansible.builtin.shell: |
         SOCK="{{ build_dir }}/.qemu-install.sock"
         rm -f "$SOCK"
@@ -292,15 +383,32 @@
             grep -qa 'CFGDONE' "$INSTALL_LOG" 2>/dev/null && break
           done
           sleep 2
-          # kairos-agent install with teardown + retry. After it partitions the
-          # blank disk, the live env races to auto-unlock+mount the new COS_*
+          # kairos-agent install with teardown + retry. teardown ALSO deactivates
+          # LVM/device-mapper: an image that ships lvm2 (profiles/palette-appliance.yml
+          # needs it for Piraeus/LINSTOR) starts LVM2 monitoring in the LIVE
+          # installer env, which holds the target disk. The blkdeactivate that
+          # kairos-agent runs then fails with "device or resource busy" on every
+          # retry and the install writes nothing. Guarded on the binaries being
+          # present so images without lvm2 are unaffected.
+          #
+          # It also stops the STYLUS side. An appliance/stylus image boots its
+          # own installer in the live env, whose config runs
+          # "palette-agent partitions unlock-all" - that opens the target disk
+          # exclusively, so the injected kairos-agent install can never claim
+          # it. A plain Kairos edge image ships no such agent, which is why
+          # this only appears for appliance profiles. VDA-HOLDERS in the
+          # console log names whatever still holds the disk after a teardown.
+          # NOTE: no apostrophes in this block — an odd number of single quotes
+          # anywhere in this shell body breaks Ansible argument splitting.
+          #
+          # After it partitions the blank disk, the live env races to auto-unlock+mount the new COS_*
           # partitions (LUKS -> /dev/mapper/persistent|oem, mounted at /run/cos/*,
           # /usr/local, /oem), and the deploy step then aborts with "target device
           # /dev/vda has mounted partitions". teardown() unmounts those (lazy),
           # closes the LUKS mappers, and wipes the table; we retry up to 3x since
           # the race does not fire on every attempt. Then re-mount the new OEM
           # partition and drop in 99_bcm.yaml and (if present) 99_userdata.yaml.
-          printf 'teardown() { sync; for mp in $(grep -E " (/run/cos|/oem|/usr/local)" /proc/mounts | cut -d" " -f2 | sort -r); do umount -l "$mp" 2>/dev/null || true; done; for d in persistent oem state recovery; do [ -e /dev/mapper/$d ] && cryptsetup close /dev/mapper/$d 2>/dev/null || true; done; wipefs -a /dev/vda 2>/dev/null || true; sgdisk --zap-all /dev/vda 2>/dev/null || true; partprobe /dev/vda 2>/dev/null || true; }; n=1; while true; do teardown; kairos-agent --debug install 2>&1 && break; n=$((n+1)); [ "$n" -gt 3 ] && break; echo INSTALL-RETRY-$n; sleep 5; done; mount /dev/vda2 /oem 2>/dev/null; cp /tmp/99_bcm.yaml /oem/99_bcm.yaml; { [ -f /tmp/99_userdata.yaml ] && cp /tmp/99_userdata.yaml /oem/99_userdata.yaml; true; }; poweroff\r\n'
+          printf 'teardown() { sync; systemctl stop stylus-agent 2>/dev/null || true; pkill -9 -f palette-agent 2>/dev/null || true; pkill -9 -f palette-tui 2>/dev/null || true; pkill -9 -f agent-provider-stylus 2>/dev/null || true; sleep 2; for mp in $(grep -E " (/run/cos|/oem|/usr/local)" /proc/mounts | cut -d" " -f2 | sort -r); do umount -l "$mp" 2>/dev/null || true; done; for d in persistent oem state recovery; do [ -e /dev/mapper/$d ] && cryptsetup close /dev/mapper/$d 2>/dev/null || true; done; command -v vgchange >/dev/null 2>&1 && { vgchange -an 2>/dev/null || true; }; command -v dmsetup >/dev/null 2>&1 && { dmsetup remove_all --force 2>/dev/null || true; }; command -v blkdeactivate >/dev/null 2>&1 && { blkdeactivate --dmoptions force,retry /dev/vda 2>/dev/null || true; }; udevadm settle 2>/dev/null || true; wipefs -a /dev/vda 2>/dev/null || true; sgdisk --zap-all /dev/vda 2>/dev/null || true; partprobe /dev/vda 2>/dev/null || true; command -v fuser >/dev/null 2>&1 && { echo VDA-HOLDERS-BEGIN; fuser -vm /dev/vda 2>&1 | head -12; echo VDA-HOLDERS-END; }; }; n=1; while true; do teardown; kairos-agent --debug install 2>&1 && break; n=$((n+1)); [ "$n" -gt 3 ] && break; echo INSTALL-RETRY-$n; sleep 5; done; mount /dev/vda2 /oem 2>/dev/null; cp /tmp/99_bcm.yaml /oem/99_bcm.yaml; { [ -f /tmp/99_userdata.yaml ] && cp /tmp/99_userdata.yaml /oem/99_userdata.yaml; true; }; poweroff\r\n'
           sleep 900
         ) | nc -U "$SOCK" > "$INSTALL_LOG" 2>&1 &
         SERIAL_PID=$!
@@ -308,6 +416,51 @@
         kill "$SERIAL_PID" 2>/dev/null || true
         rm -f "$SOCK" {{ build_dir }}/.qemu-install.pid {{ build_dir }}/userdata.img
       async: 3600
+      poll: 30
+
+    # Self-install: no serial injection at all. The image boots its own
+    # installer, reads the config baked into the ISO, installs, and powers
+    # itself off (install.poweroff). Waiting for the QEMU process to exit is
+    # the completion signal, the same one roles/bcm_vm uses.
+    - name: Let the image install itself in QEMU (OVMF / UEFI, self-install)
+      when: kairos_build_self_install | default(false) | bool
+      ansible.builtin.shell: |
+        OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+        OVMF_VARS_SRC=/usr/share/OVMF/OVMF_VARS_4M.fd
+        [ -f "$OVMF_CODE" ] || OVMF_CODE=/usr/share/qemu/OVMF.fd
+        [ -f "$OVMF_VARS_SRC" ] || OVMF_VARS_SRC=/usr/share/ovmf/OVMF.fd
+        cp -f "$OVMF_VARS_SRC" {{ build_dir }}/ovmf-vars.fd
+        INSTALL_LOG={{ e2e_dir }}/logs/qemu-install.log
+        : > "$INSTALL_LOG"
+        qemu-system-x86_64 \
+          -enable-kvm -m {{ kairos_build_install_ram | default(8192) }} -smp {{ kairos_build_install_cpus | default(4) }} -cpu host \
+          -machine q35 \
+          -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+          -drive if=pflash,format=raw,file={{ build_dir }}/ovmf-vars.fd \
+          -display none \
+          -serial file:"$INSTALL_LOG" \
+          -drive if=virtio,format=raw,media=disk,file={{ raw_disk_path }} \
+          -drive format=raw,media=cdrom,readonly=on,file={{ build_dir }}/{{ iso_name }}.iso \
+          -boot d \
+          -no-reboot \
+          -pidfile {{ build_dir }}/.qemu-install.pid \
+          -daemonize
+        QEMU_PID=$(cat {{ build_dir }}/.qemu-install.pid)
+        echo "self-install running (PID $QEMU_PID); powers off when done"
+        T=0
+        LIMIT={{ kairos_build_install_timeout | default(3600) }}
+        while kill -0 "$QEMU_PID" 2>/dev/null; do
+          sleep 15
+          T=$((T + 15))
+          if [ "$T" -ge "$LIMIT" ]; then
+            echo "TIMEOUT after ${T}s, see $INSTALL_LOG" >&2
+            kill "$QEMU_PID" 2>/dev/null || true
+            exit 1
+          fi
+        done
+        echo "self-install finished after ${T}s"
+        rm -f {{ build_dir }}/.qemu-install.pid
+      async: "{{ (kairos_build_install_timeout | default(3600) | int) + 300 }}"
       poll: 30
 
     - name: Verify kairos-agent install produced a bootable disk
@@ -320,6 +473,20 @@
       ansible.builtin.shell: |
         set -eu
         LOOP=$(losetup -fP --show {{ raw_disk_path }})
+        # losetup -fP asks the kernel to scan the partition table, but the
+        # /dev/loopNpM nodes are created asynchronously by udev. Globbing them
+        # immediately can match nothing on a busy box, and the checks below
+        # then report "no EFI System Partition (vfat) found" and
+        # "cOS/active.img not found" for a perfectly good image -- the SAME
+        # message a genuinely failed install produces, which makes a false
+        # negative here expensive to tell apart from the real thing. Wait for
+        # the nodes before looking.
+        partprobe "$LOOP" 2> /dev/null || true
+        udevadm settle --timeout=30 2> /dev/null || true
+        for _ in $(seq 1 20); do
+          ls ${LOOP}p1 > /dev/null 2>&1 && break
+          sleep 1
+        done
         cleanup() {
           umount /tmp/kairos-verify-esp 2>/dev/null || true
           umount /tmp/kairos-verify-state 2>/dev/null || true
@@ -389,6 +556,9 @@
         # before csum). NOTE: 2>/dev/null was removed deliberately — on 24.04 the
         # old `tune2fs -O ^metadata_csum` silently failed and the node never booted.
         LOOP=$(losetup -fP --show {{ raw_disk_path }})
+        # Same udev race as the verify step above.
+        partprobe "$LOOP" 2> /dev/null || true
+        udevadm settle --timeout=30 2> /dev/null || true
         for p in ${LOOP}p2 ${LOOP}p3 ${LOOP}p4 ${LOOP}p5; do
           [ -b "$p" ] || continue
           e2fsck -fy "$p" >/dev/null 2>&1 || true
