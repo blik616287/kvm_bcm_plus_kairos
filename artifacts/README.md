@@ -82,10 +82,36 @@ fails the run if it does not pass.
 `appliance_pe_version` in `inventory/hosts.yml` **must match** the stylus/agent
 version your content bundle ships.
 
-> **`appliance_pe_version` is the stylus *agent* version, not the bundle filename.**
-> They differ. `palette-enterprise-appliance-4.10.17.tar.zst` ships stylus
-> `v4.10.4` — `4.10.17` is the manifest version. Read the real one out of the
-> bundle before setting it:
+> **Two different version numbers. Everything that matters uses the second one.**
+>
+> | | Example | Where it comes from |
+> |---|---|---|
+> | package / bundle version | `4.10.17` | the `.tar.zst` filename and the bundle manifest |
+> | **stylus agent version** | **`v4.10.4`** | inside the bundle — this is what you configure |
+>
+> `palette-enterprise-appliance-4.10.17.tar.zst` ships stylus `v4.10.4`. Three
+> settings must all equal the *stylus* version, never the filename:
+>
+> - `appliance_pe_version` — the appliance's agent version
+> - `PE_VERSION` in `profiles/palette-appliance.yml` — baked into the appliance image
+> - `PE_VERSION` in any edge profile registering to that appliance — e.g.
+>   `profiles/edge-to-appliance.yml`. Leave it unset and CanvOS picks its own
+>   default (`v4.10.0-rc.2` was observed), the node registers fine, and then
+>   retries a self-upgrade forever: `failed to upgrade stylus`.
+>
+> A mismatch never fails the build. It surfaces much later as a broken cluster
+> deploy or an endless upgrade loop on a host that reports healthy and ready.
+> The pipeline checks `appliance_pe_version` against the bundle for you
+> (`playbooks/tasks/appliance_credentials.yml`), which is why that one is hard to
+> get wrong — the edge profile's copy is not checked, so set it by hand.
+>
+> Read the real value out of the bundle rather than off the filename:
+>
+> ```bash
+> python3 playbooks/files/bundle_stylus_version.py artifacts/<bundle>.tar.zst
+> ```
+>
+> or the long form:
 >
 > ```bash
 > python3 - <<'EOF'

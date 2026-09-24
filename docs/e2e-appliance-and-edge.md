@@ -114,6 +114,29 @@ Edge nodes will register to https://192.168.98.251
 The credentials are baked into the image, so the image must be built **after**
 step 2:
 
+> **Version pinning — two numbers, and you want the second one.**
+>
+> | | Example | Where it comes from |
+> |---|---|---|
+> | package / bundle version | `4.10.17` | the `.tar.zst` filename and manifest |
+> | **stylus agent version** | **`v4.10.4`** | inside the bundle — what you configure |
+>
+> `profiles/edge-to-appliance.yml` pins `PE_VERSION: "v4.10.4"` so the edge node
+> runs the *same stylus* as the appliance. All three of these must agree:
+> `appliance_pe_version`, `PE_VERSION` in the appliance profile, and `PE_VERSION`
+> in the edge profile. Get it from the bundle, never the filename:
+>
+> ```bash
+> python3 playbooks/files/bundle_stylus_version.py artifacts/*.tar.zst
+> ```
+>
+> Leave the edge profile's copy unset and CanvOS supplies its own default
+> (`v4.10.0-rc.2` was observed). The node still registers and still reports
+> `health: healthy` / `state: ready`, so nothing looks wrong — it just retries a
+> self-upgrade forever (`failed to upgrade stylus: 2 errors occurred`). Only
+> `appliance_pe_version` is validated against the bundle automatically; the edge
+> profile's is not, so it is on you.
+
 ```bash
 make kairos-build ANSIBLE_ARGS="-e @profiles/edge-to-appliance.yml"   # ~25 min
 make deploy-dd    ANSIBLE_ARGS="-e @profiles/edge-to-appliance.yml"   # ~8 min

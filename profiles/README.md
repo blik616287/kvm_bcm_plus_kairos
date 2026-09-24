@@ -202,6 +202,15 @@ role logic, not as sign-off for a DGX deploy.
 
 ## Notes
 
+- **`PE_VERSION` is the stylus *agent* version, not the bundle filename.** A
+  `palette-enterprise-appliance-4.10.17.tar.zst` bundle ships stylus `v4.10.4`;
+  `4.10.17` is the package/manifest version. Any profile that talks to a
+  self-hosted appliance — the appliance profile itself and every edge profile
+  registering to it — must pin the *stylus* version, and they must all match.
+  `python3 playbooks/files/bundle_stylus_version.py artifacts/<bundle>.tar.zst`
+  prints the real one. Unset on an edge profile, CanvOS picks its own default and
+  the node registers healthy but retries a self-upgrade forever.
+
 - **ISO_NAME must differ per profile** — the build's "ISO already exists" short-circuit
   keys on `build/<ISO_NAME>.iso`. Same name across profiles would reuse the wrong ISO.
 - **Base tag pattern**: `kairos-ubuntu:<ver>-core-amd64-generic-<KAIROS_VERSION>`.

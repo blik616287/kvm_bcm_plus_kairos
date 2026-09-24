@@ -556,6 +556,17 @@ Milestones and notable changes, newest first. Each entry links its JIRA ticket
   the discriminator (static handler → `405`; real API → `401/403` to a credential-less login),
   bounded by `appliance_api_timeout`. Verified both ways against a live appliance. The tenant
   login keeps its `no_log` but gets a larger budget, since readiness is now proven upstream.
+- **Pin the edge profile's stylus version to the appliance's** (same ticket) —
+  `profiles/edge-to-appliance.yml` left `PE_VERSION` unset, so CanvOS supplied its own
+  default (`v4.10.0-rc.2` observed) while the appliance ran `v4.10.4`. The node registers
+  fine and reports `health: healthy` / `state: ready`, then retries a self-upgrade forever
+  (`failed to upgrade stylus: 2 errors occurred`) — a failure with no visible symptom at the
+  point you would look. Note the two version numbers this trips over: the **package**
+  version is the `.tar.zst` filename and manifest (`4.10.17`), the **stylus agent** version
+  is what is inside it (`v4.10.4`), and every `PE_VERSION` / `appliance_pe_version` must be
+  the latter. Only `appliance_pe_version` is validated against the bundle automatically, so
+  an edge profile's copy is set by hand; the distinction is now documented in
+  `artifacts/README.md`, `profiles/README.md` and the e2e runbook.
 - **Licensed Palette artifacts move through JFrog** ([IN-2649](https://insightsoftmax.atlassian.net/browse/IN-2649) · [#58](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/58)) — the ~10 GB content
   bundle, its detached signature and the content-signing key are mirrored to JFrog and fetched
   the same way stage 1 fetches the BCM ISO, instead of someone hand-copying them onto each rig.

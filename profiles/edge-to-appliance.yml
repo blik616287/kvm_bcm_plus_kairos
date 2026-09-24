@@ -34,6 +34,22 @@ kairos_canvos_args:
   # Distinct so the build's "ISO already exists" short-circuit cannot hand back
   # another profile's ISO -- which would silently ship the wrong cloud-config.
   ISO_NAME: "palette-edge-appliance"
+  # Pin the stylus agent to the SAME version the appliance runs.
+  #
+  # TWO DIFFERENT NUMBERS, and PE_VERSION is the second one:
+  #   package / bundle version   4.10.17   the .tar.zst filename + manifest
+  #   stylus agent version       v4.10.4   what is actually inside the bundle
+  # Read it out of the bundle rather than off the filename -- see
+  # artifacts/README.md; playbooks/files/bundle_stylus_version.py prints it.
+  #
+  # Left unset, CanvOS supplies its own default (v4.10.0-rc.2 was observed), and
+  # the registered node then tries to self-upgrade to match the appliance and
+  # fails with `failed to upgrade stylus: 2 errors occurred`. Registration still
+  # succeeds, so this is easy to miss -- the host appears healthy and ready
+  # while quietly retrying an upgrade forever.
+  #
+  # Must equal appliance_pe_version in profiles/palette-appliance.yml.
+  PE_VERSION: "v4.10.4"
 
 # Modest: this node only has to boot, register and idle as a worker.
 kairos_vm_ram: 6144
