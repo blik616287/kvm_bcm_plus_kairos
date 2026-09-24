@@ -578,8 +578,10 @@ Milestones and notable changes, newest first. Each entry links its JIRA ticket
   from `appliance_jfrog_repo` into `artifacts/` and never touches the BCM ISO, which comes from
   `jfrog_repo` into `dist/` and is pulled by `bcm-prepare` itself. Someone following the guide
   with no JFrog mirror therefore had no `dist/<iso_filename>` and found out mid-stage. Step 1 is
-  now explicitly two halves, section 1 maps every licensed input to its repo variable,
-  destination and fetching command, and the truncated-ISO case is called out because
+  now explicitly two halves — each naming the command that stages it, `make bcm-prepare` for the
+  ISO (that target *is* the download; nothing is curl'd by hand) and
+  `make palette-artifacts-pull` for the bundle — section 1 maps every licensed input to its repo
+  variable, destination and fetching command, and the truncated-ISO case is called out because
   `bcm-prepare` never re-downloads a file that already exists — a short ISO surfaces as a `7z x`
   archive error during the remaster, and re-running does not fix it. The JFrog token appears in
   the guide only as `<PLACE JFROG TOKEN HERE>`.
