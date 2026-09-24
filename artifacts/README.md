@@ -19,8 +19,6 @@ version and show the artifacts, then download:
 | Its detached signature, `*.tar.sig.bin` | recommended |
 | Content-signing public key, `*.pem` | recommended |
 
-The playbook finds them by extension, so exact filenames don't matter:
-
 ```
 artifacts/
 ├── palette-enterprise-appliance-<version>.tar.zst
@@ -28,12 +26,25 @@ artifacts/
 └── spectro_public_key.pem
 ```
 
-Pin a specific file instead of auto-discovery with
-`-e appliance_content_bundle=/path/to/bundle.tar.zst`.
+Each file is resolved in three steps, most specific first:
 
-Auto-discovery is only safe with **one** bundle present: the glob sorts
-lexicographically, not by version, so `4.9.3` beats `4.11.0`. With more than
-one, the run fails rather than guessing — pin the names in your profile.
+1. an **explicit path** — `appliance_content_bundle`,
+   `appliance_content_bundle_signature`, `appliance_signing_public_key`, for a
+   file kept outside this directory;
+2. the **configured name** under `appliance_artifacts_dir`, when that file is
+   there — `appliance_bundle_filename` and friends, derived from
+   `appliance_bundle_version`;
+3. **glob by extension**, which is the hand-copied case where the names were
+   never configured.
+
+Step 3 is only safe with **one** bundle present: the glob sorts
+lexicographically, not by version, so `4.9.3` beats `4.11.0`. With more than one
+and no name or path configured, the run fails rather than guessing.
+
+All of these are **group_vars**, defaulted in `inventory/hosts.yml` and overridden
+in `inventory/group_vars/all.yml`. None of it lives in a profile, so pointing a
+build at a different version or a differently-named mirror is a config change,
+not an edit to a committed file.
 
 ## Getting them here without hand-copying 10 GB
 
@@ -59,13 +70,24 @@ instance, but a different repo — a content bundle is not an ISO release:
 | `appliance_jfrog_repo` | `palette-content` |
 | `appliance_jfrog_token` | `{{ jfrog_token }}` |
 
-Which files move is whatever the profile names —
-`appliance_bundle_filename`, `appliance_bundle_signature_filename`,
-`appliance_signing_key_filename`. The JFrog path and the local filename are
-deliberately identical, which is what lets discovery above find a pulled file
-with no further configuration. Leaving one empty drops it from the transfer.
-A new Palette version is a copy of `profiles/palette-appliance.yml` with those
-three names and `PE_VERSION` changed — see "Adding a version" there.
+Which files move is `appliance_bundle_filename`,
+`appliance_bundle_signature_filename` and `appliance_signing_key_filename` — all
+derived from `appliance_bundle_version`, all group_vars. The JFrog path and the
+local filename are deliberately identical, which is what lets discovery above
+find a pulled file with no further configuration. Leaving one empty drops it from
+the transfer, so a site that mirrors only the bundle still works.
+
+**Moving to a new Palette version** is therefore two keys in
+`inventory/group_vars/all.yml`:
+
+```yaml
+appliance_bundle_version: "4.11.0"      # the .tar.zst filename
+appliance_pe_version:     "v4.11.0"     # the stylus agent INSIDE it — check it
+```
+
+Copy `profiles/palette-appliance.yml` only to run two versions side by side on one
+rig, where each build needs its own BCM-side namespace; a profile is passed with
+`-e`, so its pins deliberately beat group_vars.
 
 Verify a download before using it, per Spectro Cloud's bundle verification
 instructions:
@@ -79,8 +101,9 @@ openssl dgst -sha256 -verify artifacts/spectro_public_key.pem \
 `roles/palette_cluster` performs this same check before uploading anything, and
 fails the run if it does not pass.
 
-`appliance_pe_version` in `inventory/hosts.yml` **must match** the stylus/agent
-version your content bundle ships.
+`appliance_pe_version` (defaulted in `inventory/hosts.yml`, set in
+`inventory/group_vars/all.yml`) **must match** the stylus/agent version your
+content bundle ships.
 
 > **Two different version numbers. Everything that matters uses the second one.**
 >
@@ -89,21 +112,19 @@ version your content bundle ships.
 > | package / bundle version | `4.10.17` | the `.tar.zst` filename and the bundle manifest |
 > | **stylus agent version** | **`v4.10.4`** | inside the bundle — this is what you configure |
 >
-> `palette-enterprise-appliance-4.10.17.tar.zst` ships stylus `v4.10.4`. Three
-> settings must all equal the *stylus* version, never the filename:
+> `palette-enterprise-appliance-4.10.17.tar.zst` ships stylus `v4.10.4`. One
+> setting carries it: **`appliance_pe_version`**, which must be the *stylus*
+> version and never the filename. Both images derive from it —
+> `profiles/palette-appliance.yml` and `profiles/edge-to-appliance.yml` each pass
+> `PE_VERSION: "{{ appliance_pe_version }}"` to CanvOS — and
+> `playbooks/tasks/appliance_credentials.yml` checks it against the bundle before
+> anything is built.
 >
-> - `appliance_pe_version` — the appliance's agent version
-> - `PE_VERSION` in `profiles/palette-appliance.yml` — baked into the appliance image
-> - `PE_VERSION` in any edge profile registering to that appliance — e.g.
->   `profiles/edge-to-appliance.yml`. Leave it unset and CanvOS picks its own
->   default (`v4.10.0-rc.2` was observed), the node registers fine, and then
->   retries a self-upgrade forever: `failed to upgrade stylus`.
->
-> A mismatch never fails the build. It surfaces much later as a broken cluster
-> deploy or an endless upgrade loop on a host that reports healthy and ready.
-> The pipeline checks `appliance_pe_version` against the bundle for you
-> (`playbooks/tasks/appliance_credentials.yml`), which is why that one is hard to
-> get wrong — the edge profile's copy is not checked, so set it by hand.
+> That single source replaced three separate literals, because a mismatch never
+> fails the build: it surfaces much later as a broken cluster deploy, or as an
+> endless upgrade loop (`failed to upgrade stylus`) on an edge host that reports
+> `healthy` and `ready`. With the edge copy simply unset, CanvOS used its own
+> default — `v4.10.0-rc.2` was observed in exactly that state.
 >
 > Read the real value out of the bundle rather than off the filename:
 >

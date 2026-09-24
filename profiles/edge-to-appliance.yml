@@ -48,8 +48,11 @@ kairos_canvos_args:
   # succeeds, so this is easy to miss -- the host appears healthy and ready
   # while quietly retrying an upgrade forever.
   #
-  # Must equal appliance_pe_version in profiles/palette-appliance.yml.
-  PE_VERSION: "v4.10.4"
+  # Taken from appliance_pe_version (inventory/hosts.yml default, overridden in
+  # inventory/group_vars/all.yml) rather than repeated as a literal -- that is
+  # the one value the pipeline checks against the bundle itself, and the appliance
+  # image derives its PE_VERSION from it too, so the two cannot drift apart.
+  PE_VERSION: "{{ appliance_pe_version }}"
 
 # Modest: this node only has to boot, register and idle as a worker.
 kairos_vm_ram: 6144

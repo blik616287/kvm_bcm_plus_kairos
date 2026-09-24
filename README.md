@@ -335,6 +335,24 @@ already be up (stages 1–2) — it is what provisions the node.
 
 `roles/deploy_dd` needed **no changes**: it was already generic over `kairos_profile`.
 
+### Which bundle it builds against
+
+The licensed artifact set is **group_vars, not profile settings**. Two keys in
+`inventory/group_vars/all.yml` retarget a version:
+
+```yaml
+appliance_bundle_version: "4.10.17"    # PACKAGE version = the .tar.zst filename
+appliance_pe_version:     "v4.10.4"    # STYLUS AGENT version INSIDE that bundle
+```
+
+The three `appliance_*_filename` names derive from the first. Both profiles pass
+`PE_VERSION: "{{ appliance_pe_version }}"` to CanvOS, and the second is checked against the
+bundle before anything is built, so the appliance and every edge image registering to it cannot
+drift apart. `appliance_jfrog_repo` and `appliance_artifacts_dir` say where the files come from
+and land, and a file resolves as *explicit path → configured name → glob by extension*.
+Defaults are in `inventory/hosts.yml`. A profile pins any of this only to run two Palette
+versions side by side on one rig — a profile is passed with `-e`, so its values beat group_vars.
+
 ### What makes an appliance build differ from an edge build
 
 Five profile settings, each required:
@@ -534,6 +552,23 @@ Milestones and notable changes, newest first. Each entry links its JIRA ticket
 
 ### 2026-09-24
 
+- **The licensed artifact set is group_vars, not a profile literal**
+  ([IN-2663](https://insightsoftmax.atlassian.net/browse/IN-2663) · [#60](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/60)) —
+  `profiles/palette-appliance.yml` hardcoded the bundle name, the signature name, the signing-key
+  name and `appliance_pe_version`, and that made them **unoverridable**: a profile is passed with
+  `-e`, extra-vars beat group_vars, so `appliance_pe_version` sitting in someone's
+  `group_vars/all.yml` was silently inert and retargeting a version meant editing a committed
+  file. They now live in `inventory/hosts.yml` (overridden in `all.yml`) beside
+  `appliance_jfrog_repo` and `appliance_artifacts_dir`, with one new `appliance_bundle_version`
+  handle deriving all three filenames — the same shape the BCM ISO already had with
+  `jfrog_repo` + `iso_filename`. Both profiles now pass `PE_VERSION: "{{ appliance_pe_version }}"`
+  instead of repeating the string, which removes the three-places-must-match rule that produced
+  the `failed to upgrade stylus` loop: the appliance image and every edge image registering to it
+  cannot disagree, and that one value is checked against the bundle before anything is built.
+  Artifact resolution now also honours the configured name (*explicit path → name under
+  `appliance_artifacts_dir` → glob by extension*), so which file is used stops depending on what
+  else happens to be in `artifacts/`. Pinning in a profile still works and is now documented for
+  what it is: the way to run two Palette versions side by side on one rig.
 - **A from-scratch reproduction guide, and the staging step it was missing**
   ([IN-2663](https://insightsoftmax.atlassian.net/browse/IN-2663) · [#60](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/60)) —
   `docs/REPRODUCE.md` is the researcher-facing walkthrough of the validated BCM → appliance →

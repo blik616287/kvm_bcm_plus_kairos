@@ -125,21 +125,24 @@ step 2:
 > | package / bundle version | `4.10.17` | the `.tar.zst` filename and manifest |
 > | **stylus agent version** | **`v4.10.4`** | inside the bundle — what you configure |
 >
-> `profiles/edge-to-appliance.yml` pins `PE_VERSION: "v4.10.4"` so the edge node
-> runs the *same stylus* as the appliance. All three of these must agree:
-> `appliance_pe_version`, `PE_VERSION` in the appliance profile, and `PE_VERSION`
-> in the edge profile. Get it from the bundle, never the filename:
+> You set it **once**, as `appliance_pe_version` in
+> `inventory/group_vars/all.yml` (default in `inventory/hosts.yml`). Both images
+> derive from it — `profiles/palette-appliance.yml` and
+> `profiles/edge-to-appliance.yml` each pass
+> `PE_VERSION: "{{ appliance_pe_version }}"` to CanvOS — so the edge node cannot
+> end up on a different stylus than the appliance, and
+> `playbooks/tasks/appliance_credentials.yml` checks the value against the bundle
+> before anything is built. Get it from the bundle, never the filename:
 >
 > ```bash
 > python3 playbooks/files/bundle_stylus_version.py artifacts/*.tar.zst
 > ```
 >
-> Leave the edge profile's copy unset and CanvOS supplies its own default
-> (`v4.10.0-rc.2` was observed). The node still registers and still reports
-> `health: healthy` / `state: ready`, so nothing looks wrong — it just retries a
-> self-upgrade forever (`failed to upgrade stylus: 2 errors occurred`). Only
-> `appliance_pe_version` is validated against the bundle automatically; the edge
-> profile's is not, so it is on you.
+> This replaced three separate literals, and the failure mode is worth knowing
+> because you would not find it by looking: with the edge profile's copy unset,
+> CanvOS supplies its own default (`v4.10.0-rc.2` was observed), the node still
+> registers and still reports `health: healthy` / `state: ready`, and it simply
+> retries a self-upgrade forever (`failed to upgrade stylus: 2 errors occurred`).
 
 ```bash
 make kairos-build ANSIBLE_ARGS="-e @profiles/edge-to-appliance.yml"   # ~25 min
@@ -267,7 +270,7 @@ The VIP (`192.168.98.251`) must avoid BCM's DHCP pool (`.16`–`.250`),
 | Cluster sits at `Provisioning`, Local UI dies, nothing in any log | `stylus-agent` crash-looping `203/EXEC` on an `ExecStartPre` script its rootfs does not carry | `kairos_build_bcm_integration: false` for appliance profiles (already set in `profiles/palette-appliance.yml`) |
 | Tenant step times out with a censored `no_log` failure | it started before Palette's API existed; the API comes up ~30 min after the cluster reports Running | `palette_cluster` now waits for the API itself; re-run `make palette-tenant` |
 | `no EFI System Partition (vfat) found` right after a successful-looking install | either a cloud-config stage key rendered with nothing under it (YAML null → kairos-agent segfault), or the verify step raced udev | `check-cloud-config.py` catches the first at render time; the udev race is fixed in the verify task |
-| Node registers but `failed to upgrade stylus` | the edge image's stylus version differs from the appliance's `PE_VERSION` | pin `PE_VERSION` in the edge profile to match `appliance_pe_version` |
+| Node registers but `failed to upgrade stylus` | the edge image's stylus version differs from the appliance's | both profiles now derive `PE_VERSION` from `appliance_pe_version`, so check that one value against the bundle (`bundle_stylus_version.py`) — and that no profile copy re-pins `PE_VERSION` |
 | `https://<vip>/` dead in a browser, but `ansible bcm -m uri` gets 200 | the build host has no interface on the provisioning network | `make palette-console` |
 
 `/var/log/node-installer` **on BCM** is the source of truth for the provisioning
