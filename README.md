@@ -553,7 +553,7 @@ Milestones and notable changes, newest first. Each entry links its JIRA ticket
 ### 2026-09-24
 
 - **The licensed artifact set is group_vars, not a profile literal**
-  ([IN-2663](https://insightsoftmax.atlassian.net/browse/IN-2663) · [#60](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/60)) —
+  ([IN-2664](https://insightsoftmax.atlassian.net/browse/IN-2664) · [#61](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/61)) —
   `profiles/palette-appliance.yml` hardcoded the bundle name, the signature name, the signing-key
   name and `appliance_pe_version`, and that made them **unoverridable**: a profile is passed with
   `-e`, extra-vars beat group_vars, so `appliance_pe_version` sitting in someone's
