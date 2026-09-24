@@ -99,7 +99,7 @@ DHCP dies silently while ARP and host pings still work.
 # --- JFrog mirror for the licensed inputs -----------------------------------
 # Read-only token. Needs GET on the ISO repo and the Palette content repo.
 # Also used as the default for appliance_jfrog_token.
-jfrog_token: "<read-only JFrog token>"
+jfrog_token: "<PLACE JFROG TOKEN HERE>"
 jfrog_instance: "insightsoftmax.jfrog.io"
 jfrog_repo: "iso-releases"
 iso_filename: "bcm-11.0-ubuntu2404.iso"
