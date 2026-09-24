@@ -226,17 +226,28 @@ make discover           # Interactive: prompts for BCM IP/user/pass + optional j
                         # emits bcm-discovery-<hostname>.yml with suggested group_vars
 
 # Self-hosted Palette appliance (optional; local-KVM only)
-make palette-appliance  # Build appliance ISO + install VM + deploy cluster + create tenant
-make palette-iso        # ISO only            (--tags build)
-make palette-vm         # Install + boot only (--tags vm)
-make palette-cluster    # Content + cluster   (--tags cluster)
-make palette-tenant     # First tenant only   (--tags tenant)
-make palette-stop       # Stop the appliance VM
-make palette-serial     # Tail the appliance serial log
+# The appliance is a BUILD PROFILE: BCM provisions it over the ordinary
+# stage 3 -> 4 -> 5 path. See docs/e2e-appliance-and-edge.md for the full runbook.
+make palette-appliance  # Build image + BCM deploy + boot node + cluster + tenant
+make palette-build      # Stage 3 only — build the appliance raw disk
+make palette-deploy     # Stage 4 only — push to BCM, configure PXE/category
+make palette-node       # Stage 5 only — PXE-boot the node so BCM dd's the image
+make palette-cluster    # Post-boot only — upload content + deploy the mgmt cluster
+make palette-tenant     # First tenant only
+make palette-console    # Browser tunnel to the appliance through BCM (Ctrl-C closes)
+make palette-serial     # Tail the appliance node's serial log
+
+# Licensed Palette artifacts (content bundle + signature + signing key)
+make palette-artifacts-pull   # Fetch from JFrog into artifacts/
+make palette-artifacts-push   # Publish artifacts/ to JFrog (explicit; licensed content)
+
+# Kairos edge node registered to the appliance instead of Palette SaaS
+make palette-edge-credentials  # Mint an API key + project uid in the appliance's tenant
+make palette-edge-verify       # Confirm the edge host registered
 
 # VM management (local-KVM mode)
 make bcm-stop           # Stop BCM VM
-make kairos-stop        # Stop Kairos compute VM
+make kairos-stop        # Stop compute VMs; NODE=node002 stops just that one
 make stop               # Stop all VMs
 make bcm-serial         # Tail BCM serial log
 make kairos-serial      # Tail Kairos serial log
@@ -446,10 +457,15 @@ kvm_bcm_plus_kairos/
 │   ├── kairos_vm/               # PXE boot compute VM (local-KVM)
 │   ├── validate/                # ~40-point health checks
 │   ├── dependencies/
-│   ├── appliance_iso/           # Palette appliance ISO (CanvOS, separate checkout)
-│   ├── appliance_vm/            # Palette appliance QEMU VM (raw QEMU, socket net)
-│   ├── palette_cluster/         # content bundle + management cluster
+│   ├── palette_cluster/         # content bundle + management cluster (post-boot)
 │   └── palette_tenant/          # first tenant
+│                                # (no appliance_* roles: the appliance is a BUILD
+│                                #  PROFILE driven through kairos_build/deploy_dd/
+│                                #  kairos_vm — see profiles/palette-appliance.yml)
+├── scripts/                     # real (shellcheck-gated) helper scripts
+│   ├── provisioning-net.sh      # create the provisioning bridge; make it qemu-usable
+│   ├── palette-console.sh       # browser tunnel to the appliance through BCM
+│   └── shellcheck-templates.sh  # lint bridge for roles/*/templates/*.sh.j2
 ├── files/canvos/                # CanvOS overlay
 │   └── overlay/files/usr/bin/palette-cleanup-stale.sh   # pre-registration hook
 ├── artifacts/                   # licensed Spectro downloads for the appliance — gitignored
@@ -458,8 +474,8 @@ kvm_bcm_plus_kairos/
 │   ├── POC_Client_Deployment.pdf  # rendered via weasyprint
 │   └── pipeline-deep-dive.md      # engineer walkthrough
 ├── build/   dist/   logs/       # generated artifacts — gitignored
-├── CanvOS/                      # cloned at build time (Kairos edge image) — gitignored
-└── CanvOS-appliance/            # cloned at build time (Palette appliance) — gitignored
+└── CanvOS/                      # cloned at build time; shared by every profile,
+                                 # including the appliance — gitignored
 ```
 
 ## Logs
@@ -518,7 +534,7 @@ Milestones and notable changes, newest first. Each entry links its JIRA ticket
 
 ### 2026-09-23
 
-- **Fix: the appliance shipped a stylus hook whose scripts it does not carry** (IN-TBD · #TBD) —
+- **Fix: the appliance shipped a stylus hook whose scripts it does not carry** ([IN-2649](https://insightsoftmax.atlassian.net/browse/IN-2649) · [#58](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/58)) —
   the overlay's `bcm-sync.conf` adds `ExecStartPre=/usr/bin/palette-cleanup-stale.sh` (and
   `bcm-sync-userdata.sh`) to `stylus-agent`. Those arrive only via the Dockerfile `COPY`, and an
   appliance build installs a **different rootfs** than the one CanvOS customises — the ISO's
@@ -540,7 +556,7 @@ Milestones and notable changes, newest first. Each entry links its JIRA ticket
   the discriminator (static handler → `405`; real API → `401/403` to a credential-less login),
   bounded by `appliance_api_timeout`. Verified both ways against a live appliance. The tenant
   login keeps its `no_log` but gets a larger budget, since readiness is now proven upstream.
-- **Licensed Palette artifacts move through JFrog** (IN-TBD · #TBD) — the ~10 GB content
+- **Licensed Palette artifacts move through JFrog** ([IN-2649](https://insightsoftmax.atlassian.net/browse/IN-2649) · [#58](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/58)) — the ~10 GB content
   bundle, its detached signature and the content-signing key are mirrored to JFrog and fetched
   the same way stage 1 fetches the BCM ISO, instead of someone hand-copying them onto each rig.
   `make palette-artifacts-push` publishes (deliberately explicit — it pushes licensed Spectro
@@ -642,7 +658,7 @@ Milestones and notable changes, newest first. Each entry links its JIRA ticket
 
 ### 2026-09-22
 
-- **Self-hosted Palette appliance, provisioned BY BCM** (IN-TBD · #TBD) — brings
+- **Self-hosted Palette appliance, provisioned BY BCM** ([IN-2649](https://insightsoftmax.atlassian.net/browse/IN-2649) · [#58](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/58)) — brings
   [palette-appliance-automation](https://github.com/blik616287/palette-appliance-automation)
   (`8f29a40`) in as `make palette-appliance`. The appliance is a **build profile**
   (`profiles/palette-appliance.yml`) flowing through the ordinary stage 3 → 4 → 5 pipeline, so
@@ -664,7 +680,8 @@ Milestones and notable changes, newest first. Each entry links its JIRA ticket
   content-signing public key in, else the appliance rejects the bundle with
   `public key to verify content not found`).
 - **`kairos_vm`: optional data disk + profile-overridable boot probe** (same ticket) —
-  `kairos_vm_data_disk_size` gives a node a second disk (the appliance keeps its
+  `kairos_vm_data_disk_size` (superseded later in this same PR by the more general
+  `kairos_vm_disks` list — see the 2026-09-23 entry above) gives a node a second disk (the appliance keeps its
   Piraeus/LINSTOR storage pool there, and that disk is wiped at deploy). The post-boot probe
   no longer hardcodes the edge image's `kairos`/`kairos` account, which an appliance image does
   not have; it would otherwise burn its whole 10-minute timeout while the appliance sat there

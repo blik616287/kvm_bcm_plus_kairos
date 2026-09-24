@@ -7,7 +7,7 @@ the dev/demo path (`make all`, stages 1–6). For the remote-BCM path see
 
 What you end up with:
 - A BCM head node VM (`BCM-HeadNode`) running DHCP/PXE/TFTP/NFS/HTTP on an
-  internal socket network.
+  internal provisioning bridge.
 - A Kairos compute VM (`Kairos-ComputeNode`) that PXE-booted from BCM, had a
   prebuilt Kairos raw disk `dd`'d onto it, rebooted into Kairos under UEFI, and
   registered itself as an **edge host** in your Palette project.
@@ -147,7 +147,7 @@ ssh -p 2222 root@localhost        # password: HelloRubyTuesday
    `default` category into a `default-kairos` category, **auto-adds `node001`**
    (MAC `52:54:00:00:02:01`) in FULL install mode, and adds the
    health-check exclude filter + NFS export ACLs.
-5. **kairos-vm** — launches the compute VM on the internal socket network. It
+5. **kairos-vm** — launches the compute VM on the internal provisioning bridge. It
    PXE-boots from BCM, the installer `curl`s the image over HTTP and
    `dd | lz4 -d`'s it onto `/dev/vda`, fixes the GPT + grows the last partition,
    writes a UEFI boot entry, and reboots into Kairos.
@@ -218,7 +218,7 @@ make clean-canvos && make kairos-build deploy-dd kairos-vm
 | Stage 1 fails downloading ISO | Wrong `jfrog_token` / `jfrog_repo` / `iso_filename`; verify the curl in §1. |
 | Stage 2 aborts "port 2222 in use" | Another service on the host port; change `bcm_ssh_port`. |
 | Stage 3 docker permission denied | Add user to `docker` group, re-login. |
-| Stage 5 node never PXE boots | `kairos_vm_mac` must match the MAC deploy-dd registered (auto path uses `kairos_vm_mac`); the two VMs must share socket net `:31337`. |
+| Stage 5 node never PXE boots | `kairos_vm_mac` must match the MAC deploy-dd registered (auto path uses `kairos_vm_mac`); the two VMs must share the provisioning bridge (`bcm_internal_net_mode: bridge`; under the legacy `socket` mode only one compute VM can attach at a time). |
 | Node not in Palette after boot | Check `make kairos-serial` for stylus errors; confirm `palette_api_key` + `palette_project_uid` are valid (token-mint needs them). Endpoint must be reachable from the node. |
 | Need to repoint to a different Palette | Endpoint is build-time baked → `make clean-canvos && make kairos-build deploy-dd kairos-vm`. |
 

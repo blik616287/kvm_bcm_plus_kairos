@@ -90,31 +90,39 @@ flowchart LR
   KAIROS -->|"register"| PAL
 ```
 
-**Networks (local-KVM):** BCM and the compute VM share a QEMU **socket network** — BCM `listen=:31337`, node `connect=:31337` — which is the *provisioning network* (`bcm_internal_cidr`, default `192.168.98.0/24`; your site may use another, e.g. `10.184.70.0/x`). BCM also has a user-mode NAT NIC with **host-forwards**: `bcm_ssh_port`→22, `bcm_https_port`→443. Kernel args force `net.ifnames=0` so NICs are `ethN`.
+**Networks (local-KVM):** BCM and the compute VMs share a **host bridge**
+(`bcm_internal_bridge`, default `br-kairos`) — the *provisioning network*
+(`bcm_internal_cidr`, default `192.168.98.0/24`; your site may use another, e.g.
+`10.184.70.0/x`). Each VM gets its own tap, created by `qemu-bridge-helper` from
+`-netdev bridge`. BCM also has a user-mode NAT NIC with **host-forwards**:
+`bcm_ssh_port`→22, `bcm_https_port`→443. Kernel args force `net.ifnames=0` so NICs
+are `ethN`. `scripts/provisioning-net.sh` creates the bridge and makes it usable by
+qemu; it runs from each VM's launcher, so nothing has to be set up by hand.
 
-> **That socket network is point-to-point.** It carries **one** compute VM at a time: start a
-> second while another is attached and it gets no carrier at all, dying with
-> `PXE-E18: Server response timeout`, which reads like broken DHCP/TFTP on BCM and sends you
-> looking in the wrong place. `roles/kairos_vm` now refuses to start in that case, naming the
-> VM that holds the link. BCM keeps listening throughout, so nothing needs restarting —
-> stopping the other VM (`make kairos-stop NODE=<it>`) is the whole fix.
+> **On a Docker or Kubernetes host, the bridge needs an explicit iptables allow.**
+> `br_netfilter` (`bridge-nf-call-iptables=1`, which Kubernetes needs) hands every
+> bridged **IP** frame to the `FORWARD` chain, whose policy under Docker or
+> kube-router is `DROP`. The LAN then looks perfectly healthy — bridge up, ports
+> forwarding, carrier present, ARP resolving, host-originated pings working — while
+> silently dropping every guest-to-guest IP broadcast. DHCP is exactly that, so PXE
+> dies with `PXE-E18: Server response timeout` and BCM's dhcpd logs *nothing at
+> all*. ARP survives because it goes to arptables (policy ACCEPT); a ping from the
+> host survives because it is `OUTPUT`, not `FORWARD`. That combination is what
+> makes this look like anything other than a firewall problem.
 >
-> Two things will mislead you here. An unprivileged `ss -ltn` does **not** show a root-owned
-> listening socket, so BCM looks like it has stopped listening when it has not — check as
-> root. And a freshly booted node takes roughly **two minutes** to answer on the network, so
-> `No route to host` immediately after a successful install is normal.
->
-> Multicast — QEMU's N-peer socket mode — is not a drop-in fix: it needs a multicast-capable
-> interface, and `lo` is not one, so it would put the rig's DHCP and PXE traffic on the
-> physical network.
+> The per-bridge `nf_call_iptables=0` toggle is **not sufficient** — with it set to
+> 0 the `FORWARD` drop counter still increments once per flooded port (measured
+> 68 → 80 for six DHCP broadcasts). `provisioning-net.sh` therefore installs
+> `-i <bridge> -o <bridge> -j ACCEPT`, scoped to traffic both entering *and*
+> leaving the provisioning bridge.
 
-> **A stale ISO in `build/` silently wins over your profile changes.** Stage 3 skips the whole
-> input-generation block — `.arg`, the overlay copy, the Dockerfile patches,
-> `.edge-custom-config.yaml` *and* the cloud-config bake — whenever
-> `build/<ISO_NAME>.iso` already exists. The check is file existence only; it does not look at
-> whether any input changed. So editing a profile or a cloud-config template and re-running
-> stage 3 rebuilds **nothing**, and the old image deploys looking like a successful build.
-> Delete `build/<ISO_NAME>.iso` (and the matching `-disk.raw*`) to force a real rebuild.
+> **`bcm_internal_net_mode` selects the topology.** `bridge` (the default) is a real
+> multi-peer LAN, so several nodes can be up at once — required for anything where
+> one node must reach another, such as an edge node registering to a self-hosted
+> appliance. `socket` is the original QEMU socket netdev (BCM `listen=`, each node
+> `connect=`): point-to-point, carrying exactly **one** compute VM. Start a second
+> under `socket` and it gets no carrier and fails PXE; `roles/kairos_vm` refuses
+> with a clear message rather than letting it time out.
 
 **Ports in play:** DHCP 67/udp, TFTP 69/udp, NFS 111+2049, **HTTP 8888 (Kairos raw image)**, rsync 873, cmd 8081 (node→BCM heartbeat), SSH 22.
 
@@ -191,7 +199,7 @@ Each stage below: **does → artifacts → logs → validate → common failures
 | ISO already present, stale | `dist/<iso>` cached from old run | delete the cached ISO to force re-download |
 
 ### Stage 2 — `bcm-vm` (`02-bcm-vm.yml` → `bcm_vm`) — *local-KVM only*
-**Does:** QEMU boots the autoinstall ISO (Phase 1, up to ~90 min), then boots BCM from the installed disk (Phase 2). Networking = socket net `listen=:31337` + NAT with `hostfwd :bcm_ssh_port→22 / :bcm_https_port→443`. Waits for SSH → `cmfirstboot` done → `cmd` active → `cmsh` answers.
+**Does:** QEMU boots the autoinstall ISO (Phase 1, up to ~90 min), then boots BCM from the installed disk (Phase 2). Networking = a tap on the provisioning bridge `br-kairos` + NAT with `hostfwd :bcm_ssh_port→22 / :bcm_https_port→443`. Waits for SSH → `cmfirstboot` done → `cmd` active → `cmsh` answers.
 **Artifacts:** `build/bcm-headnode.qcow2` (running BCM VM), pidfile `build/.bcm-qemu.pid`.
 **Logs:** `logs/bcm-install-serial.log`, `logs/bcm-serial.log` (`make bcm-serial`).
 **Validate:**
@@ -248,7 +256,7 @@ ls -l /cm/images/<profile>-installer/etc/systemd/system/multi-user.target.wants/
 | HTTP 8888 curl fails | http service didn't start | check the `kairos-http.service` on BCM |
 
 ### Stage 5 — `kairos-vm` (`05-kairos-vm.yml` → `kairos_vm`) — *local-KVM only*
-**Does:** Phase 1 launches the compute VM PXE-first (`-boot order=cn`) on the socket net → BCM provisions the installer Ubuntu → `kairos-install.service` runs `install-kairos.sh` → node powers off. Phase 2 boots the same disk (`-boot c`) using the **shared OVMF vars** (so the efibootmgr Kairos entry persists) and waits for Kairos. `kairos_vm_wait=false` hands the wait+disk-boot to a detached finisher.
+**Does:** Phase 1 launches the compute VM PXE-first (`-boot order=cn`) on the provisioning bridge → BCM provisions the installer Ubuntu → `kairos-install.service` runs `install-kairos.sh` → node powers off. Phase 2 boots the same disk (`-boot c`) using the **shared OVMF vars** (so the efibootmgr Kairos entry persists) and waits for Kairos. `kairos_vm_wait=false` hands the wait+disk-boot to a detached finisher.
 **Artifacts:** `build/<slug>-compute.qcow2`, `build/ovmf-vars-<slug>-vm.fd`, pidfile.
 **Logs:** `logs/<slug>-serial.log` (`make kairos-serial`) — **note it's truncated at the phase boundary**, so the install-phase trace is best read from the node's `/dev/shm/kairos-install.log`; `logs/<slug>-finish.log` in non-blocking mode.
 **Validate:** node powers off after the install phase, then boots; `ssh kairos@<node-ip>` shows `/etc/kairos-release`.
@@ -257,7 +265,7 @@ ls -l /cm/images/<profile>-installer/etc/systemd/system/multi-user.target.wants/
 | Symptom | Cause | Fix |
 |---|---|---|
 | No DHCP / PXE never starts | MAC/network mismatch, node not registered on the right `provisioninginterface` | check `kairos_vm_mac` matches the cmsh device; re-run deploy-dd |
-| PXE pulls `syslinux.efi` then stalls | TFTP/next-stage over socket net (rig artifact), or BCM served `localboot` | for a *fresh install* it usually proceeds; for a re-PXE see Appendix A |
+| PXE pulls `syslinux.efi` then stalls | TFTP/next-stage over the provisioning bridge (rig artifact), or BCM served `localboot` | for a *fresh install* it usually proceeds; for a re-PXE see Appendix A |
 | Node boots **Ubuntu, not Kairos** | `kairos-install.service` didn't complete the `dd` | **see `docs/troubleshoot-node-booted-bcm-image.md`** + Appendix A |
 | Disk-boot times out once then works | stylus first-boot registration stall | the role resets + reboots; second boot uses the default Kairos GRUB entry |
 

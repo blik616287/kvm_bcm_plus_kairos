@@ -112,7 +112,7 @@ make deploy-dd    ANSIBLE_ARGS="-e @profiles/ubuntu-26.04.yml"
 # validate 24.04 on node001
 make kairos-vm    ANSIBLE_ARGS="-e @profiles/ubuntu-24.04.yml"
 make validate     ANSIBLE_ARGS="-e @profiles/ubuntu-24.04.yml"
-make kairos-stop                                                  # free the socket net
+make kairos-stop                                                  # stop compute VMs
 
 # validate 26.04 on node002
 make kairos-vm    ANSIBLE_ARGS="-e @profiles/ubuntu-26.04.yml"
@@ -169,14 +169,23 @@ be exercised on the rig instead of on a DGX. Two things make it a faithful stand
   and here it would actively break selection: the smallest N drives become the OS
   mirror, so a small boot disk would be chosen as a member.
 
+It runs on **node004** (`52:54:00:00:06:01` → `.13`), not node003 — node003
+belongs to `profiles/edge-to-appliance.yml`, and on a bridge-mode provisioning LAN
+both can be up at once, so sharing a node slot would have them overwrite each
+other's BCM registration and qcow2 disks.
+
 ```yaml
 kairos_vm_disk_size: ""          # no boot disk; the mirror IS the boot target
 kairos_vm_disks:
-  - {size: "24G", bus: nvme}     # \
-  - {size: "24G", bus: nvme}     #  > smallest two -> OS mirror
-  - {size: "48G", bus: nvme}     # \
-  - {size: "48G", bus: nvme}     #  > the rest -> /raid stripe
+  - {size: "96G",  bus: nvme}    # \
+  - {size: "96G",  bus: nvme}    #  > smallest two -> OS mirror
+  - {size: "128G", bus: nvme}    # \
+  - {size: "128G", bus: nvme}    #  > the rest -> /raid stripe
 ```
+
+The members are 96G rather than something token-sized because of the three floors
+in the table below — in particular the array has to hold the whole raw image, and
+a mirror is only one member wide.
 
 Two sizing floors apply, to different things — get either wrong and the error names neither:
 
