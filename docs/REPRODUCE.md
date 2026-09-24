@@ -194,40 +194,31 @@ make install-deps && make setup             # no MISSING lines
 
 ### Step 1 — stage the licensed inputs
 
-Two sets, two destinations (section 1). Do **both** — the BCM ISO is not part of
-`palette-artifacts-pull`.
+Two sets, two destinations (section 1), and each has its own command — the BCM
+ISO is not part of `palette-artifacts-pull`. With a JFrog mirror both are
+automatic and this step is just a place to fail fast on ~23 GB of transfers
+before a 90-minute install; without one, both sets are copied in by hand.
 
-**1a — BCM ISO into `dist/`.** With a mirror configured this is optional:
-`make bcm-prepare` in step 2 downloads
-`https://<jfrog_instance>/artifactory/<jfrog_repo>/<iso_filename>` itself when
-`dist/<iso_filename>` is missing, and skips the download when it is already
-there. Stage it up front if you want the ~13 GB transfer to fail early rather
-than 90 minutes into the run, or if you have no mirror and are copying the ISO
-straight off your NVIDIA/Bright entitlement download:
+**1a — BCM ISO into `dist/`.** With a mirror configured there is nothing to do
+here: `make bcm-prepare` (step 2) *is* the download step — it fetches
+`<jfrog_repo>/<iso_filename>` into `dist/` with the token in a `0600` curl config,
+skips the download when the file is already there, and goes on to remaster it.
+There is no separate ISO-only target and no reason to fetch it by hand.
+
+Only when you have no mirror do you stage it yourself — put the entitlement
+download in `dist/` under exactly the name `iso_filename` gives:
 
 ```bash
 mkdir -p dist
-# no mirror — just place the entitlement download, under its exact iso_filename:
 cp /path/to/bcm-11.0-ubuntu2404.iso dist/
-
-# or pull it from your mirror. The token goes in a 0600 file, never in argv:
-# (this is the same thing roles/bcm_prepare does, and why)
-umask 077
-printf 'header = "Authorization: Bearer %s"\n' "$JFROG_TOKEN" > "$HOME/.jfrog-curl.cfg"
-curl --fail -L --progress-bar -K "$HOME/.jfrog-curl.cfg" \
-  -o dist/bcm-11.0-ubuntu2404.iso \
-  "https://insightsoftmax.jfrog.io/artifactory/iso-releases/bcm-11.0-ubuntu2404.iso"
-rm -f "$HOME/.jfrog-curl.cfg"
-
 ls -lh dist/     # ~13 GB, and the name must equal iso_filename
 ```
 
-A 401/403 here means the token lacks read on the ISO repo. Check the size
-afterwards either way: `--fail` stops an error page being saved, but nothing
-catches an interrupted transfer, and a truncated ISO is the worst case:
-`bcm-prepare` never re-downloads a file that already exists, so the run reports
+Either route, check the size once. `bcm-prepare` never re-downloads a file that
+already exists, so a truncated or half-copied ISO is not retried: the run reports
 an archive error out of `7z x` during the remaster rather than a download error,
-and re-running changes nothing. Delete a short file and pull it again.
+and re-running changes nothing. Delete a short file and fetch it again. A 401/403
+from the download means the token lacks read on the ISO repo.
 
 **1b — Palette bundle into `artifacts/`.**
 

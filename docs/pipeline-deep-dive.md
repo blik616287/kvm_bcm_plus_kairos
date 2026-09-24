@@ -117,10 +117,14 @@ Takes the stock BCM 11.0 installer ISO and turns it into an unattended auto-inst
 
 ### 3.1 Download the BCM ISO from JFrog
 
-Fetched with a bearer token to `dist/bcm-*.iso`; skipped if the file already exists:
+Fetched to `dist/<iso_filename>`; skipped if the file already exists. The token
+goes in a `0600` curl config read with `-K` and removed in an `always:` block, never
+in argv — process arguments are world-readable via `/proc`, and this download can
+run for hours:
 
 ```
-curl --fail -L -H "Authorization: Bearer $jfrog_token" \
+# dist/.jfrog-curl.cfg, mode 0600:  header = "Authorization: Bearer <token>"
+curl --fail -L --progress-bar -K dist/.jfrog-curl.cfg \
   -o dist/<iso_filename> \
   "https://<jfrog_instance>/artifactory/<jfrog_repo>/<iso_filename>"
 ```
