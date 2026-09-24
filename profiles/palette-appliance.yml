@@ -14,15 +14,23 @@
 #   make palette-appliance
 #
 # PREREQUISITE — the licensed Spectro content bundle must be in artifacts/
-# (see artifacts/README.md). appliance_pe_version must match the STYLUS AGENT
-# version the bundle ships, which is NOT the bundle filename: a
-# palette-enterprise-appliance-4.10.17.tar.zst bundle ships stylus v4.10.4.
+# (see artifacts/README.md).
+#
+# WHICH BUNDLE is not decided here. The artifact set — appliance_bundle_version,
+# the three appliance_*_filename names, appliance_pe_version, appliance_jfrog_*
+# and appliance_artifacts_dir — lives in inventory/hosts.yml and is overridden
+# in inventory/group_vars/all.yml, so retargeting a version does not mean
+# editing a committed profile. This file only reads from it: PE_VERSION below is
+# "{{ appliance_pe_version }}", so there is one value to change, not three.
 
-# ADDING A VERSION — copy this file to profiles/palette-appliance-<ver>.yml and
-# change five things: kairos_profile (it namespaces every artifact on BCM, so
-# two versions coexist), ISO_NAME, PE_VERSION, appliance_pe_version, and the
-# three appliance_*_filename names near the bottom. Nothing else is
-# version-shaped. `make palette-appliance PALETTE_PROFILE=profiles/<new>.yml`.
+# ADDING A VERSION — normally nothing here changes: set appliance_bundle_version
+# and appliance_pe_version in inventory/group_vars/all.yml and run
+# `make palette-appliance`. Copy this file only to run TWO versions side by side
+# on one rig, where each needs its own BCM-side namespace: change kairos_profile
+# (it namespaces every artifact on BCM), ISO_NAME, and — because a profile is
+# extra-vars and therefore beats group_vars — pin that build's
+# appliance_bundle_version and appliance_pe_version here.
+# `make palette-appliance PALETTE_PROFILE=profiles/<new>.yml`.
 
 kairos_profile: "palette-appliance"
 
@@ -104,8 +112,11 @@ kairos_canvos_args:
   K8S_DISTRIBUTION: "k3s"
   K8S_VERSION: "1.36.2"
   # PE_VERSION is not in kairos_canvos_defaults; arbitrary keys flow through to
-  # .arg verbatim. Must match the bundle's stylus agent version.
-  PE_VERSION: "v4.10.4"
+  # .arg verbatim. It must equal the bundle's stylus agent version, so take it
+  # from the one variable that is checked against the bundle rather than
+  # repeating the string — a silent mismatch here is what leaves a healthy,
+  # ready node retrying "failed to upgrade stylus" forever.
+  PE_VERSION: "{{ appliance_pe_version }}"
   CUSTOM_TAG: "appliance"
   # Distinct ISO_NAME so the build's "ISO already exists" short-circuit cannot
   # reuse an edge profile's ISO from build/.
@@ -151,18 +162,12 @@ kairos_dockerfile_extra: |
       rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
 
 # ---- Appliance / Palette cluster settings ----
-# Must match the stylus agent version the content bundle ships.
-appliance_pe_version: "v4.10.4"
-
-# The licensed artifacts this profile is built against, by name. Pinning them
-# does two things: `make palette-artifacts-pull` (and any appliance build with
-# an empty artifacts/) knows what to fetch from JFrog, and discovery stops
-# guessing -- fileglob sorts lexicographically, so an artifacts/ dir holding
-# both 4.9.3 and 4.11.0 would otherwise silently pick 4.9.3. A new Palette
-# version is a copy of this file with these three names and PE_VERSION changed.
-appliance_bundle_filename: "palette-enterprise-appliance-4.10.17.tar.zst"
-appliance_bundle_signature_filename: "palette-enterprise-appliance-4.10.17.tar.sig.bin"
-appliance_signing_key_filename: "spectro_public_key.pem"
+# NOT HERE, deliberately: appliance_pe_version, appliance_bundle_version and the
+# three appliance_*_filename names. They describe the licensed artifact set, not
+# this image's layout, and they are group_vars (inventory/hosts.yml defaults,
+# inventory/group_vars/all.yml overrides) so a site points the build at its own
+# mirror and version without editing this file. Pin them here only for a
+# second, side-by-side version — see ADDING A VERSION at the top.
 # Second disk on the deployed node, wiped during cluster deployment. Virtio on
 # a local-KVM node, so vdb — NOT sdb (that would be a SCSI-attached node).
 appliance_storage_pool_drive: "/dev/vdb"

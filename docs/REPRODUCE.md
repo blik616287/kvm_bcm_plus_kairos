@@ -103,7 +103,7 @@ DHCP dies silently while ARP and host pings still work.
 ### 3.1 The one file you must create
 
 `inventory/group_vars/all.yml` is gitignored and holds everything site-specific.
-**This is the complete file used by the validated run** — seven keys, nothing else:
+**This is the complete file used by the validated run** — eight keys, nothing else:
 
 ```yaml
 ---
@@ -125,44 +125,57 @@ kairos_target_disk: "/dev/vda"
 # stage 4 skip the DHCP-pool and site-DNS work the local rig depends on.
 bcm_manage_cluster_defaults: true
 
-# --- Stylus AGENT version in the content bundle (NOT the filename) ----------
+# --- Which licensed Palette artifact set to build against -------------------
+# TWO version numbers, and they are not the same one:
+#   appliance_bundle_version  the PACKAGE version = the .tar.zst filename
+#   appliance_pe_version      the STYLUS AGENT version INSIDE that bundle
 # A palette-enterprise-appliance-4.10.17.tar.zst bundle ships stylus v4.10.4.
-# Read it from the bundle, never off the name:
+# Read the second out of the bundle, never off the name:
 #   python3 playbooks/files/bundle_stylus_version.py artifacts/<bundle>.tar.zst
+# The filenames are derived from the first, and both profiles take their CanvOS
+# PE_VERSION from the second, so these two keys retarget the whole artifact set.
+appliance_bundle_version: "4.10.17"
 appliance_pe_version: "v4.10.4"
 ```
 
 Everything else comes from committed defaults: `inventory/hosts.yml` for the rig
-(addresses, VM sizing, bridge, VIP) and `profiles/*.yml` per build. Full variable
-reference: `inventory/group_vars/all.example.yml`.
+(addresses, VM sizing, bridge, VIP, and the artifact names/locations derived from
+the two keys above) and `profiles/*.yml` per build. Full variable reference:
+`inventory/group_vars/all.example.yml` — the licensed artifact set has its own
+section there, and none of it lives in a profile, so a different bundle version
+or a differently-named mirror is a group_vars change, never a profile edit.
 
 ### 3.2 Values you may need to change
 
 | Variable | Default (`inventory/hosts.yml`) | Change if |
 |---|---|---|
 | `appliance_jfrog_repo` | `palette-content` | your Palette mirror repo is named differently |
+| `appliance_bundle_filename` (and `_bundle_signature_filename`, `_signing_key_filename`) | derived from `appliance_bundle_version` | your mirror does not use Spectro's `palette-enterprise-appliance-<ver>.tar.zst` naming. The JFrog path and the local filename are the same string |
+| `appliance_artifacts_dir` | `<repo>/artifacts` | you keep the ~10 GB bundle elsewhere (or pin absolute paths with `appliance_content_bundle` / `appliance_signing_public_key`) |
 | `bcm_internal_cidr` | `192.168.98.0/24` | it collides with a network on your host |
 | `appliance_vip` | `192.168.98.251` | you change the CIDR. Must avoid BCM's DHCP pool (`.16`–`.250`), `bcm_internal_ip` (`.2`) and every derived node address |
 | `bcm_internal_net_mode` | `bridge` | **leave it.** `socket` is point-to-point and cannot run the appliance and edge node together, so the experiment is impossible under it |
 
-### 3.3 Pin the Palette version in three places
+### 3.3 The version is pinned in one place
 
-All three must equal the **stylus agent** version inside the bundle — not the
-package version in the filename:
+`appliance_pe_version` in `inventory/group_vars/all.yml` is the only place the
+**stylus agent** version is written. Both images derive their CanvOS
+`PE_VERSION` from it — `profiles/palette-appliance.yml` and
+`profiles/edge-to-appliance.yml` each pass `PE_VERSION: "{{ appliance_pe_version }}"`
+— and `playbooks/tasks/appliance_credentials.yml` checks it against the bundle
+before anything is built, so a wrong value fails the run early and by name.
 
-| Setting | File |
-|---|---|
-| `appliance_pe_version` | `inventory/group_vars/all.yml` |
-| `PE_VERSION` | `profiles/palette-appliance.yml` |
-| `PE_VERSION` | `profiles/edge-to-appliance.yml` |
+That matters because the failure it replaces was invisible: the appliance and the
+edge node used to carry separate literals, and an edge image a version behind
+registers fine and reports `health: healthy` / `state: ready`, then retries
+`failed to upgrade stylus` forever.
 
-Only the first is validated against the bundle automatically. A mismatch in the
-edge profile does not fail anything — the node registers and reports healthy,
-then retries a self-upgrade forever.
-
-Also update the three filenames in `profiles/palette-appliance.yml`
-(`appliance_bundle_filename`, `appliance_bundle_signature_filename`,
-`appliance_signing_key_filename`) if your bundle version differs.
+Likewise the bundle's own name: set `appliance_bundle_version` (or the three
+`appliance_*_filename` keys, for a mirror with different naming) in
+`inventory/group_vars/all.yml`. Nothing version-shaped is left in a profile.
+Copy `profiles/palette-appliance.yml` only to run two Palette versions side by
+side on one rig, where each build needs its own BCM-side namespace — a profile is
+passed with `-e`, so the copy's pins deliberately beat group_vars.
 
 ---
 
