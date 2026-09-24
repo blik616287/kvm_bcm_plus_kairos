@@ -6,5 +6,31 @@
     e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
     build_dir: "{{ e2e_dir }}/build"
     dist_dir: "{{ e2e_dir }}/dist"
+  pre_tasks:
+    # An edge profile that registers to the self-hosted appliance needs the API
+    # key and project uid `make palette-edge-credentials` minted. They live in
+    # .run-credentials.yml (0600) rather than in the profile, which is
+    # committed. Absent file = a SaaS/unregistered build, which is the default.
+    - name: Load edge registration credentials when present
+      ansible.builtin.include_vars:
+        file: "{{ e2e_dir }}/.run-credentials.yml"
+        name: edge_prior_creds
+      failed_when: false
+      no_log: true
+
+    - name: Surface them as the vars the profile references
+      ansible.builtin.set_fact:
+        edge_palette_api_key: "{{ edge_prior_creds.edge_palette_api_key | default('') }}"
+        edge_palette_project_uid: "{{ edge_prior_creds.edge_palette_project_uid | default('') }}"
+      no_log: true
+
+    # The appliance image bakes a hash of appliance_admin_password into its
+    # cloud-config, so the credentials must be resolved (and persisted) before
+    # kairos_build renders the template. Guarded on the template selection so
+    # ordinary edge profiles are completely unaffected.
+    - name: Resolve appliance credentials when building the appliance image
+      ansible.builtin.include_tasks: tasks/appliance_credentials.yml
+      when: kairos_cloud_config_template | default('') is search('appliance')
+
   roles:
     - kairos_build

@@ -110,7 +110,28 @@ mdadm --detail "${DISK}" 2>&1 | grep -E 'Raid Level|State|Active Devices' || tru
 {% endif %}
 
 for i in $(seq 1 30); do curl --fail --silent --head "${RAW_URL}" > /dev/null 2>&1 && break; sleep 5; done
-echo "[kairos-finalize $(date)] writing image..."
+
+# The image is dd'd byte for byte, so the target must be at least as large as
+# the raw disk. On a RAID profile the target is the ARRAY, which is easy to
+# undersize: members look roomy individually while the mirror is one member
+# wide. Say so here, naming both numbers -- the alternative is dd stopping at
+# "No space left on device" several minutes in, with a half-written GPT.
+_TARGET_BYTES=$(blockdev --getsize64 "${DISK}" 2> /dev/null || echo 0)
+_IMAGE_BYTES={{ dd_raw_stat.stat.size | default(0) }}
+if [ "${_TARGET_BYTES}" -eq 0 ]; then
+    # On a RAID profile this is how a failed `mdadm --create` shows up: the
+    # array above only warns, so without this the dd would write to a path
+    # that is not a block device at all.
+    echo "[kairos-finalize $(date)] FATAL: ${DISK} is not a usable block device (size 0)."
+    exit 1
+fi
+if [ "${_IMAGE_BYTES}" -gt 0 ] && [ "${_TARGET_BYTES}" -lt "${_IMAGE_BYTES}" ]; then
+    echo "[kairos-finalize $(date)] FATAL: ${DISK} is ${_TARGET_BYTES} bytes but the image is ${_IMAGE_BYTES} bytes."
+    echo "[kairos-finalize $(date)] Grow the target (on a RAID profile that means the members) or shrink kairos_raw_disk_size."
+    exit 1
+fi
+
+echo "[kairos-finalize $(date)] writing image (${_IMAGE_BYTES} bytes -> ${DISK}, ${_TARGET_BYTES} bytes)..."
 curl --fail -s "${RAW_URL}" | lz4 -d - - | dd of="${DISK}" bs=4M oflag=direct status=progress
 sync
 echo "[kairos-finalize $(date)] dd complete; fixing GPT + growing last partition..."

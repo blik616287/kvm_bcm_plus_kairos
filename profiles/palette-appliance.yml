@@ -1,0 +1,173 @@
+---
+# Build/deploy/boot profile for the self-hosted PALETTE MANAGEMENT APPLIANCE.
+#
+# The appliance is provisioned BY BCM, exactly like a Kairos edge node: stage 3
+# builds a raw disk, stage 4 pushes it to BCM and configures PXE + the category,
+# stage 5 PXE-boots the node and BCM `dd`s the image onto it. The only thing
+# that differs from an edge profile is the image's cloud-config, which
+# kairos_cloud_config_template swaps wholesale.
+#
+#   make kairos-build ANSIBLE_ARGS="-e @profiles/palette-appliance.yml"
+#   make deploy-dd    ANSIBLE_ARGS="-e @profiles/palette-appliance.yml"
+#   make kairos-vm    ANSIBLE_ARGS="-e @profiles/palette-appliance.yml"
+# or run the whole chain plus the post-boot cluster deploy in one command:
+#   make palette-appliance
+#
+# PREREQUISITE — the licensed Spectro content bundle must be in artifacts/
+# (see artifacts/README.md). appliance_pe_version must match the STYLUS AGENT
+# version the bundle ships, which is NOT the bundle filename: a
+# palette-enterprise-appliance-4.10.17.tar.zst bundle ships stylus v4.10.4.
+
+# ADDING A VERSION — copy this file to profiles/palette-appliance-<ver>.yml and
+# change five things: kairos_profile (it namespaces every artifact on BCM, so
+# two versions coexist), ISO_NAME, PE_VERSION, appliance_pe_version, and the
+# three appliance_*_filename names near the bottom. Nothing else is
+# version-shaped. `make palette-appliance PALETTE_PROFILE=profiles/<new>.yml`.
+
+kairos_profile: "palette-appliance"
+
+# ---- The image is an appliance, not an edge node ----
+# Replaces the Kairos edge cloud-config (BCM integration + Palette
+# registration + the kairos user) with the appliance one (stylus
+# applianceType: palette, seeded Local UI admin, storage bind-mounts).
+kairos_cloud_config_template: "appliance-cloud-config.yaml.j2"
+
+# The appliance image boots its OWN installer, so the config is baked into the
+# ISO and the image installs itself; kairos_build just waits for the power-off.
+# Injecting `kairos-agent install` here cannot work: the appliance stylus
+# config mounts COS_PERSISTENT the moment those labels appear, so kairos-agent
+# loses a race against the very labels it writes and fails with
+# "device or resource busy" on every retry.
+kairos_build_self_install: true
+
+# The appliance installs a rootfs that does not carry the BCM overlay scripts,
+# so the stylus-agent hook that calls them must not ship: it fails 203/EXEC and
+# stylus never starts, leaving the cluster stuck at Provisioning.
+kairos_build_bcm_integration: false
+# The appliance installer needs more headroom than the edge default (4G/2).
+kairos_build_install_ram: 8192
+kairos_build_install_cpus: 4
+
+# ---- BCM-managed node this profile installs onto ----
+# Distinct name + MAC so the appliance coexists with the edge node001 slot on
+# the same BCM. kairos_target_ip pins the node's address so the cluster VIP and
+# the Local UI are at predictable places; it MUST sit outside BCM's DHCP pool
+# (.16-.250) and differ from bcm_internal_ip.
+kairos_node_name: "node002"
+kairos_vm_mac: "52:54:00:00:03:01"
+# REMOTE-BCM ONLY. On local-KVM, roles/deploy_dd/tasks/node.yml derives the
+# node address as bcm_internal_ip-prefix + (9 + node number), so node002 is
+# 192.168.98.11 and this value is ignored. The VIP below must not collide with
+# that derived address.
+kairos_target_ip: "192.168.98.10"
+
+# Disk BCM `dd`s the image onto. Local-KVM compute nodes are virtio.
+kairos_target_disk: "/dev/vda"
+
+# Run the dd from the node-installer FINALIZE stage rather than the stage-2
+# kairos-install unit. Required here, not optional: the stage-2 dd overwrites
+# its own running rootfs, so every post-dd step silently fails — observed
+# exactly as IN-2323 documents it:
+#   Problem opening /dev/vda for reading! Error is 2.
+#   run-dd.sh: /dev/shm/kinstall/timeout: No such file or directory
+#   WARN: couldn't detect last partition, skipping grow
+#   efivars or efibootmgr unavailable; skipping EFI entry creation
+# The dd itself succeeds (86 GB at ~386 MB/s) but leaves an unbootable disk:
+# no GPT backup header fix, no COS_PERSISTENT grow, no EFI boot entry.
+# The finalize stage runs from the node-installer NFS root, never the disk
+# being overwritten. Needs the node firmware boot order to be disk-first with
+# PXE fallback, which the local-KVM launcher already does.
+deploy_dd_finalize_install: true
+
+# ---- Appliance VM sizing (stage 5, local-KVM) ----
+# Spectro's published per-node sizing: 8 vCPU, 16 GB RAM, a 300-500 GB install
+# disk, and a second disk >= 500 GB for the storage pool, which is WIPED during
+# cluster deployment.
+kairos_vm_ram: 16384
+kairos_vm_cpus: 8
+kairos_vm_disk_size: "500G"
+# Storage-pool disk (appliance_storage_pool_drive). virtio -> /dev/vdb.
+kairos_vm_disks:
+  - { size: "500G", bus: virtio }
+
+# The appliance image has no kairos/kairos user (its cloud-config seeds the
+# Local UI admin instead), so the post-boot probe must use that account or it
+# can never succeed.
+kairos_vm_probe_user: "{{ appliance_admin_user }}"
+kairos_vm_probe_password: "{{ appliance_admin_password }}"
+
+# ---- CanvOS build inputs ----
+kairos_canvos_args:
+  OS_DISTRIBUTION: "ubuntu"
+  OS_VERSION: "22.04"
+  IMAGE_REPO: "ubuntu"
+  K8S_DISTRIBUTION: "k3s"
+  K8S_VERSION: "1.36.2"
+  # PE_VERSION is not in kairos_canvos_defaults; arbitrary keys flow through to
+  # .arg verbatim. Must match the bundle's stylus agent version.
+  PE_VERSION: "v4.10.4"
+  CUSTOM_TAG: "appliance"
+  # Distinct ISO_NAME so the build's "ISO already exists" short-circuit cannot
+  # reuse an edge profile's ISO from build/.
+  ISO_NAME: "palette-appliance-installer"
+  # Bake the content-signing public key into the image (see
+  # kairos_edge_custom_config below). Without it the appliance rejects a signed
+  # content bundle with "public key to verify content not found".
+  EDGE_CUSTOM_CONFIG: ".edge-custom-config.yaml"
+  # MUST be empty, overriding the EDGE default of "spc.tgz" in
+  # kairos_canvos_defaults. The appliance gets its cluster definition AFTER it
+  # boots, from the content bundle palette_cluster uploads — there is no
+  # spc.tgz in the CanvOS tree at build time, so a non-empty value points
+  # CanvOS at a file that does not exist. Upstream set this empty for the same
+  # reason.
+  CLUSTERCONFIG: ""
+
+# The content-signing public key the appliance verifies the bundle against.
+# Read from artifacts/ at render time; appliance_signing_public_key is
+# auto-discovered by the playbook (artifacts/*.pem).
+kairos_edge_custom_config: |
+  content:
+   signing:
+    publicKey:
+     base64EncodedValue: "{{ lookup('file', appliance_signing_public_key) | b64encode }}"
+     description: "Content signing public key ({{ appliance_signing_public_key | basename }})"
+
+# Host user-space for the Piraeus/LINSTOR (DRBD) storage stack.
+kairos_extra_apt_packages:
+  - lvm2
+  - thin-provisioning-tools
+  - drbd-utils
+
+# The bundle's module-builder images compile DRBD against the running kernel,
+# so matching kernel headers must be baked in too. CanvOS ships the script;
+# kairos_extra_apt_packages cannot express a COPY, hence the raw block.
+kairos_dockerfile_extra: |
+  COPY scripts/install-kernel-headers.sh /tmp/install-kernel-headers.sh
+  RUN if [ "${OS_DISTRIBUTION}" = "ubuntu" ]; then \
+        chmod 755 /tmp/install-kernel-headers.sh && \
+        /tmp/install-kernel-headers.sh; \
+      fi; \
+      rm -f /tmp/install-kernel-headers.sh && \
+      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
+
+# ---- Appliance / Palette cluster settings ----
+# Must match the stylus agent version the content bundle ships.
+appliance_pe_version: "v4.10.4"
+
+# The licensed artifacts this profile is built against, by name. Pinning them
+# does two things: `make palette-artifacts-pull` (and any appliance build with
+# an empty artifacts/) knows what to fetch from JFrog, and discovery stops
+# guessing -- fileglob sorts lexicographically, so an artifacts/ dir holding
+# both 4.9.3 and 4.11.0 would otherwise silently pick 4.9.3. A new Palette
+# version is a copy of this file with these three names and PE_VERSION changed.
+appliance_bundle_filename: "palette-enterprise-appliance-4.10.17.tar.zst"
+appliance_bundle_signature_filename: "palette-enterprise-appliance-4.10.17.tar.sig.bin"
+appliance_signing_key_filename: "spectro_public_key.pem"
+# Second disk on the deployed node, wiped during cluster deployment. Virtio on
+# a local-KVM node, so vdb — NOT sdb (that would be a SCSI-attached node).
+appliance_storage_pool_drive: "/dev/vdb"
+# The management cluster VIP. Same subnet as the node so kube-vip binds it to
+# the provisioning NIC. Must avoid THREE things: BCM's DHCP pool (.16-.250),
+# bcm_internal_ip (.2), and the address deploy_dd derives for the node itself
+# (node002 -> .11). .251 clears all three.
+appliance_vip: "192.168.98.251"

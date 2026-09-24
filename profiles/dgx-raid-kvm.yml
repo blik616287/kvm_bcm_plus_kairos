@@ -1,0 +1,102 @@
+---
+# LOCAL-KVM emulation of the DGX A100 RAID layout (profiles/dgx-raid.yml).
+#
+# Exists because dgx-raid targets real hardware (bcm_target_node: dgx03), so
+# the RAID half of it — mdadm creating the OS mirror, dd onto /dev/md0, the
+# per-member EFI boot entry, the data array + its fail-open mount unit — has
+# never been exercisable on a dev box. Everything else in the pipeline had
+# local-KVM coverage; this closes that gap.
+#
+#   make kairos-build ANSIBLE_ARGS="-e @profiles/dgx-raid-kvm.yml"
+#   make deploy-dd    ANSIBLE_ARGS="-e @profiles/dgx-raid-kvm.yml"
+#   make kairos-vm    ANSIBLE_ARGS="-e @profiles/dgx-raid-kvm.yml"
+#
+# The node presents EMULATED NVMe rather than virtio, because the finalize
+# script selects members by scanning /sys/block/nvme*n1 — virtio disks are
+# invisible to it. That means the REAL selection logic runs here unmodified,
+# rather than a test-only variant that would prove nothing.
+#
+# What this does NOT emulate: real NVMe timing, multi-terabyte sizes, and the
+# bonded-NIC PXE behaviour in docs/nvidia-dgx-*.md. It is a logic test.
+
+kairos_profile: "dgx-raid-kvm"
+
+# Local-KVM node (empty bcm_target_node = register a fresh node, not dgx03).
+bcm_target_node: ""
+# node004, not node003: profiles/edge-to-appliance.yml owns node003, and now
+# that the provisioning LAN is a bridge rather than a point-to-point socket the
+# two can be up at the same time -- sharing a node slot would have them
+# overwrite each other's BCM registration and qcow2 disks.
+kairos_node_name: "node004"
+kairos_vm_mac: "52:54:00:00:06:01"
+
+# RAID-capable image: mdadm + the dracut mdraid module + rd.auto=1, so the
+# initramfs can assemble the array the raw image was dd'd onto.
+kairos_build_mdraid: true
+
+kairos_canvos_args:
+  OS_DISTRIBUTION: "ubuntu"
+  OS_VERSION: "22.04"
+  # Distinct ISO_NAME so the build's "ISO already exists" short-circuit cannot
+  # reuse another profile's ISO.
+  ISO_NAME: "palette-edge-dgxraid-kvm"
+
+# ---- The emulated drive set ----
+# Four NVMe namespaces: two small (OS mirror) + two large (data array). The
+# SIZE DIFFERENCE is what makes selection work — finalize sorts by size and
+# takes the smallest N as the mirror, which is the DGX shape (2 small OS +
+# 8 large data) scaled down to something a dev box can build in minutes.
+kairos_vm_ram: 4096
+kairos_vm_cpus: 2
+# NO separate boot disk, exactly like a DGX: every drive is NVMe and the OS
+# mirror is what the node boots from. A boot disk would also break selection —
+# finalize takes the SMALLEST N drives as the mirror, so a small boot disk
+# would be picked over the real members.
+kairos_vm_disk_size: ""
+# Two sizing floors, both learned the hard way, and they apply to DIFFERENT
+# things -- get either wrong and the failure names neither:
+#
+#  1. An OS mirror MEMBER also has to hold BCM's installer environment before
+#     finalize wipes it for the array. The category disksetup is 100M ESP +
+#     16G swap + the software image (~9.4G), so a member under ~28G fails
+#     mid-provision with "An error occurred while provisioning. Ran out of
+#     disk space!" -- pointing at BCM, not at the profile.
+#  2. The ARRAY has to hold the whole raw image, because stage 4 dd's it onto
+#     the array byte for byte -- and a mirror is only one member wide, so
+#     members that look roomy individually still make a small target. The
+#     image is the 80 GiB default: kairos_raw_disk_size cannot usefully go
+#     much below ~56 GiB, because the edge image's own layout asks for
+#     OEM 5120 + recovery 20200 + state 25576 MiB before COS_PERSISTENT gets
+#     anything, and kairos-agent refuses with "the requested partitions size
+#     (50960MiB) does not fit in the target disk".
+#
+# Hence 96G members: >= the 80 GiB image, and comfortably over floor 1.
+kairos_vm_disks:
+  - { size: "96G", bus: nvme }   # nvme0n1 - OS mirror member
+  - { size: "96G", bus: nvme }   # nvme1n1 - OS mirror member
+  - { size: "128G", bus: nvme }  # nvme2n1 - data
+  - { size: "128G", bus: nvme }  # nvme3n1 - data
+
+# ---- RAID layout (same shape as profiles/dgx-raid.yml) ----
+# size mode: ignore the device NAMES below, take the smallest 2 as the mirror.
+kairos_raid_select: size
+
+kairos_os_raid:
+  level: 1
+  # Superblock at the END of each member, so UEFI can still read the ESP the
+  # image writes at LBA0 off a single drive. A RAID1 mirror is the only level
+  # that gives each member a complete bootable ESP — finalize.yml asserts it.
+  metadata: "1.0"
+  devices: [nvme0n1, nvme1n1]   # under 'size' only the COUNT (2) is used
+kairos_target_disk: /dev/md0    # dd target = the assembled mirror
+
+kairos_data_raid:
+  - name: raid
+    level: 0
+    devices: [nvme2n1, nvme3n1]
+    filesystem: ext4
+    mount: /raid
+
+# The dd must run from the node-installer NFS root, never the disk being
+# overwritten — and the RAID arrays are created by that finalize script.
+deploy_dd_finalize_install: true

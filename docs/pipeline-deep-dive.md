@@ -189,7 +189,7 @@ qemu-system-x86_64 \
   -kernel build/.bcm-kernel \
   -initrd build/.bcm-rootfs-auto.cgz \
   -append "dvdinstall nokeymap root=/dev/ram0 rw ramdisk_size=1000000 … net.ifnames=0 biosdevname=0 console=ttyS0,115200" \
-  -netdev socket,id=intnet,listen=:31337 \
+  -netdev bridge,id=intnet,br=br-kairos,helper=/usr/lib/qemu/qemu-bridge-helper \
   -device virtio-net-pci,netdev=intnet,mac=BC:24:11:7F:33:7C \
   -netdev user,id=extnet,hostfwd=tcp::${bcm_ssh_port}-:22,hostfwd=tcp::${bcm_https_port}-:443 \
   -device virtio-net-pci,netdev=extnet,mac=BC:24:11:ED:21:50 \
@@ -198,7 +198,7 @@ qemu-system-x86_64 \
 
 Key points:
 - Direct `-kernel`/`-initrd`/`-append` — bypasses the ISO bootloader; `dvdinstall` tells the installer to look on CD-ROM.
-- eth0 on a QEMU **socket network** listening on `:31337` (compute VM will `connect=:31337`); eth1 on user-mode NAT with host port-forwards for SSH + HTTPS.
+- eth0 on the **provisioning bridge** `br-kairos` (compute VMs get their own taps on the same bridge); eth1 on user-mode NAT with host port-forwards for SSH + HTTPS.
 - Config drive is the third virtio disk.
 - Serial to `logs/bcm-serial.log` for tailing (`make bcm-serial`).
 
@@ -711,7 +711,7 @@ At this point BCM is fully configured. The target node will pick up the `kairos-
 qemu-system-x86_64 \
   -enable-kvm -m $kairos_vm_ram -smp $kairos_vm_cpus -cpu host \
   -drive file=build/kairos-compute.qcow2,format=qcow2,if=virtio \
-  -netdev socket,id=intnet,connect=:31337 \
+  -netdev bridge,id=intnet,br=br-kairos,helper=/usr/lib/qemu/qemu-bridge-helper \
   -device virtio-net-pci,netdev=intnet,mac=$kairos_vm_mac \
   -chardev socket,id=ser0,host=localhost,port=4321,server=on,wait=off,telnet=on,logfile=logs/kairos-serial.log \
   -serial chardev:ser0 \
@@ -719,7 +719,7 @@ qemu-system-x86_64 \
 ```
 
 Key differences from BCM VM:
-- **Single NIC** on socket network (`connect=:31337` connects to BCM's listen) — no direct internet, routes through BCM's NAT.
+- **Single NIC** on the provisioning bridge `br-kairos` (its tap is created by `qemu-bridge-helper`) — no direct internet, routes through BCM's NAT.
 - **`-boot order=cn`** — network first, then disk. PXE ROM requests DHCP from BCM, pulls the PXE config + kernel + ramdisk over TFTP.
 - **MAC matches registered node001** (`52:54:00:00:02:01` by default) so BCM assigns the expected IP and the `kairos` category.
 - **Telnet serial on port 4321** — attach with `telnet localhost 4321` for live debugging.
@@ -916,7 +916,7 @@ The build host never sees the provisioning VLAN directly — every BCM operation
 │                        Host Machine                                  │
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐    │
-│  │   QEMU socket net :31337  (flat L2, "internalnet")            │    │
+│  │   host bridge br-kairos   (flat L2, "internalnet")            │    │
 │  │                                                               │    │
 │  │   ┌─────────────────────┐       ┌──────────────────────────┐  │    │
 │  │   │ BCM head node VM    │       │ Kairos compute node VM   │  │    │

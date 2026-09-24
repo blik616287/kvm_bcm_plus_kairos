@@ -112,7 +112,7 @@ make deploy-dd    ANSIBLE_ARGS="-e @profiles/ubuntu-26.04.yml"
 # validate 24.04 on node001
 make kairos-vm    ANSIBLE_ARGS="-e @profiles/ubuntu-24.04.yml"
 make validate     ANSIBLE_ARGS="-e @profiles/ubuntu-24.04.yml"
-make kairos-stop                                                  # free the socket net
+make kairos-stop                                                  # stop compute VMs
 
 # validate 26.04 on node002
 make kairos-vm    ANSIBLE_ARGS="-e @profiles/ubuntu-26.04.yml"
@@ -156,7 +156,60 @@ is a worked example (2-drive OS mirror + 8-drive data RAID0). ⚠️ Confirm the
 `/dev/nvme*` enumeration on the live box before deploying — BMC `Device#` ≠ Linux
 device name.
 
+### Testing a RAID layout without the hardware
+
+`profiles/dgx-raid-kvm.yml` runs the same RAID path on a local-KVM node, so the
+array creation, the `dd`-to-`/dev/md0` and the UEFI boot off a mirror member can
+be exercised on the rig instead of on a DGX. Two things make it a faithful stand-in:
+
+- **Every disk is NVMe** (`bus: nvme` in `kairos_vm_disks` attaches an emulated
+  NVMe controller, not virtio). `kairos_raid_select: size` globs `/sys/block/nvme*n1`
+  — virtio disks would be `vd*` and the selector would find nothing.
+- **There is no separate boot disk** (`kairos_vm_disk_size: ""`). A DGX has none,
+  and here it would actively break selection: the smallest N drives become the OS
+  mirror, so a small boot disk would be chosen as a member.
+
+It runs on **node004** (`52:54:00:00:06:01` → `.13`), not node003 — node003
+belongs to `profiles/edge-to-appliance.yml`, and on a bridge-mode provisioning LAN
+both can be up at once, so sharing a node slot would have them overwrite each
+other's BCM registration and qcow2 disks.
+
+```yaml
+kairos_vm_disk_size: ""          # no boot disk; the mirror IS the boot target
+kairos_vm_disks:
+  - {size: "96G",  bus: nvme}    # \
+  - {size: "96G",  bus: nvme}    #  > smallest two -> OS mirror
+  - {size: "128G", bus: nvme}    # \
+  - {size: "128G", bus: nvme}    #  > the rest -> /raid stripe
+```
+
+The members are 96G rather than something token-sized because of the three floors
+in the table below — in particular the array has to hold the whole raw image, and
+a mirror is only one member wide.
+
+Two sizing floors apply, to different things — get either wrong and the error names neither:
+
+| Floor | Applies to | Symptom if too small |
+|---|---|---|
+| BCM installer env (disksetup: 100M ESP + 16G swap + ~9.4G image) | each **OS mirror member** | `An error occurred while provisioning. Ran out of disk space!` — before finalize ever runs |
+| `kairos_raw_disk_size` | the assembled **array** | `dd` stops at `No space left on device` (now caught before the write, naming both numbers) |
+| the image's own layout (OEM + recovery + state, ~51 GiB on the edge image) | `kairos_raw_disk_size` itself | `the requested partitions size (50960MiB) does not fit in the target disk` during the stage-3 install |
+
+What it does **not** cover: real NVMe enumeration instability (the reason
+`kairos_raid_select` exists at all — QEMU enumerates deterministically), drive
+count, and anything vendor-firmware shaped. Treat it as a regression test for the
+role logic, not as sign-off for a DGX deploy.
+
 ## Notes
+
+- **`PE_VERSION` is the stylus *agent* version, not the bundle filename.** A
+  `palette-enterprise-appliance-4.10.17.tar.zst` bundle ships stylus `v4.10.4`;
+  `4.10.17` is the package/manifest version. Any profile that talks to a
+  self-hosted appliance — the appliance profile itself and every edge profile
+  registering to it — must pin the *stylus* version, and they must all match.
+  `python3 playbooks/files/bundle_stylus_version.py artifacts/<bundle>.tar.zst`
+  prints the real one. Unset on an edge profile, CanvOS picks its own default and
+  the node registers healthy but retries a self-upgrade forever.
 
 - **ISO_NAME must differ per profile** — the build's "ISO already exists" short-circuit
   keys on `build/<ISO_NAME>.iso`. Same name across profiles would reuse the wrong ISO.

@@ -1,0 +1,65 @@
+---
+# Edge node registering to the SELF-HOSTED appliance, not to Palette SaaS.
+#
+# End-to-end shape this exercises:
+#   make palette-appliance                      # appliance + cluster + tenant
+#   make palette-edge-credentials               # mint API key + project uid in that tenant
+#   make kairos-build ANSIBLE_ARGS="-e @profiles/edge-to-appliance.yml"
+#   make deploy-dd    ANSIBLE_ARGS="-e @profiles/edge-to-appliance.yml"
+#   make kairos-vm    ANSIBLE_ARGS="-e @profiles/edge-to-appliance.yml"
+#
+# The node has no route to the internet in local-KVM; it reaches the appliance
+# over the provisioning network, which is exactly the path a real edge node
+# uses to reach an on-prem Palette. That is the point of the test.
+#
+# Registration is the stock edge mechanism, unchanged: the cloud-config writes
+# /oem/palette-admin.env (APIKEY/PROJECTUID/ENDPOINT) and
+# palette-cleanup-stale.sh mints the edge-host token on first boot. Only the
+# ENDPOINT differs from a SaaS build -- so this also proves the BCM overlay
+# hook still works, which the appliance profile deliberately drops.
+
+kairos_profile: "edge-appliance"
+
+# Second local-KVM node. node002 is the appliance itself.
+kairos_node_name: "node003"
+kairos_vm_mac: "52:54:00:00:05:01"
+bcm_target_node: ""
+
+kairos_canvos_args:
+  OS_DISTRIBUTION: "ubuntu"
+  OS_VERSION: "22.04"
+  IMAGE_REPO: "ubuntu"
+  K8S_DISTRIBUTION: "k3s"
+  K8S_VERSION: "1.31.9"
+  # Distinct so the build's "ISO already exists" short-circuit cannot hand back
+  # another profile's ISO -- which would silently ship the wrong cloud-config.
+  ISO_NAME: "palette-edge-appliance"
+  # Pin the stylus agent to the SAME version the appliance runs.
+  #
+  # TWO DIFFERENT NUMBERS, and PE_VERSION is the second one:
+  #   package / bundle version   4.10.17   the .tar.zst filename + manifest
+  #   stylus agent version       v4.10.4   what is actually inside the bundle
+  # Read it out of the bundle rather than off the filename -- see
+  # artifacts/README.md; playbooks/files/bundle_stylus_version.py prints it.
+  #
+  # Left unset, CanvOS supplies its own default (v4.10.0-rc.2 was observed), and
+  # the registered node then tries to self-upgrade to match the appliance and
+  # fails with `failed to upgrade stylus: 2 errors occurred`. Registration still
+  # succeeds, so this is easy to miss -- the host appears healthy and ready
+  # while quietly retrying an upgrade forever.
+  #
+  # Must equal appliance_pe_version in profiles/palette-appliance.yml.
+  PE_VERSION: "v4.10.4"
+
+# Modest: this node only has to boot, register and idle as a worker.
+kairos_vm_ram: 6144
+kairos_vm_cpus: 4
+kairos_vm_disk_size: "80G"
+
+# ---- Point registration at the appliance ----
+# appliance_vip, and the API key + project uid minted from the new tenant,
+# all come from .run-credentials.yml via playbooks/tasks/edge_credentials.yml.
+# Nothing here is a secret; the values are resolved at run time.
+palette_endpoint: "{{ appliance_vip }}"
+palette_api_key: "{{ edge_palette_api_key | default('') }}"
+palette_project_uid: "{{ edge_palette_project_uid | default('') }}"

@@ -44,6 +44,12 @@ setup: ## Verify prerequisites (ansible, qemu, docker, sshpass, etc.)
 	@command -v xorriso >/dev/null || { echo "MISSING: xorriso"; exit 1; }
 	@command -v lz4 >/dev/null || { echo "MISSING: lz4"; exit 1; }
 	@command -v jq >/dev/null || { echo "MISSING: jq"; exit 1; }
+	@# These run in become:true tasks, so check what ROOT resolves, not what the
+	@# invoking user does: a user-local install (conda, ~/.local) shadows the
+	@# system copy and would make this check pass while the playbook fails.
+	@ROOTPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+	  PATH=$$ROOTPATH command -v zstd >/dev/null || { echo "MISSING: zstd (palette appliance; not on root's PATH)"; exit 1; }; \
+	  PATH=$$ROOTPATH command -v bsdtar >/dev/null || { echo "MISSING: bsdtar (palette appliance; not on root's PATH - apt install libarchive-tools)"; exit 1; }
 	@test -f inventory/group_vars/all.yml || { echo "MISSING: inventory/group_vars/all.yml (copy from all.example.yml)"; exit 1; }
 	@echo "All prerequisites OK"
 
@@ -168,6 +174,97 @@ validate: ## Stage 6: Validation
 all: ## Run full pipeline (stages 1-6)
 	$(call run_playbook,site)
 
+# ---- Self-hosted Palette appliance (optional; local-KVM only) ----
+# The appliance is a BUILD PROFILE, not a special case: it flows through the
+# ordinary stage 3 -> 4 -> 5 pipeline and BCM provisions it exactly like a
+# Kairos edge node. These targets just supply the profile.
+#
+# BCM must already be up (stages 1-2) — it is what provisions the node.
+# Override the profile with PALETTE_PROFILE=profiles/<other>.yml.
+
+PALETTE_PROFILE ?= profiles/palette-appliance.yml
+PALETTE_ARGS     = -e @$(PALETTE_PROFILE) $(ANSIBLE_ARGS)
+
+.PHONY: palette-appliance
+palette-appliance: ## Palette appliance: build image + BCM deploy + boot node + deploy mgmt cluster
+	@$(MAKE) --no-print-directory _palette-run ANSIBLE_ARGS="$(PALETTE_ARGS)"
+
+.PHONY: _palette-run
+_palette-run:
+	$(call run_playbook,palette-appliance)
+
+.PHONY: palette-build
+palette-build: ## Palette appliance, stage 3 only: build the appliance raw disk
+	@$(MAKE) --no-print-directory kairos-build ANSIBLE_ARGS="$(PALETTE_ARGS)"
+
+.PHONY: palette-deploy
+palette-deploy: ## Palette appliance, stage 4 only: push to BCM + configure PXE/category
+	@$(MAKE) --no-print-directory deploy-dd ANSIBLE_ARGS="$(PALETTE_ARGS)"
+
+.PHONY: palette-node
+palette-node: ## Palette appliance, stage 5 only: PXE-boot the node so BCM dd's the image
+	@$(MAKE) --no-print-directory kairos-vm ANSIBLE_ARGS="$(PALETTE_ARGS)"
+
+.PHONY: palette-cluster
+palette-cluster: ## Palette appliance, post-boot only: upload content + deploy the mgmt cluster
+	@$(MAKE) --no-print-directory _palette-run ANSIBLE_ARGS="$(PALETTE_ARGS) --tags cluster"
+
+.PHONY: palette-tenant
+palette-tenant: ## Palette appliance, create the first tenant only
+	@$(MAKE) --no-print-directory _palette-run ANSIBLE_ARGS="$(PALETTE_ARGS) --tags tenant"
+
+# The licensed bundle is ~10 GB, so the pull runs automatically during an
+# appliance build only when artifacts/ is missing what the profile names.
+# The push stays a separate explicit target: it publishes licensed Spectro
+# Cloud content to a shared repo, which no ordinary build should do by itself.
+.PHONY: palette-artifacts-pull
+palette-artifacts-pull: ## Fetch the licensed Palette artifacts from JFrog into artifacts/
+	@$(MAKE) --no-print-directory _palette-artifacts \
+	  ANSIBLE_ARGS="-e appliance_artifacts_action=pull $(PALETTE_ARGS)"
+
+.PHONY: palette-artifacts-push
+palette-artifacts-push: ## Publish the artifacts/ Palette bundle + signature + key to JFrog
+	@$(MAKE) --no-print-directory _palette-artifacts \
+	  ANSIBLE_ARGS="-e appliance_artifacts_action=push $(PALETTE_ARGS)"
+
+.PHONY: _palette-artifacts
+_palette-artifacts:
+	$(call run_playbook,palette-artifacts)
+
+# The appliance lives on the provisioning network, which the build host has no
+# interface on — so a browser cannot reach the VIP however healthy the
+# appliance is. This tunnels through BCM, which is on that network.
+# Run after `make palette-appliance`: mints the API key + project uid that an
+# edge node needs to register with the appliance instead of Palette SaaS.
+.PHONY: palette-edge-credentials
+palette-edge-credentials: ## Mint edge-host registration creds in the appliance's tenant
+	@$(MAKE) --no-print-directory _palette-edge-credentials ANSIBLE_ARGS="$(PALETTE_ARGS)"
+
+.PHONY: _palette-edge-credentials
+_palette-edge-credentials:
+	$(call run_playbook,palette-edge-credentials)
+
+.PHONY: palette-edge-verify
+palette-edge-verify: ## Verify a Kairos edge node registered with the appliance
+	@$(MAKE) --no-print-directory _palette-edge-verify ANSIBLE_ARGS="$(PALETTE_ARGS)"
+
+.PHONY: _palette-edge-verify
+_palette-edge-verify:
+	$(call run_playbook,palette-edge-verify)
+
+.PHONY: palette-console
+palette-console: ## Open a browser tunnel to the appliance (Ctrl-C to close)
+	@$(MAKE) --no-print-directory _palette-console ANSIBLE_ARGS="$(PALETTE_ARGS)"
+	@exec build/palette-console.cmd
+
+.PHONY: _palette-console
+_palette-console:
+	$(call run_playbook,palette-console)
+
+.PHONY: palette-serial
+palette-serial: ## Tail the appliance node's serial log
+	@tail -f logs/node002-serial.log 2>/dev/null || echo "No serial log found (is the appliance node named node002?)"
+
 # ---- VM Management ----
 
 .PHONY: bcm-stop
@@ -180,10 +277,18 @@ bcm-stop: ## Stop BCM VM
 	@echo "BCM VM stopped"
 
 .PHONY: kairos-stop
-kairos-stop: ## Stop Kairos compute VM
-	@PID=$$(cat build/.kairos-qemu.pid 2>/dev/null) && sudo kill $$PID 2>/dev/null || true
-	@sudo pkill -f '^qemu-system.*Kairos-ComputeNode' 2>/dev/null || true
-	@echo "Kairos VM stopped"
+kairos-stop: ## Stop Kairos compute VM(s); NODE=node002 stops just that one
+	@# The pidfile is per-node (build/.<node>-qemu.pid), so NODE= stops exactly
+	@# one VM. Without it, every compute VM goes — which is what you want when
+	@# clearing the (point-to-point) provisioning link before a different node.
+	@if [ -n "$(NODE)" ]; then \
+	  PID=$$(cat build/.$(NODE)-qemu.pid 2>/dev/null) && sudo kill $$PID 2>/dev/null || true; \
+	  sudo pkill -f "^qemu-system.*-name Kairos-ComputeNode-$(NODE) " 2>/dev/null || true; \
+	  echo "Kairos VM $(NODE) stopped"; \
+	else \
+	  sudo pkill -f '^qemu-system.*-name Kairos-ComputeNode-' 2>/dev/null || true; \
+	  echo "All Kairos compute VMs stopped"; \
+	fi
 
 .PHONY: stop
 stop: bcm-stop kairos-stop ## Stop all VMs
@@ -217,8 +322,9 @@ clean-dist: ## Remove downloaded ISOs (dist/)
 	ansible localhost -m file -a "path=$(E2E_DIR)/dist state=absent" --become
 
 .PHONY: clean-canvos
-clean-canvos: ## Remove cloned CanvOS repo + per-profile raw build artifacts
+clean-canvos: ## Remove cloned CanvOS repos (Kairos + appliance) + per-profile raw build artifacts
 	ansible localhost -m file -a "path=$(E2E_DIR)/CanvOS state=absent" --become
+	ansible localhost -m file -a "path=$(E2E_DIR)/CanvOS-appliance state=absent" --become
 	@find $(E2E_DIR)/build -maxdepth 1 -type f \( -name '*-disk.raw' -o -name '*-disk.raw.lz4' -o -name '*-disk.raw.sha256' \) -delete 2>/dev/null || true
 
 .PHONY: clean-all

@@ -1,4 +1,94 @@
 ---
+# Stage 4 — push the image to BCM and configure it for a PXE + dd install.
+#
+# Three plays rather than one, because the multi-GB image transfer uses
+# ansible.posix.synchronize (rsync: resumable via --partial, and a no-op when
+# the file is already identical). synchronize pushes from the controller to the
+# play's INVENTORY host — `delegate_to: bcm` inverts it and makes BCM rsync to
+# itself — so the transfer needs its own `hosts: bcm` play. Compression has to
+# happen before that play, hence the split.
+
+- name: "Stage 4 (prep): compress the raw image for transfer"
+  hosts: localhost
+  gather_facts: true
+  vars:
+    e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
+    build_dir: "{{ e2e_dir }}/build"
+    dd_raw_image: "{{ build_dir }}/{{ kairos_profile | default('default-kairos') }}-disk.raw"
+  pre_tasks:
+    - name: Register the BCM as a managed host
+      ansible.builtin.import_tasks: tasks/add_bcm_host.yml
+  tasks:
+    - name: Stat the raw + compressed image locally
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        # Only .exists and .mtime are read below. The module checksums by
+        # default, which here is a SHA-1 pass over an 80 GB raw plus its
+        # archive on every stage-4 run, for a comparison of two timestamps.
+        get_checksum: false
+        get_mime: false
+      loop:
+        - "{{ dd_raw_image }}"
+        - "{{ dd_raw_image }}.lz4"
+      register: dd_imgs
+
+    - name: Compress the raw image (lz4) when the archive is missing or stale
+      ansible.builtin.command: "lz4 -f {{ dd_raw_image }} {{ dd_raw_image }}.lz4"
+      when: >-
+        not dd_imgs.results[1].stat.exists
+        or dd_imgs.results[0].stat.mtime > dd_imgs.results[1].stat.mtime
+      changed_when: true
+
+- name: "Stage 4 (transfer): rsync the image to the BCM"
+  hosts: bcm
+  gather_facts: false
+  vars:
+    e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
+    build_dir: "{{ e2e_dir }}/build"
+    dd_raw_image: "{{ build_dir }}/{{ kairos_profile | default('default-kairos') }}-disk.raw"
+    dd_profile_share: "/cm/shared/kairos/{{ kairos_profile | default('default-kairos') }}"
+  tasks:
+    # synchronize needs rsync on BOTH ends. The ansible.builtin.copy this
+    # replaced needed nothing on the remote, so this is a NEW dependency on the
+    # head node — do not assume a customer BCM has it. Same no-cache_valid_time
+    # reasoning as the lz4 install in roles/deploy_dd: a freshly-installed BCM
+    # has a recent-but-incomplete apt cache, and a cache-age check would skip
+    # the refresh and fail to find the package.
+    - name: Ensure rsync is installed on the BCM (required by synchronize)
+      ansible.builtin.apt:
+        name: rsync
+        state: present
+        update_cache: true
+      become: true
+
+    - name: Ensure the profile-scoped share dir exists on the BCM
+      ansible.builtin.file:
+        path: "{{ dd_profile_share }}"
+        state: directory
+        mode: "0755"
+
+    - name: Upload the compressed image to the BCM (rsync, resumable)
+      # --partial keeps a half-sent file so an interrupted multi-GB transfer
+      # resumes instead of restarting; --inplace writes directly rather than to
+      # a temp copy, which matters when /cm has only a few GB spare.
+      ansible.posix.synchronize:
+        src: "{{ dd_raw_image }}.lz4"
+        dest: "{{ dd_profile_share }}/disk.raw.lz4"
+        mode: push
+        # delay_updates writes to a temp copy and renames at the end, which
+        # both doubles the space a multi-GB image needs on /cm and is mutually
+        # exclusive with --inplace ("--inplace cannot be used with
+        # --delay-updates"). Off, so --inplace + --partial can resume.
+        delay_updates: false
+        rsync_opts:
+          - "--partial"
+          - "--inplace"
+
+    - name: Keep the uploaded image world-readable for the HTTP server
+      ansible.builtin.file:
+        path: "{{ dd_profile_share }}/disk.raw.lz4"
+        mode: "0644"
+
 - name: "Stage 4: Upload image to BCM, configure PXE (native Ansible)"
   hosts: localhost
   gather_facts: true

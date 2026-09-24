@@ -1,0 +1,86 @@
+---
+# Publish the licensed Palette artifacts to JFrog, so a rig can fetch them
+# instead of anyone hand-copying ~10 GB between machines.
+#
+#   make palette-artifacts-push    upload artifacts/ to JFrog
+#   make palette-artifacts-pull    fetch them back (also runs automatically
+#                                  during an appliance build when missing)
+#
+# The upload is deliberately a separate, explicit target: it pushes licensed
+# Spectro Cloud content to a shared repository, which is not something an
+# ordinary build should do as a side effect.
+
+- name: "Palette artifacts: publish to / fetch from JFrog"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
+    # push | pull — set by the make target
+    appliance_artifacts_action: "pull"
+
+  tasks:
+    - name: Require a JFrog token
+      ansible.builtin.assert:
+        that: appliance_jfrog_token | default('') | length > 0
+        fail_msg: >-
+          appliance_jfrog_token is empty. Set it in
+          inventory/group_vars/all.yml (gitignored) — it defaults to
+          jfrog_token, so setting that one covers both the BCM ISO and these
+          artifacts.
+
+    - name: Fetch the artifacts from JFrog
+      ansible.builtin.import_tasks: tasks/appliance_fetch_artifacts.yml
+      when: appliance_artifacts_action == 'pull'
+
+    - name: Publish the artifacts to JFrog
+      when: appliance_artifacts_action == 'push'
+      block:
+        - name: Check which artifacts are present locally
+          ansible.builtin.stat:
+            path: "{{ appliance_artifacts_dir }}/{{ item }}"
+          register: appliance_push_stats
+          loop: "{{ appliance_jfrog_files | select | list }}"
+
+        - name: Refuse to publish nothing
+          ansible.builtin.assert:
+            that: appliance_push_stats.results | selectattr('stat.exists') | list | length > 0
+            fail_msg: >-
+              None of {{ appliance_jfrog_files | select | list | join(', ') }}
+              are in {{ appliance_artifacts_dir }}/ — nothing to publish.
+
+        - name: Stage a 0600 curl config holding the JFrog credential
+          ansible.builtin.copy:
+            dest: "{{ appliance_artifacts_dir }}/.jfrog-curl.cfg"
+            mode: "0600"
+            content: |
+              header = "Authorization: Bearer {{ appliance_jfrog_token }}"
+          become: false
+          no_log: true
+
+        - name: Upload each artifact to JFrog
+          # -T is an HTTP PUT, which is how Artifactory takes a deploy. --fail
+          # so a 401/403 is an error rather than a stored error page.
+          ansible.builtin.command:
+            argv:
+              - curl
+              - --fail
+              - --location
+              - --progress-bar
+              - -K
+              - "{{ appliance_artifacts_dir }}/.jfrog-curl.cfg"
+              - -T
+              - "{{ appliance_artifacts_dir }}/{{ item.item }}"
+              - "https://{{ appliance_jfrog_instance }}/artifactory/{{ appliance_jfrog_repo }}/{{ item.item }}"
+          loop: "{{ appliance_push_stats.results | selectattr('stat.exists') | list }}"
+          loop_control:
+            label: "{{ item.item }}"
+          become: false
+          changed_when: true
+          async: "{{ appliance_jfrog_fetch_timeout }}"
+          poll: 15
+      always:
+        - name: Remove the staged curl config
+          ansible.builtin.file:
+            path: "{{ appliance_artifacts_dir }}/.jfrog-curl.cfg"
+            state: absent
+          become: false

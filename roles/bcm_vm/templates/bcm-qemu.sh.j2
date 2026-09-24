@@ -26,7 +26,11 @@ args=(
     -name "$NAME"
     -display {{ qemu_display_type.stdout }}
     -drive file="{{ bcm_disk }}",format=qcow2,if=virtio
-    -netdev socket,id=intnet,listen=:31337
+{% if (bcm_internal_net_mode | default('socket')) == 'bridge' %}
+    -netdev bridge,id=intnet,br={{ bcm_internal_bridge | default('br-kairos') }},helper={{ bcm_qemu_bridge_helper | default('/usr/lib/qemu/qemu-bridge-helper') }}
+{% else %}
+    -netdev socket,id=intnet,listen=:{{ bcm_internal_socket_port | default(31337) }}
+{% endif %}
     -device virtio-net-pci,netdev=intnet,mac=BC:24:11:7F:33:7C
     -netdev user,id=extnet,hostfwd=tcp::{{ bcm_ssh_port }}-:22,hostfwd=tcp::{{ bcm_https_port }}-:443
     -device virtio-net-pci,netdev=extnet,mac=BC:24:11:ED:21:50
@@ -50,5 +54,9 @@ if [ "$PHASE" = install ]; then
 else
     args+=(-boot c)
 fi
+
+{% if (bcm_internal_net_mode | default('socket')) == 'bridge' %}
+"{{ e2e_dir }}/scripts/provisioning-net.sh" up "{{ bcm_internal_bridge | default('br-kairos') }}"
+{% endif %}
 
 exec qemu-system-x86_64 "${args[@]}"

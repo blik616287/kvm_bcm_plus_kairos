@@ -1,0 +1,18 @@
+---
+# Defaults for roles/palette_tenant — create the first tenant so Palette is
+# usable when the run finishes.
+
+# Self-hosted Palette ships these system-console defaults; change the password
+# after install. NOTE the appliance_ prefix: this repo's palette_* namespace
+# means "the Palette that edge nodes register to", and these are the appliance's
+# own system console — conflating the two would be a trap.
+appliance_system_user: "admin"
+appliance_system_password: "admin"
+
+appliance_create_tenant: true
+appliance_tenant_org_name: "acme"
+appliance_tenant_admin_first_name: "Palette"
+appliance_tenant_admin_last_name: "Admin"
+appliance_tenant_admin_email: "admin@example.test"
+# Generated per run when empty; recorded in .run-credentials.yml.
+appliance_tenant_admin_password: ""

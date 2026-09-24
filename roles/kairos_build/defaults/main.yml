@@ -39,6 +39,50 @@ kairos_canvos_args: {}
 # pre-customization build).
 kairos_extra_apt_packages: []
 
+# Raw YAML written to CanvOS/.edge-custom-config.yaml before the ISO build.
+# CanvOS bakes it into the image when the .arg sets EDGE_CUSTOM_CONFIG, and the
+# appliance uses it to carry the CONTENT-SIGNING PUBLIC KEY. Without that key an
+# appliance rejects a signed content bundle with
+#   500 content verification failed: public key to verify content not found
+# Empty (default) = no file, and the block is removed if a previous profile
+# left one behind (all profiles share one CanvOS checkout).
+kairos_edge_custom_config: ""
+
+# How the raw disk gets installed.
+#
+# false (default, Kairos EDGE images): boot the ISO with the cloud-config on a
+#   CIDATA disk and drive `kairos-agent install` over the serial console. The
+#   edge live environment sits at a root shell and does nothing on its own, so
+#   the automation owns the disk.
+#
+# true (APPLIANCE images): bake the cloud-config into the ISO instead and let
+#   the ISO install ITSELF, then wait for it to power off. A stylus/appliance
+#   image boots its own installer, and its config carries hooks that mount
+#   COS_PERSISTENT the moment those labels appear — so an injected
+#   `kairos-agent install` loses a race it cannot win: the labels it writes are
+#   grabbed by the live environment and its own blkdeactivate then fails with
+#   "device or resource busy" on every retry. Driving the image the way it is
+#   designed to be driven avoids the fight entirely.
+kairos_build_self_install: false
+
+# Raw Dockerfile instructions appended to the CanvOS image build, for image
+# customization that kairos_extra_apt_packages cannot express — a COPY of a
+# CanvOS-provided script, a multi-step RUN, and so on. Empty = nothing added.
+# Used by profiles/palette-appliance.yml to add the LVM/DRBD host tooling and
+# kernel headers the Piraeus/LINSTOR storage stack needs.
+kairos_dockerfile_extra: ""
+
+# Base cloud-config for the image, rendered to build/cloud-config.yaml and
+# delivered as /oem/90_custom.yaml during the OVMF install. The default is the
+# Kairos EDGE config (BCM integration + Palette registration + the kairos user).
+#
+# A profile can point this at a different template to build a fundamentally
+# different image through the same stage 3 -> 4 -> 5 pipeline — that is how the
+# Palette management appliance is built (profiles/palette-appliance.yml uses
+# appliance-cloud-config.yaml.j2). kairos_user_data only LAYERS on top of this
+# file, so it cannot express "replace the base config".
+kairos_cloud_config_template: "cloud-config.yaml.j2"
+
 # Raw cloud-config YAML written to /oem/99_userdata.yaml inside the built
 # image, layered on top of /oem/90_custom.yaml. Empty string = no extra
 # userdata file is written. Must NOT redefine the kairos user or the install
@@ -93,3 +137,24 @@ kairos_build_mdraid: false
 #     rke2:
 #       - "1.32.1"
 kairos_k8s_versions: {}
+
+# Size of the raw disk image kairos-agent installs into, and therefore the
+# exact number of bytes stage 4 dd's onto the node's target device. The target
+# must be at least this large -- on a RAID profile that is the ARRAY, not a
+# member.
+#
+# There is a hard floor well above zero: the image's own layout asks for
+# OEM + recovery + state (5120 + 20200 + 25576 MiB on the current edge image)
+# before COS_PERSISTENT gets anything, and kairos-agent refuses outright with
+# "the requested partitions size (50960MiB) does not fit in the target disk".
+# So shrinking this to make a test rig cheaper only buys the difference
+# between ~56 GiB and 80 GiB -- check the installer's own "Setting <x>
+# partition size" lines in logs/qemu-install.log before changing it.
+kairos_raw_disk_size: "81920M"
+
+# Ship the BCM integration hook (overlay's stylus-agent bcm-sync.conf drop-in).
+# True for edge images, which are registered BCM nodes and whose installed
+# rootfs is the CanvOS-built one carrying the scripts the hook calls. Set false
+# for an image whose rootfs does not carry them -- see the task that consumes
+# this in tasks/main.yml.
+kairos_build_bcm_integration: true
