@@ -1,0 +1,85 @@
+---
+# Deploy profile for the DGX A100 "dgx02" — OS RAID1 mirror; data disks stay JBOD.
+#
+# Status 2026-09-25: dgx02 HAS BEEN RE-IMAGED and is live on this layout. Verified
+# on the node: the OS mirror is active, and the kernel boots off it (Kairos on
+# Ubuntu 24.04). The dd target is /dev/md0, but md names are NOT stable across
+# boot — dgx02's mirror came up as /dev/md127 and dgx04's as /dev/md126. Mount by
+# LABEL, never by md node.
+#
+# History: the pre-2026-09-25 install had no arrays at all and duplicate COS_*
+# labels on two M.2s. This profile REPLACES it rather than repairing it.
+#
+# Slot map as observed on dgx02 2026-09-25 13:03. The SLOTS are stable fleet-wide;
+# the nvmeXn1 names are NOT — they shuffled between boots that same day (23:00.0
+# was nvme4n1 in the morning, nvme6n1 by afternoon), which is why selection below
+# is by PATH and never by name:
+#   08:00.0 -> nvme8n1  09:00.0 -> nvme9n1  22:00.0 -> nvme0n1  23:00.0 -> nvme6n1
+#   52:00.0 -> nvme5n1  53:00.0 -> nvme7n1  89:00.0 -> nvme2n1  8a:00.0 -> nvme3n1
+#   ca:00.0 -> nvme1n1  cb:00.0 -> nvme4n1
+#   22:00.0 + 23:00.0 are the two 1920GB M.2s = the OS mirror; the other eight are
+#   the 3.5T data disks.
+#
+# WARNING — deploying this RE-IMAGES dgx02 and is destructive. The finalize wipes
+# every nvme it finds, including the COS_PERSISTENT partition (mounted at
+# /usr/local) and /var/lib/wicked. Do not run it unasked.
+#
+# Palette endpoint/credentials are deliberately NOT here — they are shared and
+# live in the gitignored inventory/group_vars/all.yml. Pass it to every stage:
+#   make kairos-build ANSIBLE_ARGS="-e @profiles/kairos-dgx2.yml"
+#   make deploy-dd    ANSIBLE_ARGS="-e @profiles/kairos-dgx2.yml"
+#   make validate     ANSIBLE_ARGS="-e @profiles/kairos-dgx2.yml"
+
+kairos_profile: "kairos-dgx2"
+
+# --- Stage 3: RAID-capable image ---
+# MUST be true. Adds mdadm + the dracut mdraid module + rd.auto=1 so the raw image
+# can be dd'd onto /dev/md0 and still boot. Without it the kernel never assembles
+# the array and Kairos label-resolves against the raw members.
+kairos_build_mdraid: true
+
+# Distinct ISO_NAME per profile: the build's "ISO already exists" short-circuit
+# keys on build/<ISO_NAME>.iso, so a shared name reuses another profile's ISO.
+# Kept in step with the category's softwareimage.
+kairos_canvos_args:
+  OS_DISTRIBUTION: "ubuntu"
+  OS_VERSION: "24.04"          # verified running on dgx02 2026-09-25
+  ISO_NAME: "kairos-dgx2-installer"
+
+# --- Stage 4: array layout ---
+# Selection is by PCIe SLOT, not by name: nvmeXn1 names are NOT stable across
+# boots on these systems. Both M.2s sit in slots 22/23 exactly as on dgx04, so
+# the platform slot map holds across the fleet. The finalize also asserts the
+# mirror members match in size and are the smallest pair present, so a wrong pin
+# fails loudly instead of building a mirror that thrashes and hangs boot.
+kairos_raid_select: path
+
+kairos_os_raid:
+  level: 1
+  metadata: "1.0"          # superblock at END so UEFI can read the ESP off a member
+  devices: [pci-0000:22:00.0-nvme-1, pci-0000:23:00.0-nvme-1]
+kairos_target_disk: /dev/md0    # dd target = the assembled OS mirror
+
+# --- Data disks: JBOD on purpose — NOT an array ---
+# dgx02's eight 3.5T drives are consumed as WHOLE disks by the storage layer (the
+# persistent layer mounts /var/lib/rook, /var/lib/osd, /var/lib/longhorn), so they
+# must stay bare and individually addressable. false renders NO data-array step
+# into the finalize — no mdadm --create, no mkfs, no /raid systemd unit — leaving
+# them unpartitioned and unlabelled, which is the intended end state.
+# This is the deliberate difference from profiles/kairos-dgx4.yml, whose finalize
+# builds a RAID0 /raid over the same eight slots (verified live on dgx04:
+# md127 raid0, 28T, mounted /raid).
+kairos_data_raid: false
+
+# A floor, not the truth: the finalize unions this list with every nvme device the
+# kernel exposes, so a stale name cannot leave a label-colliding superblock.
+# Wiping the data disks clears any stray COS_*/raid labels; it does NOT put them
+# into an array.
+kairos_wipe_disks: "nvme0n1 nvme1n1 nvme2n1 nvme3n1 nvme4n1 nvme5n1 nvme6n1 nvme7n1 nvme8n1 nvme9n1"
+
+# Big disks -> the finalize-stage install (grow/timeout/efibootmgr fix) matters.
+deploy_dd_finalize_install: true
+
+# --- Remote-BCM node targeting ---
+# The existing cmsh device to re-image.
+bcm_target_node: "dgx02"
