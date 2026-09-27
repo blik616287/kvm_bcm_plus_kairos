@@ -81,6 +81,37 @@ _resolve_dev() {
         *) echo "/dev/$1" ;;
     esac
 }
+
+# Release any md array that currently holds one of our target members. A previous
+# install on this node leaves md metadata that udev/mdadm auto-assembles at boot
+# (--name/--homehost make that a certainty, see below); a member still held by a
+# live array cannot be wiped or re-created, so the create below dies with
+# "Device or resource busy" - and opaquely, because the wipe is best-effort. Stop
+# the owning arrays first, then assert the members actually came free. Without
+# this a RE-image of a node that already carries arrays fails where a first
+# install on a bare node succeeds.
+_release_md_members() {
+    for _m in "$@"; do
+        [ -b "${_m}" ] || continue
+        _lnk="/sys/class/block/$(basename "${_m}")/md"
+        [ -L "${_lnk}" ] || continue
+        _md=$(basename "$(readlink "${_lnk}")")
+        echo "[kairos-finalize $(date)] member $(basename "${_m}") is held by ${_md}; stopping it"
+        mdadm --stop "/dev/${_md}" 2> /dev/null || mdadm --stop "${_md}" 2> /dev/null || true
+    done
+    udevadm settle --timeout=20 2> /dev/null || true
+}
+# Loud, early failure naming the device beats an opaque mdadm --create abort later.
+_assert_md_members_free() {
+    for _m in "$@"; do
+        [ -b "${_m}" ] || continue
+        _lnk="/sys/class/block/$(basename "${_m}")/md"
+        if [ -L "${_lnk}" ]; then
+            echo "[kairos-finalize $(date)] FATAL: member $(basename "${_m}") still held by $(basename "$(readlink "${_lnk}")") after stop; refusing to build a partial array"
+            exit 1
+        fi
+    done
+}
 {% if (kairos_raid_select | default('name')) == 'size' %}
 # size mode: OS mirror = smallest N (N = len(kairos_os_raid.devices)), data = the rest.
 # Assumes a single data array (the DGX 2x-OS + 8x-data layout).
@@ -163,6 +194,8 @@ echo "[kairos-finalize $(date)] OS mirror selection OK: ${_MEMBERS% } (${_FIRST}
 {% endif %}
 echo "[kairos-finalize $(date)] building OS RAID1 ${DISK} (metadata {{ kairos_os_raid.metadata | default('1.0') }}) over: ${OS_MEMBERS}"
 mdadm --stop "${DISK}" 2> /dev/null || true
+_release_md_members ${OS_MEMBERS}
+_assert_md_members_free ${OS_MEMBERS}
 for m in ${OS_MEMBERS}; do
     for mp in $(awk -v d="$m" '$1 ~ ("^" d) {print $2}' /proc/mounts | sort -r); do umount -fl "$mp" 2> /dev/null || true; done
     wipefs -a -f "$m" 2> /dev/null || true
@@ -267,6 +300,7 @@ for _s in {% for d in arr.devices %}{{ d }} {% endfor %}; do DATA_MEMBERS="${DAT
 DATA_COUNT=$(set -- ${DATA_MEMBERS}; echo $#)
 echo "[kairos-finalize $(date)] building data array {{ arr.name }} (raid{{ arr.level }}) over: ${DATA_MEMBERS}"
 mdadm --stop "/dev/md/{{ arr.name }}" 2> /dev/null || true
+_release_md_members ${DATA_MEMBERS}
 for m in ${DATA_MEMBERS}; do wipefs -a -f "$m" 2> /dev/null || true; mdadm --zero-superblock "$m" 2> /dev/null || true; done
 yes | mdadm --create "/dev/md/{{ arr.name }}" --level={{ arr.level }} \
     --raid-devices="${DATA_COUNT}" --run ${DATA_MEMBERS} \
