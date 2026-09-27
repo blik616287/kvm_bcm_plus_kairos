@@ -63,3 +63,35 @@ deploy_dd_finalize_install: false
 #   Use 'size' (node-agnostic; assumes ONE data array) or 'path' (per PCIe slot; use
 #   the by-path names the finalize logs in its drive inventory). 'id' pins exact serials.
 kairos_raid_select: name
+
+# Assert that the OS mirror members all have the SAME size and are the N smallest
+# whole disks present. A spec that resolves is not necessarily the right disk: a
+# by-path pin landing on a data disk builds a mismatched mirror, which thrashes
+# and hangs boot. Turn off only if the OS mirror is deliberately not the
+# smallest disks on the node.
+kairos_os_raid_assert_smallest: true
+
+# --- dd-install: BCM must not claim a Kairos disk ---------------------------
+# The FINALIZE stage owns the disks end to end (wipes the members, builds the OS
+# mirror, dd's the image onto it). BCM re-applies its own disksetup on every PXE
+# boot, so any disk the category names is re-partitioned out from under Kairos:
+# the install is destroyed and the node re-provisions in a loop. The category
+# inherits its clone source's disksetup, and `category clone` is skipped once
+# the category exists (category.yml), so this must be enforced on every deploy,
+# not just the first. Anything whose kernel name matches dd_disksetup_strip_glob
+# is treated as Kairos-owned and may not appear in the category disksetup.
+dd_disksetup_strip_glob: "^nvme"
+# BCM's no-local-OS mode. It is what makes an empty disksetup legal, and it is
+# what a dd-install wants: the node-installer runs over NFS and the FINALIZE
+# stage lays out every disk itself, so BCM has no OS to install on a disk.
+dd_category_datanode: true
+# The disksetup a dd-install hands BCM. It must leave BCM nothing to partition:
+# BCM re-applies it on every PXE boot, so any disk it names is re-partitioned
+# out from under Kairos. An EMPTY <diskSetup></diskSetup> is rejected ("If
+# diskless is not set, there should be at least one device") because `diskless`
+# is an XML element, not an attribute -- so point BCM at the diskless layout it
+# ships (siblings in that dir: raid0-8-cache-drives, stig, one-big-partition).
+dd_disksetup_diskless_file: "/cm/local/apps/cmd/etc/htdocs/disk-setup/slave-diskless.xml"
+# Escape hatch: a full disksetup XML to apply instead — e.g. to keep a dormant
+# BCM root on disks that are NOT Kairos-owned. Takes precedence over datanode.
+dd_disksetup_xml_file: ""
