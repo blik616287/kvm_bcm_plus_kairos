@@ -1,0 +1,126 @@
+---
+# palette-console.yml — render an SSH tunnel that makes the appliance reachable
+# from a browser on the build host.
+#
+#   make palette-console
+#
+# The provisioning network is a QEMU socket network (local-KVM) or a private
+# customer subnet (remote). Either way the build host has no interface on it,
+# so https://<vip>/ resolves to nothing from a desktop browser even though the
+# appliance is perfectly healthy — which looks exactly like a failed deploy.
+# BCM *is* on that network and the build host can already reach BCM, so BCM is
+# the jump host.
+#
+# This only renders the script; the make target runs it in the foreground so
+# Ctrl-C tears the tunnel down. Nothing here changes any state on BCM.
+
+- name: "Palette appliance: render a browser tunnel through BCM"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
+    build_dir: "{{ e2e_dir }}/build"
+    palette_console_vip_port: 15443
+    palette_console_localui_port: 15080
+
+  pre_tasks:
+    - name: Register the BCM as a managed host
+      ansible.builtin.import_tasks: tasks/add_bcm_host.yml
+
+  tasks:
+    - name: Capture the invoking user (ansible.cfg become=true → keep the script user-owned)
+      ansible.builtin.command: whoami
+      become: false
+      changed_when: false
+      register: palette_console_invoker
+
+    - name: Resolve the appliance node name
+      ansible.builtin.set_fact:
+        palette_console_node: "{{ bcm_target_node | default(kairos_node_name | default('node002', true), true) }}"
+
+    # Same lookup roles/palette_cluster and roles/validate do: ask BCM what it
+    # gave the node, rather than trusting a var to still be accurate.
+    - name: Look up the appliance node IP from cmsh
+      ansible.builtin.command: cmsh -c "device; use {{ palette_console_node }}; get ip"
+      delegate_to: bcm
+      register: palette_console_ip_raw
+      changed_when: false
+
+    - name: Fall back to the BOOTIF interface IP when the device IP is 0.0.0.0
+      ansible.builtin.command: cmsh -c "device; use {{ palette_console_node }}; interfaces; use BOOTIF; get ip"
+      delegate_to: bcm
+      register: palette_console_bootif
+      changed_when: false
+      when: (palette_console_ip_raw.stdout | trim) in ['', '0.0.0.0']
+
+    - name: Resolve the effective appliance IP
+      ansible.builtin.set_fact:
+        palette_console_node_ip: >-
+          {{ (palette_console_bootif.stdout | trim)
+             if (palette_console_ip_raw.stdout | trim) in ['', '0.0.0.0']
+             else (palette_console_ip_raw.stdout | trim) }}
+
+    - name: Refuse to tunnel to nowhere
+      # A plain regex, not ansible.utils.ipaddr: that filter needs the netaddr
+      # Python package, which nothing else here requires and which is not part
+      # of `make install-deps`. All this has to reject is '' and '0.0.0.0'.
+      ansible.builtin.assert:
+        that:
+          - palette_console_node_ip | trim is match('^(\d{1,3}\.){3}\d{1,3}$')
+          - palette_console_node_ip | trim != '0.0.0.0'
+        fail_msg: >-
+          BCM has no usable IP for {{ palette_console_node }}
+          (got '{{ palette_console_node_ip }}'). Has the node been deployed
+          and booted? See docs/stage-palette-appliance.md.
+
+    # sshpass reads the password from a 0600 file, never from argv — process
+    # arguments are world-readable via /proc. The script removes it on exit.
+    - name: Stage the BCM password for the tunnel
+      ansible.builtin.copy:
+        content: "{{ bcm_password }}"
+        dest: "{{ build_dir }}/.bcm-console-pw"
+        mode: "0600"
+        owner: "{{ palette_console_invoker.stdout }}"
+        group: "{{ palette_console_invoker.stdout }}"
+      when: bcm_ssh_private_key | default('') | length == 0
+      no_log: true
+
+    # The tunnel command, written out for `make palette-console` to exec. It is
+    # a file rather than a printed command because the argument list carries
+    # the resolved node IP, the jumphost fragment and the password-file path,
+    # and nobody should have to reassemble that by hand.
+    - name: Write the tunnel invocation
+      ansible.builtin.copy:
+        dest: "{{ build_dir }}/palette-console.cmd"
+        mode: "0700"
+        owner: "{{ palette_console_invoker.stdout }}"
+        group: "{{ palette_console_invoker.stdout }}"
+        content: |
+          #!/bin/sh
+          exec {{ e2e_dir }}/scripts/palette-console.sh \
+            --bcm-host {{ bcm_ssh_host | default('localhost') | quote }} \
+            --bcm-port {{ bcm_ssh_port | quote }} \
+            --bcm-user {{ bcm_ssh_user | default('root') | quote }} \
+            --node-ip {{ palette_console_node_ip | trim | quote }} \
+            --vip {{ appliance_vip | quote }} \
+            --vip-port {{ palette_console_vip_port | quote }} \
+            --localui-port {{ palette_console_localui_port | quote }} \
+          {% if _bcm_ssh_key | length > 0 %}
+            --identity-file {{ _bcm_ssh_key | quote }} \
+          {% else %}
+            --password-file {{ (build_dir ~ '/.bcm-console-pw') | quote }} \
+          {% endif %}
+          {% if _bcm_proxy_jump | length > 0 %}
+            --proxy-jump {{ _bcm_proxy_jump | quote }} \
+            --proxy-key {{ _bcm_proxy_key | quote }} \
+          {% endif %}
+            "$@"
+
+    - name: Where to point the browser
+      ansible.builtin.debug:
+        msg:
+          - "Appliance {{ palette_console_node }} at {{ palette_console_node_ip | trim }}, VIP {{ appliance_vip }}."
+          - "  Tenant console: https://localhost:{{ palette_console_vip_port }}/"
+          - "  System console: https://localhost:{{ palette_console_vip_port }}/system"
+          - "  Local UI:       https://localhost:{{ palette_console_localui_port }}/ ({{ appliance_admin_user }})"
+          - "Both serve a self-signed cert — the browser warning is expected."

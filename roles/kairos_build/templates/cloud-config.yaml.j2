@@ -10,9 +10,9 @@ stylus:
 {% else %}
     edgeHostToken: ""
 {% endif %}
-{% if palette_project_name is defined %}
+{% if palette_project_name is defined and palette_project_name | length > 0 %}
     projectName: {{ palette_project_name }}
-{% elif palette_project_uid is defined %}
+{% elif palette_project_uid is defined and palette_project_uid | length > 0 %}
     projectUid: {{ palette_project_uid }}
 {% endif %}
 {% if palette_ca_cert is defined and palette_ca_cert | length > 0 %}
@@ -37,9 +37,13 @@ users:
     groups: [sudo, admin, adm, systemd-journal]
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: false
+{# A stage key with no entries under it renders as YAML null, and the kairos
+   collector panics (nil deref in DeepMerge) instead of installing -- so every
+   stage key below is emitted only when something is actually written into it. #}
+{% set want_initramfs = palette_api_key is defined and palette_api_key | length > 0 and palette_project_uid is defined and palette_project_uid | length > 0 %}
 stages:
+{% if want_initramfs %}
   initramfs:
-{% if palette_api_key is defined and palette_api_key | length > 0 and palette_project_uid is defined and palette_project_uid | length > 0 %}
     - name: "Write Palette admin creds for pre-registration cleanup"
       files:
         - path: /oem/palette-admin.env

@@ -18,14 +18,35 @@
   when: dd_img_exists.rc != 0
   changed_when: true
 
-- name: Wait for the installer image filesystem to be provisioned
-  ansible.builtin.stat:
-    path: "{{ dd_image_root }}/usr"
+- name: Wait for the installer image clone to finish
+  # cmsh's clone returns long before the copy does: the image's /usr appears
+  # within a second or two of a clone that takes minutes. Stat'ing it
+  # green-lights writes into an image that is still materialising, and the next
+  # task fails with "Destination directory .../usr/local/bin does not exist" —
+  # a race, so it passes on a re-run and on any profile whose image already
+  # existed, which is why it survived this long.
+  #
+  # Size stability is the signal: true of a finished clone and of a
+  # pre-existing image alike, and it needs nothing from cmsh. The directory
+  # checks then confirm the specific paths the following tasks write into.
+  ansible.builtin.shell: |
+    set -u
+    a=$(du -sb "{{ dd_image_root }}" 2>/dev/null | cut -f1)
+    sleep 10
+    b=$(du -sb "{{ dd_image_root }}" 2>/dev/null | cut -f1)
+    if [ -n "${a:-}" ] && [ "${a:-x}" = "${b:-y}" ] &&
+        [ -d "{{ dd_image_root }}/usr/local/bin" ] &&
+        [ -d "{{ dd_image_root }}/usr/local/sbin" ]; then
+      echo "IMAGE-READY ${b} bytes"
+    else
+      echo "IMAGE-COPYING ${a:-?} -> ${b:-?} bytes"
+    fi
   delegate_to: bcm
   register: dd_img_fs
   retries: 60
-  delay: 2
-  until: dd_img_fs.stat.exists and dd_img_fs.stat.isdir
+  delay: 5
+  until: "'IMAGE-READY' in dd_img_fs.stdout"
+  changed_when: false
 
 # ---- [4/7] dd installer into the image ----
 - name: Ensure lz4 is installed on the BCM host (needed to decompress the image)

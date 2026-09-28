@@ -17,13 +17,39 @@
     path: "{{ dist_dir }}/{{ iso_filename }}"
   register: iso_stat
 
+# The token must NOT reach curl's argv: process arguments are world-readable
+# via /proc, so `ps` would hand the JFrog credential to any local user for the
+# whole (multi-GB, possibly hours-long) download. Pass it in a 0600 config file
+# that curl reads with -K, and delete it in an always-block.
 - name: Download BCM ISO from JFrog
-  ansible.builtin.shell: |
-    curl --fail --location --progress-bar \
-      -H "Authorization: Bearer {{ jfrog_token }}" \
-      -o "{{ dist_dir }}/{{ iso_filename }}" \
-      "https://{{ jfrog_instance }}/artifactory/{{ jfrog_repo }}/{{ iso_filename }}"
   when: not iso_stat.stat.exists
+  block:
+    - name: Stage a 0600 curl config holding the JFrog credential
+      ansible.builtin.copy:
+        dest: "{{ dist_dir }}/.jfrog-curl.cfg"
+        mode: "0600"
+        content: |
+          header = "Authorization: Bearer {{ jfrog_token }}"
+      no_log: true
+
+    - name: Download BCM ISO from JFrog
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --fail
+          - --location
+          - --progress-bar
+          - -K
+          - "{{ dist_dir }}/.jfrog-curl.cfg"
+          - -o
+          - "{{ dist_dir }}/{{ iso_filename }}"
+          - "https://{{ jfrog_instance }}/artifactory/{{ jfrog_repo }}/{{ iso_filename }}"
+      changed_when: true
+  always:
+    - name: Remove the staged curl config
+      ansible.builtin.file:
+        path: "{{ dist_dir }}/.jfrog-curl.cfg"
+        state: absent
 
 # ---- Remaster ISO ----
 

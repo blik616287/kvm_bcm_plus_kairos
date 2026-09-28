@@ -1,0 +1,30 @@
+---
+# Defaults for roles/palette_cluster — knobs used ONLY by this role. Shared
+# values (VIP, node IP, admin login, artifacts, arch) live in
+# inventory/hosts.yml; see roles/appliance_iso/defaults/main.yml for why.
+
+appliance_cluster_name: "palette-mgmt"
+
+# Single node needs these at 1; a three-node HA deployment uses the shipped
+# profile defaults (3).
+appliance_csi_placement_count: 1
+appliance_mongo_replicas: 1
+
+# Second disk, wiped during deployment. Enumerates as /dev/sdb only because
+# the VM attaches its disks over virtio-SCSI — see
+# roles/appliance_vm/templates/appliance-qemu.sh.j2.
+appliance_storage_pool_drive: "/dev/sdb"
+
+# Internal Zot registry admin password; generated per run when empty.
+appliance_registry_password: ""
+
+# ---- Timeouts (seconds) ----
+appliance_cluster_timeout: 3600
+# The content bundle is ~10 GB and now streams through QEMU slirp (userspace
+# TCP) rather than a libvirt bridge, so this is deliberately generous.
+appliance_content_upload_timeout: 7200
+
+# How long to wait for Palette's API to come up behind the VIP after the
+# cluster reports Running. Measured at ~30 min on the local-KVM rig, so the
+# default leaves real headroom; the static UI answers long before this.
+appliance_api_timeout: 3600

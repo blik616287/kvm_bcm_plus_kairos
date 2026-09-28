@@ -7,14 +7,14 @@ Boots a Kairos compute node in QEMU so the whole pipeline can be exercised on on
 | **Playbook / role** | `playbooks/05-kairos-vm.yml` → `roles/kairos_vm` |
 | **Target** | `make kairos-vm` |
 | **Mode** | local-KVM only (remote nodes are real hardware) |
-| **Networking** | QEMU socket `connect=:31337` → the BCM VM's provisioning network |
+| **Networking** | a tap on the provisioning bridge `br-kairos`, shared with the BCM VM |
 
 ## What it does — two QEMU phases
 
 ```mermaid
 flowchart TD
   R["cmsh: set node installmode FULL"] --> F["fresh qcow2 + per-VM OVMF vars"]
-  F --> P1["Phase 1: launch QEMU PXE-first (-boot order=cn)<br/>socket connect=:31337, serial→telnet+logfile"]
+  F --> P1["Phase 1: launch QEMU PXE-first (-boot order=cn)<br/>bridge tap, serial→telnet+logfile"]
   P1 --> X["PXE → BCM installer Ubuntu →<br/>kairos-install.service → dd Kairos → poweroff"]
   X --> W1["wait for VM to power off (≤30 min)"]
   W1 --> P2["Phase 2: launch from disk (-boot c)<br/>REUSES the same OVMF vars (Kairos efibootmgr entry persists)"]
@@ -24,7 +24,7 @@ flowchart TD
   W2 -->|"up"| OK["KAIROS_BOOTED"]
 ```
 
-**Phase 1 (PXE-install):** resets the node to `installmode FULL` via `cmsh`, makes a fresh `build/<slug>-compute.qcow2` and a **per-VM OVMF vars file**, then launches QEMU with `-boot order=cn` on the socket network. The node PXE-boots the BCM installer image, `kairos-install.service` runs `install-kairos.sh` (the `dd`), and the VM powers off. The role polls the PID for up to 30 min.
+**Phase 1 (PXE-install):** resets the node to `installmode FULL` via `cmsh`, makes a fresh `build/<slug>-compute.qcow2` and a **per-VM OVMF vars file**, then launches QEMU with `-boot order=cn` on the provisioning bridgework. The node PXE-boots the BCM installer image, `kairos-install.service` runs `install-kairos.sh` (the `dd`), and the VM powers off. The role polls the PID for up to 30 min.
 
 **Phase 2 (disk boot):** launches the same disk with `-boot c`, **reusing the OVMF vars from Phase 1** so the `Kairos` efibootmgr entry written during the install is honored. `wait-kairos-boot.sh` finds the node's IP via the BCM ARP table, SSHes in, and checks for `/etc/kairos-release` (≤10 min). If the first boot parks on the stylus first-boot/registration GRUB entry, the role **resets and reboots once** — the second boot uses the default active-Kairos entry.
 
@@ -60,7 +60,7 @@ Then `make validate ANSIBLE_ARGS="-e kairos_profile=<p> -e kairos_node_name=<nod
 | Symptom | Cause | Fix |
 |---|---|---|
 | PXE never gets DHCP / hangs | `kairos_vm_mac` ≠ the registered device MAC, or node on wrong `provisioninginterface` | align `kairos_vm_mac`; re-run `deploy-dd`; check BCM `dhcpd` |
-| PXE pulls `syslinux.efi` then stalls | next-stage TFTP over the socket net (rig artifact) / BCM served localboot | for a *fresh* install it usually proceeds; for a re-PXE see the boot-handoff note |
+| PXE pulls `syslinux.efi` then stalls | next-stage TFTP over the provisioning bridge (rig artifact) / BCM served localboot | for a *fresh* install it usually proceeds; for a re-PXE see the boot-handoff note |
 | node boots **Ubuntu, not Kairos** | `kairos-install.service` didn't complete the `dd` | [troubleshoot-node-booted-bcm-image](troubleshoot-node-booted-bcm-image.md); read `/dev/shm/kairos-install.log` |
 | Phase-1 never powers off (30-min timeout) | `dd` stalled / image corrupt / HTTP:8888 down | read the serial log; verify the raw `sha256` + the BCM HTTP server |
 | disk-boot times out once, then works | stylus first-boot registration stall | expected — the role's rescue resets + reboots; second boot is the active Kairos entry |

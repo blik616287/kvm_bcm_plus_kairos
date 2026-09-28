@@ -5,6 +5,9 @@ logs/
 
 # --- Cloned third-party ---
 CanvOS/
+# Palette-appliance CanvOS checkout (separate tree: the appliance build
+# patches .arg/Dockerfile/user-data differently than kairos_build does).
+CanvOS-appliance/
 
 # --- Big binary images (anywhere) ---
 *.iso
@@ -53,6 +56,7 @@ CLAUDE.md
 *.sha256
 
 # --- Secrets ---
+.jfrog-curl.cfg
 inventory/group_vars/all.yml
 bcm-discovery-*.yml
 bcm-bridge-inventory.yml
@@ -64,3 +68,20 @@ ursa-proxmox-access/
 *.mov
 Untitled
 profiles/kairos-dgx4.yml
+
+# --- Palette appliance: licensed Spectro Cloud artifacts (never commit) ---
+# The content bundle alone is ~10 GB and none of it is ours to redistribute.
+artifacts/*
+!artifacts/.gitkeep
+!artifacts/README.md
+*.tar.zst
+*.sig.bin
+*.sig.hex
+spc.tgz
+
+# --- Palette appliance: generated credentials + keys ---
+.run-credentials.yml
+*.pem
+*.key
+*.crt
+!**/*.pub

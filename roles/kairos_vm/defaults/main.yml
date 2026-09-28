@@ -35,7 +35,37 @@ kairos_vm_serial_port: "{{ 4320 + (kairos_node_num | int) }}"
 kairos_vm_slug: "{{ 'kairos' if kairos_node_name == 'node001' else kairos_node_name }}"
 kairos_vm_name: "Kairos-ComputeNode{{ '' if kairos_node_name == 'node001' else '-' + kairos_node_name }}"
 
+# Boot disk. Set kairos_vm_disk_size to "" for a node with NO separate boot
+# disk — the RAID profiles need that, because on a DGX every drive is NVMe and
+# the OS mirror IS the boot target. Leaving a small boot disk attached would
+# also corrupt size-based RAID selection: finalize takes the SMALLEST N drives
+# as the mirror, so a 20G boot disk would be chosen over the real members.
 kairos_disk:        "{{ build_dir }}/{{ kairos_vm_slug }}-compute.qcow2"
 kairos_serial_log:  "{{ e2e_dir }}/logs/{{ kairos_vm_slug }}-serial.log"
 kairos_pid_file:    "{{ build_dir }}/.{{ kairos_vm_slug }}-qemu.pid"
 kairos_ovmf_vars:   "{{ build_dir }}/ovmf-vars-{{ kairos_vm_slug }}-vm.fd"
+
+# Login the post-boot probe uses to confirm the node came up. Defaults match
+# the Kairos EDGE cloud-config, which creates a `kairos` user with password
+# `kairos`. An image built from a different cloud-config has no such user, so
+# the probe can never succeed and burns its whole timeout — profiles for those
+# images must override these (profiles/palette-appliance.yml does).
+kairos_vm_probe_user: "kairos"
+kairos_vm_probe_password: "kairos"
+
+# Extra disks beyond the boot disk. Empty (default) = single-disk node,
+# byte-identical to previous behaviour.
+#
+# Each entry is {size, bus}; bus is virtio (default) or nvme.
+#   virtio -> /dev/vdX      e.g. the Palette appliance storage-pool disk
+#   nvme   -> /dev/nvmeXn1
+#
+# nvme matters for RAID profiles: roles/deploy_dd's finalize script selects
+# mirror/data members by scanning /sys/block/nvme*n1, so a virtio disk is
+# invisible to it. Presenting emulated NVMe lets profiles/dgx-raid-kvm.yml
+# exercise the REAL selection logic instead of a test-only variant.
+#
+#   kairos_vm_disks:
+#     - { size: "20G", bus: nvme }
+#     - { size: "40G", bus: nvme }
+kairos_vm_disks: []

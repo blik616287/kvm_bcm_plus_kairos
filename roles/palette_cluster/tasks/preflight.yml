@@ -1,0 +1,132 @@
+---
+# palette_cluster preflight — everything that must be true BEFORE 10 GB of
+# content bundle is shipped anywhere: find the appliance BCM provisioned, prove
+# it is alive, and prepare the inputs locally.
+#
+# Split out of main.yml so the bundle transfer can use ansible.posix.synchronize,
+# which pushes from the controller to the play's INVENTORY host — a
+# `delegate_to: bcm` task cannot be that, so the transfer needs its own
+# `hosts: bcm` play. Run order is preflight (localhost) -> transfer (bcm) ->
+# main (localhost); playbooks/palette-appliance.yml wires it up.
+#
+# Facts set here are consumed by both later plays, via hostvars['localhost'].
+
+- name: Capture the invoking user (ansible.cfg become=true → keep run state user-owned)
+  ansible.builtin.command: whoami
+  become: false
+  changed_when: false
+  register: palette_cluster_invoker
+
+- name: Resolve the appliance node name
+  ansible.builtin.set_fact:
+    palette_node: "{{ bcm_target_node | default(kairos_node_name | default('node002', true), true) }}"
+    palette_share: "/cm/shared/kairos/{{ kairos_profile }}"
+
+# ---- Find the appliance on BCM's network (roles/validate does the same) ----
+
+- name: Look up the appliance node IP from cmsh
+  ansible.builtin.command: cmsh -c "device; use {{ palette_node }}; get ip"
+  delegate_to: bcm
+  register: palette_node_ip_raw
+  changed_when: false
+
+- name: Fall back to the BOOTIF interface IP when the device IP is 0.0.0.0
+  ansible.builtin.command: cmsh -c "device; use {{ palette_node }}; interfaces; use BOOTIF; get ip"
+  delegate_to: bcm
+  register: palette_bootif_ip
+  changed_when: false
+  when: (palette_node_ip_raw.stdout | trim) in ['', '0.0.0.0']
+
+- name: Resolve the effective appliance IP
+  ansible.builtin.set_fact:
+    appliance_node_ip: >-
+      {{ (palette_bootif_ip.stdout | trim)
+         if (palette_node_ip_raw.stdout | trim) in ['', '0.0.0.0']
+         else (palette_node_ip_raw.stdout | trim) }}
+
+- name: Refuse to probe an IP that would loop back to BCM/localhost
+  # Without this a bad cmsh lookup silently points every call below at BCM
+  # itself, and the run "succeeds" against the wrong host.
+  ansible.builtin.assert:
+    that: appliance_node_ip not in ['', '0.0.0.0', '127.0.0.1', '::1', bcm_internal_ip]
+    fail_msg: >-
+      Appliance IP resolved to '{{ appliance_node_ip }}' — that would loop back
+      to BCM. Check {{ palette_node }}'s interface in cmsh; the profile pins it
+      with kairos_target_ip.
+
+- name: Refuse a VIP that collides with the appliance node address
+  # kube-vip would be asked to own an address the node already holds. Easy to
+  # hit because deploy_dd DERIVES the local-KVM node address (prefix + 9 +
+  # node number, so node002 -> .11) and ignores kairos_target_ip on that path,
+  # so a VIP chosen from the profile alone can land right on top of it.
+  ansible.builtin.assert:
+    that: appliance_vip != appliance_node_ip
+    fail_msg: >-
+      appliance_vip ({{ appliance_vip }}) is the same address BCM gave
+      {{ palette_node }}. Pick a VIP outside BCM's DHCP pool (.16-.250) and
+      clear of the derived node address.
+
+- name: Compose the appliance endpoints
+  ansible.builtin.set_fact:
+    appliance_localui_url: "https://{{ appliance_node_ip }}:5080"
+    appliance_vip_url: "https://{{ appliance_vip }}"
+
+- name: Wait for the appliance Local UI to answer (BCM just finished provisioning it)
+  # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP; see the role header.
+  ansible.builtin.uri:
+    url: "{{ appliance_localui_url }}/"
+    validate_certs: false
+    status_code: [200]
+  delegate_to: bcm
+  register: palette_localui
+  until: palette_localui.status == 200
+  retries: "{{ (appliance_localui_timeout | int / 15) | int }}"
+  delay: 15
+
+# ---- Working directories ----
+
+- name: Create a working directory on the build host
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: palette
+  become: false
+  register: palette_workdir
+
+- name: Create the staging directory on BCM
+  ansible.builtin.file:
+    path: "{{ palette_share }}"
+    state: directory
+    mode: "0755"
+  delegate_to: bcm
+
+- name: Generate a registry password when none was supplied
+  ansible.builtin.set_fact:
+    palette_registry_password_effective: >-
+      {{ appliance_registry_password if appliance_registry_password | length > 0
+         else lookup('password', palette_workdir.path ~ '/registry_password length=20 chars=ascii_letters,digits') }}
+  no_log: true
+
+- name: Verify the bundle signature against the signing key
+  when: appliance_signing_public_key | length > 0 and appliance_content_bundle_signature | length > 0
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - dgst
+      - -sha256
+      - -verify
+      - "{{ appliance_signing_public_key }}"
+      - -signature
+      - "{{ appliance_content_bundle_signature }}"
+      - "{{ appliance_content_bundle }}"
+  register: palette_sig_verify
+  changed_when: false
+  failed_when: "'Verified OK' not in palette_sig_verify.stdout"
+
+- name: Extract the cluster definition from the bundle
+  # Runs on the build host, which is where the bundle is.
+  ansible.builtin.script:
+    cmd: "extract_spc.py '{{ appliance_content_bundle }}' '{{ palette_workdir.path }}'"
+    executable: python3
+  become: false
+  register: palette_spc_extract
+  changed_when: true

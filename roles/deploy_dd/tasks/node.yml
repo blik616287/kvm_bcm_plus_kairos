@@ -5,6 +5,29 @@
 # mirrors roles/kairos_vm/defaults so the two stages agree (plan C.1 will hoist
 # it to a shared var).
 
+# The assign below carries failed_when: false, because cmsh reports benign
+# conditions on stderr. That also means a bcm_target_node which does not exist
+# on this BCM -- a typo, or a profile pointed at hardware that is not in this
+# cluster -- passes silently, and the run goes on to PXE a node that was never
+# put in the category. Check the device is really there first.
+- name: Check the target device exists on this BCM
+  ansible.builtin.command: cmsh -c "device; use \"{{ bcm_target_node }}\"; get hostname"
+  delegate_to: bcm
+  register: dd_target_exists
+  changed_when: false
+  failed_when: false
+  when: bcm_target_node | default('', true) | length > 0
+
+- name: Fail if the target device is not on this BCM
+  ansible.builtin.assert:
+    that: (dd_target_exists.stdout | default('') | trim) | length > 0
+    fail_msg: >-
+      bcm_target_node '{{ bcm_target_node }}' is not a device on this BCM.
+      Either the name is wrong, or this profile targets hardware in a
+      different cluster. Leave bcm_target_node empty to register a fresh
+      local-KVM node instead (see profiles/dgx-raid-kvm.yml).
+  when: bcm_target_node | default('', true) | length > 0
+
 - name: Assign an existing BCM device to the profile (targeted/remote BCM)
   ansible.builtin.command: >-
     cmsh -c "device; use \"{{ bcm_target_node }}\";

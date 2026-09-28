@@ -1,0 +1,189 @@
+---
+# palette_tenant — create and activate the first tenant.
+#
+# Without this, the tenant console at https://<vip>/ has no account to log in
+# with: the system console's admin is system-scope only.
+#
+# Ported from palette-appliance-automation (upstream 8f29a40). Every task here
+# targets the cluster VIP, which lives on the BCM provisioning LAN and is not
+# routable from the build host — so the whole role runs `delegate_to: bcm`.
+# BCM is registered as a managed host by playbooks/tasks/add_bcm_host.yml and
+# carries a python3 interpreter, so ansible.builtin.uri runs there natively.
+#
+# TLS: every call below sets validate_certs: false. The appliance serves a
+# self-signed certificate that does not exist until the appliance is built,
+# and the VIP is private to the provisioning LAN — there is nothing to pin
+# against. The CKV_ANSIBLE_1 skips on each task record that deliberately.
+
+- name: Capture the invoking user (ansible.cfg become=true → keep run state user-owned)
+  ansible.builtin.command: whoami
+  become: false
+  changed_when: false
+  register: palette_tenant_invoker
+
+- name: Compose the VIP endpoint
+  # Set here rather than inherited from palette_cluster so this role also works
+  # when run on its own (`make palette-tenant`). It needs only the VIP, not the
+  # appliance node's address.
+  ansible.builtin.set_fact:
+    appliance_vip_url: "https://{{ appliance_vip }}"
+
+- name: Log in to the system console
+  # Takes "username", not "emailId" (that returns 403).
+  # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP; see the role header.
+  ansible.builtin.uri:
+    url: "{{ appliance_vip_url }}/v1/auth/syslogin"
+    method: POST
+    validate_certs: false
+    body_format: json
+    body:
+      username: "{{ appliance_system_user }}"
+      password: "{{ appliance_system_password }}"
+    status_code: [200]
+  delegate_to: bcm
+  register: palette_syslogin
+  # palette_cluster now proves the API is answering before this role runs, so
+  # these retries only absorb the last few seconds of it settling rather than
+  # standing in for a readiness wait. The previous 10x15s budget was being
+  # asked to cover ~30 minutes of API startup, and no_log made the resulting
+  # failure a censored blob with no indication that "the API is not up yet"
+  # was the whole story.
+  retries: 20
+  delay: 15
+  until: palette_syslogin.status == 200
+  no_log: true
+
+- name: List existing tenants
+  # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP; see the role header.
+  ansible.builtin.uri:
+    url: "{{ appliance_vip_url }}/v1/tenants"
+    validate_certs: false
+    headers:
+      Authorization: "{{ palette_syslogin.json.Authorization }}"
+    status_code: [200]
+  delegate_to: bcm
+  register: palette_tenants
+
+- name: Count tenants, ignoring soft-deleted ones
+  # Deleted tenants stay in the list annotated deleted="true".
+  ansible.builtin.set_fact:
+    # json['items'] with brackets: dotted access hits the dict's .items()
+    # method. The API returns null (not []) when there are none.
+    palette_live_tenants: >-
+      {{ (palette_tenants.json['items'] | default([], true))
+         | rejectattr('metadata.annotations.deleted', 'defined')
+         | list }}
+
+- name: Note when a tenant already exists
+  when: palette_live_tenants | length > 0
+  ansible.builtin.debug:
+    msg: >-
+      Tenant(s) already present ({{ palette_live_tenants | map(attribute='spec.orgName') | join(', ') }});
+      skipping creation.
+
+- name: Create the tenant and activate its admin
+  when: palette_live_tenants | length == 0
+  block:
+    - name: Create the tenant
+      # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP; see the role header.
+      ansible.builtin.uri:
+        url: "{{ appliance_vip_url }}/v1/tenants"
+        method: POST
+        validate_certs: false
+        headers:
+          Authorization: "{{ palette_syslogin.json.Authorization }}"
+        body_format: json
+        body:
+          metadata: {}
+          spec:
+            orgName: "{{ appliance_tenant_org_name }}"
+            firstName: "{{ appliance_tenant_admin_first_name }}"
+            lastName: "{{ appliance_tenant_admin_last_name }}"
+            emailId: "{{ appliance_tenant_admin_email }}"
+            authType: password
+        status_code: [200, 201, 500]
+      delegate_to: bcm
+      register: palette_tenant_create
+
+    - name: Explain a name collision with a deleted org
+      # Deleted orgs keep their name reserved; creating the same name 500s.
+      when: palette_tenant_create.status == 500
+      ansible.builtin.fail:
+        msg: >-
+          {{ (palette_tenant_create.json.message | default('tenant creation failed')) }}
+          {% if (palette_tenant_create.json.code | default('')) == 'OrgInDeletedState' %}
+          Set appliance_tenant_org_name to a name that has never been used on
+          this instance; deleted organizations keep their name reserved.
+          {% endif %}
+
+    - name: Fetch the activation link
+      # Keyed by the TENANT uid, despite the /v1/users/ path.
+      # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP; see the role header.
+      ansible.builtin.uri:
+        url: "{{ appliance_vip_url }}/v1/users/{{ palette_tenant_create.json.uid }}/activationlink"
+        validate_certs: false
+        headers:
+          Authorization: "{{ palette_syslogin.json.Authorization }}"
+        status_code: [200]
+      delegate_to: bcm
+      register: palette_activation
+      retries: 5
+      delay: 10
+      until: palette_activation.status == 200 and (palette_activation.json.activationLink | default('')) | length > 0
+
+    - name: Extract the activation token
+      ansible.builtin.set_fact:
+        palette_activation_token: >-
+          {{ palette_activation.json.activationLink
+             | regex_search('/auth/password/([^/]+)/activate', '\1') | first }}
+
+    - name: Set the tenant admin password
+      # PATCH only; POST returns 405.
+      # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP; see the role header.
+      ansible.builtin.uri:
+        url: "{{ appliance_vip_url }}/v1/auth/password/{{ palette_activation_token }}/activate"
+        method: PATCH
+        validate_certs: false
+        body_format: json
+        body:
+          password: "{{ appliance_tenant_admin_password }}"
+        status_code: [200, 204]
+      delegate_to: bcm
+      no_log: true
+
+    - name: Verify the tenant admin can log in
+      # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP; see the role header.
+      ansible.builtin.uri:
+        url: "{{ appliance_vip_url }}/v1/auth/authenticate"
+        method: POST
+        validate_certs: false
+        body_format: json
+        body:
+          emailId: "{{ appliance_tenant_admin_email }}"
+          password: "{{ appliance_tenant_admin_password }}"
+        status_code: [200]
+      delegate_to: bcm
+      register: palette_tenant_login
+      no_log: true
+
+    - name: Record the tenant credentials
+      ansible.builtin.blockinfile:
+        path: "{{ e2e_dir }}/.run-credentials.yml"
+        create: true
+        mode: "0600"
+        owner: "{{ palette_tenant_invoker.stdout }}"
+        group: "{{ palette_tenant_invoker.stdout }}"
+        marker: "# {mark} tenant"
+        block: |
+          tenant_org_name: {{ appliance_tenant_org_name }}
+          tenant_admin_email: {{ appliance_tenant_admin_email }}
+          tenant_admin_password: {{ appliance_tenant_admin_password }}
+      no_log: true
+
+    - name: Report the tenant
+      ansible.builtin.debug:
+        msg:
+          - "Tenant '{{ appliance_tenant_org_name }}' created and activated."
+          - "  Tenant console: {{ appliance_vip_url }}/  ({{ appliance_tenant_admin_email }})"
+          - "  System console: {{ appliance_vip_url }}/system  ({{ appliance_system_user }} — change the default password)"
+          - "  Reachable from the provisioning network (BCM + Kairos nodes), not the build host."

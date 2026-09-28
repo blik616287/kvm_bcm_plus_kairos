@@ -1,0 +1,138 @@
+---
+# Provision a self-hosted Palette management appliance END TO END, with BCM
+# doing the provisioning.
+#
+# The appliance is NOT a special case: it is a build profile
+# (profiles/palette-appliance.yml) flowing through the ordinary stages, exactly
+# like the Ubuntu and DGX profiles —
+#
+#   03-kairos-build  builds the appliance raw disk (the profile swaps the
+#                    image's cloud-config via kairos_cloud_config_template)
+#   04-deploy-dd     BCM: software image, category, PXE, node registration
+#   05-kairos-vm     PXE-boots the node; BCM `dd`s the image onto it
+#   palette_cluster  uploads the content bundle and deploys the mgmt cluster
+#   palette_tenant   creates and activates the first tenant
+#
+# Run it with `make palette-appliance`, which supplies the profile. Each stage
+# can also be run on its own with `-e @profiles/palette-appliance.yml`.
+#
+# Stage 1-2 (bcm-prepare, bcm-vm) must already have produced a running BCM:
+# BCM is what provisions this node.
+
+- import_playbook: 03-kairos-build.yml
+- import_playbook: 04-deploy-dd.yml
+- import_playbook: 05-kairos-vm.yml
+
+- name: "Palette (preflight): find the appliance and prepare the inputs"
+  hosts: localhost
+  gather_facts: true
+  vars:
+    e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
+    build_dir: "{{ e2e_dir }}/build"
+    dist_dir: "{{ e2e_dir }}/dist"
+
+  pre_tasks:
+    - name: Register the BCM as a managed host
+      # The appliance sits on BCM's provisioning network, which the build host
+      # cannot route to, so every call to it goes through BCM.
+      ansible.builtin.import_tasks: tasks/add_bcm_host.yml
+      tags: [always]
+
+    - name: Resolve appliance credentials and artifacts
+      ansible.builtin.import_tasks: tasks/appliance_credentials.yml
+      tags: [always]
+
+    - name: Require a content bundle
+      ansible.builtin.assert:
+        that: appliance_content_bundle | length > 0
+        fail_msg: >-
+          No content bundle found. Put the Artifact Studio .tar.zst in
+          {{ appliance_artifacts_dir }}/ (see artifacts/README.md) or pass
+          -e appliance_content_bundle=/path/to/bundle.tar.zst
+        success_msg: "Using content bundle: {{ appliance_content_bundle | basename }}"
+      tags: [always]
+
+  tasks:
+    # import_role, NOT include_role: include_role is dynamic and its tags do
+    # not propagate to the tasks it pulls in, so under `--tags cluster`
+    # (make palette-cluster) the preflight tasks are filtered out, the facts
+    # they set never exist, and the transfer play dies with
+    # "'HostVarsVars' has no attribute 'palette_share'". A static import
+    # applies the tags to every task inside.
+    - name: Preflight the appliance
+      ansible.builtin.import_role:
+        name: palette_cluster
+        tasks_from: preflight
+      tags: [cluster, palette, tenant]
+
+- name: "Palette (transfer): rsync the content bundle to the BCM"
+  # Its own play because ansible.posix.synchronize pushes from the controller
+  # to the play's INVENTORY host; `delegate_to: bcm` inverts it and makes BCM
+  # rsync to itself. Deliberately AFTER preflight, so ~10 GB only moves once we
+  # know the appliance exists and is answering.
+  hosts: bcm
+  gather_facts: false
+  vars:
+    _pre: "{{ hostvars['localhost'] }}"
+  tasks:
+    - name: Stage the content bundle on BCM (rsync, resumable)
+      # --partial resumes an interrupted multi-GB transfer instead of starting
+      # over; --inplace avoids the temp copy that would otherwise need double
+      # the space under /cm. delay_updates is mutually exclusive with it.
+      ansible.posix.synchronize:
+        src: "{{ _pre.appliance_content_bundle }}"
+        dest: "{{ _pre.palette_share }}/content-bundle.tar.zst"
+        mode: push
+        delay_updates: false
+        rsync_opts:
+          - "--partial"
+          - "--inplace"
+      tags: [cluster, palette]
+
+    - name: Stage the detached signature on BCM
+      ansible.posix.synchronize:
+        src: "{{ _pre.appliance_content_bundle_signature }}"
+        dest: "{{ _pre.palette_share }}/content.sig.bin"
+        mode: push
+        delay_updates: false
+      when: _pre.appliance_content_bundle_signature | length > 0
+      tags: [cluster, palette]
+
+    - name: Stage the cluster definition on BCM
+      ansible.posix.synchronize:
+        src: "{{ _pre.palette_workdir.path }}/spc.tgz"
+        dest: "{{ _pre.palette_share }}/spc.tgz"
+        mode: push
+        delay_updates: false
+      tags: [cluster, palette]
+
+    - name: Hex-encode the signature for upload
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          xxd -p -c 1000 '{{ _pre.palette_share }}/content.sig.bin' | tr -d '\n'
+          > '{{ _pre.palette_share }}/content.sig.hex'
+        executable: /bin/bash
+      when: _pre.appliance_content_bundle_signature | length > 0
+      changed_when: true
+      tags: [cluster, palette]
+
+- name: "Palette: deploy the management cluster on the BCM-provisioned appliance"
+  hosts: localhost
+  gather_facts: true
+  vars:
+    e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
+    build_dir: "{{ e2e_dir }}/build"
+    dist_dir: "{{ e2e_dir }}/dist"
+
+  pre_tasks:
+    - name: Register the BCM as a managed host
+      ansible.builtin.import_tasks: tasks/add_bcm_host.yml
+      tags: [always]
+
+  roles:
+    - role: palette_cluster
+      tags: [cluster, palette]
+    - role: palette_tenant
+      when: appliance_create_tenant | bool
+      tags: [cluster, palette, tenant]

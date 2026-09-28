@@ -1,0 +1,69 @@
+---
+# palette-edge-verify.yml — prove a Kairos edge node registered with the
+# self-hosted appliance.
+#
+#   make palette-edge-verify
+#
+# Registration is asynchronous and happens on the NODE: stylus-agent's
+# ExecStartPre hook (palette-cleanup-stale.sh) mints an edge-host token against
+# the appliance, then stylus registers. Nothing on the controller is told when
+# that finishes, so this polls the tenant until the host shows up.
+#
+# Read-only. Runs delegate_to: bcm because the build host has no route to the
+# VIP — the same path the node itself uses.
+
+- name: "Palette: verify edge host registration"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    e2e_dir: "{{ lookup('env', 'E2E_DIR') | default(playbook_dir + '/..', true) }}"
+    appliance_vip_url: "https://{{ appliance_vip }}"
+    # Registration waits on the node booting, minting a token and calling home.
+    edge_verify_timeout: 1800
+
+  pre_tasks:
+    - name: Register the BCM as a managed host
+      ansible.builtin.import_tasks: tasks/add_bcm_host.yml
+
+    - name: Load the credentials minted for edge registration
+      ansible.builtin.include_vars:
+        file: "{{ e2e_dir }}/.run-credentials.yml"
+        name: edge_creds
+      no_log: true
+
+    - name: Require the edge credentials
+      ansible.builtin.assert:
+        that:
+          - edge_creds.edge_palette_api_key | default('') | length > 0
+          - edge_creds.edge_palette_project_uid | default('') | length > 0
+        fail_msg: >-
+          No edge registration credentials. Run `make palette-edge-credentials`
+          after the appliance is up.
+
+  tasks:
+    - name: Wait for the edge host to appear in the tenant
+      # POST .../search, not a GET list: /v1/dashboard/edgehosts is a 404 and
+      # the GET forms are not exposed. Verified against a live appliance.
+      # checkov:skip=CKV_ANSIBLE_1:Appliance serves a self-signed cert on a private VIP.
+      ansible.builtin.uri:
+        url: "{{ appliance_vip_url }}/v1/dashboard/edgehosts/search"
+        method: POST
+        validate_certs: false
+        headers:
+          ApiKey: "{{ edge_creds.edge_palette_api_key }}"
+          ProjectUid: "{{ edge_creds.edge_palette_project_uid }}"
+        body_format: json
+        body: {}
+        status_code: [200]
+      delegate_to: bcm
+      register: edge_hosts
+      until: edge_hosts.json['items'] | default([]) | length > 0
+      retries: "{{ (edge_verify_timeout | int / 30) | int }}"
+      delay: 30
+
+    - name: Report the registered edge hosts
+      ansible.builtin.debug:
+        msg: >-
+          {{ edge_hosts.json['items'] | length }} edge host(s) registered with
+          the appliance: {{ edge_hosts.json['items']
+          | map(attribute='metadata.name') | join(', ') }}

@@ -1,6 +1,6 @@
 # Stage 2 — `bcm-vm`  *(local-KVM only)*
 
-Boots the head node from the stage-1 ISO in QEMU, lets it auto-install, then boots it from disk and waits until BCM is fully operational (`cmd` + `cmsh`). After this, a local BCM is listening on the QEMU **socket network `:31337`** (the provisioning net) and on host-forwarded SSH/HTTPS — ready for stages 3–6.
+Boots the head node from the stage-1 ISO in QEMU, lets it auto-install, then boots it from disk and waits until BCM is fully operational (`cmd` + `cmsh`). After this, a local BCM is on the **provisioning bridge** (`br-kairos`) and on host-forwarded SSH/HTTPS — ready for stages 3–6.
 
 | | |
 |---|---|
@@ -13,16 +13,16 @@ Boots the head node from the stage-1 ISO in QEMU, lets it auto-install, then boo
 
 ```mermaid
 flowchart TD
-  A["create bcm-headnode.qcow2"] --> P1["Phase 1: QEMU install (-boot d)<br/>-kernel/-initrd + ISO + password FAT<br/>socket listen=:31337 + NAT hostfwd 22/443"]
+  A["create bcm-headnode.qcow2"] --> P1["Phase 1: QEMU install (-boot d)<br/>-kernel/-initrd + ISO + password FAT<br/>bridge tap + NAT hostfwd 22/443"]
   P1 --> W1["auto-install runs; wait for VM to power off (≤90 min)"]
-  W1 --> P2["Phase 2: boot from disk (-boot c)<br/>same socket :31337 + hostfwd"]
+  W1 --> P2["Phase 2: boot from disk (-boot c)<br/>same bridge tap + hostfwd"]
   P2 --> S["wait for SSH (≤5 min)"]
   S --> CF["wait for cmfirstboot to finish (≤15 min)"]
   CF --> CM["wait for cmd active + cmsh answering (≤5 min)"]
   CM --> OK["BCM ready"]
 ```
 
-**Networking:** NIC 1 = QEMU **socket `listen=:31337`** (the provisioning network compute nodes connect to); NIC 2 = user-mode NAT with **host-forwards** `:bcm_ssh_port→22` and `:bcm_https_port→443`. So you reach BCM at `root@localhost -p <bcm_ssh_port>`.
+**Networking:** NIC 1 = a tap on the **provisioning bridge** `br-kairos` (created by `qemu-bridge-helper`; the network compute nodes share); NIC 2 = user-mode NAT with **host-forwards** `:bcm_ssh_port→22` and `:bcm_https_port→443`. So you reach BCM at `root@localhost -p <bcm_ssh_port>`.
 
 ## Inputs
 

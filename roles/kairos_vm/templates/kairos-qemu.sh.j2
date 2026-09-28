@@ -14,6 +14,10 @@ shift || true
 OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
 [ -f "$OVMF_CODE" ] || OVMF_CODE=/usr/share/qemu/OVMF.fd
 
+{% if (bcm_internal_net_mode | default('socket')) == 'bridge' %}
+"{{ e2e_dir }}/scripts/provisioning-net.sh" up "{{ bcm_internal_bridge | default('br-kairos') }}"
+{% endif %}
+
 exec qemu-system-x86_64 \
     {{ kvm_flag.stdout }} \
     -m {{ kairos_vm_ram }} -smp {{ kairos_vm_cpus }} -cpu host \
@@ -22,9 +26,33 @@ exec qemu-system-x86_64 \
     -drive if=pflash,format=raw,file="{{ kairos_ovmf_vars }}" \
     -name "{{ kairos_vm_name }}" \
     -display {{ qemu_display_type.stdout }} \
-    -drive file="{{ kairos_disk }}",format=qcow2,if=virtio \
-    -netdev socket,id=intnet,connect=:31337 \
+{% if (bcm_internal_net_mode | default('socket')) == 'bridge' %}
+    -netdev bridge,id=intnet,br={{ bcm_internal_bridge | default('br-kairos') }},helper={{ bcm_qemu_bridge_helper | default('/usr/lib/qemu/qemu-bridge-helper') }} \
+{% else %}
+    -netdev socket,id=intnet,connect=:{{ bcm_internal_socket_port | default(31337) }} \
+{% endif %}
     -device virtio-net-pci,netdev=intnet,mac={{ kairos_vm_mac }} \
+{# The NIC is declared BEFORE any disk, and that ordering is load-bearing.
+   QEMU hands out PCI slots to -device entries in command-line order, so every
+   `-device nvme` written ahead of the NIC pushes it one slot along and renames
+   it: four NVMe namespaces moved it from enp0s2 to enp0s6. BCM registers the
+   node against a fixed provisioning interface name, and a mismatch fails the
+   node-installer with "booted using an interface (enp0sN) which is not defined
+   in the node object" -- after a successful PXE, so it looks like a BCM
+   problem. Declaring the NIC first pins it to the first free slot whatever the
+   disk layout is. (`-drive ... if=virtio` disks do not disturb it, which is why
+   this only surfaced with the NVMe profile.) #}
+{% if kairos_vm_disk_size | default('') | length > 0 %}
+    -drive file="{{ kairos_disk }}",format=qcow2,if=virtio \
+{% endif %}
+{% for d in kairos_vm_disks | default([]) %}
+{% if (d.bus | default('virtio')) == 'nvme' %}
+    -drive file="{{ build_dir }}/{{ kairos_vm_slug }}-d{{ loop.index }}.qcow2",if=none,id=nvm{{ loop.index }},format=qcow2 \
+    -device nvme,serial=kvmnvme{{ '%03d' % loop.index }},drive=nvm{{ loop.index }} \
+{% else %}
+    -drive file="{{ build_dir }}/{{ kairos_vm_slug }}-d{{ loop.index }}.qcow2",format=qcow2,if=virtio \
+{% endif %}
+{% endfor %}
     -chardev socket,id=ser0,host=localhost,port={{ kairos_vm_serial_port }},server=on,wait=off,telnet=on,logfile="{{ kairos_serial_log }}" \
     -serial chardev:ser0 \
     -pidfile "{{ kairos_pid_file }}" \

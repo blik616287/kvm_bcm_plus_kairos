@@ -8,6 +8,7 @@ framework:
   - ansible
 skip-path:
   - CanvOS
+  - CanvOS-appliance
   - build
   - dist
   - logs
