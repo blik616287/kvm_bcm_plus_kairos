@@ -66,9 +66,10 @@ kairos_target_disk: /dev/md0    # dd target = the assembled OS mirror
 # must stay bare and individually addressable. false renders NO data-array step
 # into the finalize — no mdadm --create, no mkfs, no /raid systemd unit — leaving
 # them unpartitioned and unlabelled, which is the intended end state.
-# This is the deliberate difference from profiles/kairos-dgx4.yml, whose finalize
-# builds a RAID0 /raid over the same eight slots (verified live on dgx04:
-# md127 raid0, 28T, mounted /raid).
+# profiles/kairos-dgx4.yml matches: it also sets kairos_data_raid: false, so both
+# DGX profiles leave the eight disks bare and individually addressable.
+# History: dgx04 used to carry a RAID0 /raid at md127 over these same slots. That
+# array is gone and this pipeline does not recreate it.
 kairos_data_raid: false
 
 # A floor, not the truth: the finalize unions this list with every nvme device the
