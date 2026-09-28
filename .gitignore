@@ -63,4 +63,3 @@ ursa-proxmox-access/
 # --- Scratch / local artifacts (never commit) ---
 *.mov
 Untitled
-profiles/kairos-dgx4.yml
