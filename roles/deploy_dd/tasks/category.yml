@@ -53,7 +53,9 @@
 - name: Reconcile the category disksetup with the dd-install
   # See dd_disksetup_strip_glob in defaults/main.yml: BCM must not claim a disk
   # the FINALIZE stage owns, or it re-partitions it on the next PXE boot.
-  when: deploy_dd_finalize_install | default(false) | bool
+  when:
+    - deploy_dd_finalize_install | default(false) | bool
+    - dd_disksetup_reconcile | default(false) | bool
   delegate_to: bcm
   block:
     - name: List the Kairos disks the category disksetup still claims
@@ -98,10 +100,17 @@
       when:
         - dd_ds_claimed.stdout_lines | length > 0
         - dd_category_datanode | bool
+        - dd_disksetup_xml_file | default('') | length == 0
 
     - name: Apply the operator-supplied disksetup
-      ansible.builtin.command: >-
-        cmsh -c "category; use {{ kairos_profile }}; set disksetup {{ dd_disksetup_xml_file }}; commit"
+      # Multiline stdin for the same reason as the diskless task above.
+      ansible.builtin.command:
+        cmd: cmsh
+        stdin: |
+          category
+          use {{ kairos_profile }}
+          set disksetup {{ dd_disksetup_xml_file }}
+          commit
       changed_when: true
       when:
         - dd_ds_claimed.stdout_lines | length > 0

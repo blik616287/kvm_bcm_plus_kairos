@@ -66,16 +66,23 @@ kairos_target_disk: /dev/md0    # dd target = the assembled OS mirror
 # must stay bare and individually addressable. false renders NO data-array step
 # into the finalize — no mdadm --create, no mkfs, no /raid systemd unit — leaving
 # them unpartitioned and unlabelled, which is the intended end state.
-# This is the deliberate difference from profiles/kairos-dgx4.yml, whose finalize
-# builds a RAID0 /raid over the same eight slots (verified live on dgx04:
-# md127 raid0, 28T, mounted /raid).
+# This is the deliberate difference from the dgx04 profile (kept out of the
+# repo), whose finalize builds a RAID0 /raid over the same eight slots
+# (verified live on dgx04: md127 raid0, 28T, mounted /raid).
 kairos_data_raid: false
 
-# A floor, not the truth: the finalize unions this list with every nvme device the
-# kernel exposes, so a stale name cannot leave a label-colliding superblock.
+# A floor, not the truth: with kairos_wipe_all_nvme the finalize unions this list
+# with every nvme device the kernel exposes, so a stale name cannot leave a
+# label-colliding superblock.
 # Wiping the data disks clears any stray COS_*/raid labels; it does NOT put them
 # into an array.
 kairos_wipe_disks: "nvme0n1 nvme1n1 nvme2n1 nvme3n1 nvme4n1 nvme5n1 nvme6n1 nvme7n1 nvme8n1 nvme9n1"
+kairos_wipe_all_nvme: true
+
+# Keep BCM off every nvme: the category gets BCM's diskless disksetup and
+# datanode=yes, so BCM partitions nothing on PXE boot and the finalize owns the
+# disks. Checked and enforced on every deploy-dd.
+dd_disksetup_reconcile: true
 
 # Big disks -> the finalize-stage install (grow/timeout/efibootmgr fix) matters.
 deploy_dd_finalize_install: true

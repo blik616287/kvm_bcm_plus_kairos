@@ -71,6 +71,12 @@ kairos_raid_select: name
 # smallest disks on the node.
 kairos_os_raid_assert_smallest: true
 
+# Wipe EVERY nvme namespace the kernel exposes, not just kairos_wipe_disks. NVMe
+# names are not stable across boots, so a name list can miss a disk that still
+# carries a stale COS_* label or md superblock. Destroys every nvme on the node,
+# so it is only for profiles where Kairos owns all of them (kairos-dgx2.yml).
+kairos_wipe_all_nvme: false
+
 # --- dd-install: BCM must not claim a Kairos disk ---------------------------
 # The FINALIZE stage owns the disks end to end (wipes the members, builds the OS
 # mirror, dd's the image onto it). BCM re-applies its own disksetup on every PXE
@@ -80,6 +86,16 @@ kairos_os_raid_assert_smallest: true
 # the category exists (category.yml), so this must be enforced on every deploy,
 # not just the first. Anything whose kernel name matches dd_disksetup_strip_glob
 # is treated as Kairos-owned and may not appear in the category disksetup.
+#
+# OPT-IN per profile (dd_disksetup_reconcile). Existing finalize profiles
+# (dgx-raid, dgx-raid-kvm) deliberately let BCM lay its installer environment
+# onto the OS mirror members before finalize wipes them, and the appliance
+# (palette-appliance) installs to virtio disks; switching those categories to
+# diskless is untested, so it stays off unless a profile asks for it.
+dd_disksetup_reconcile: false
+# Matched against the disksetup <blockdev> with /dev/ stripped. The default
+# covers NVMe only: a category naming /dev/sd*, /dev/vd* or a /dev/disk/by-*
+# path is NOT checked -- widen it in the profile if the Kairos disks are those.
 dd_disksetup_strip_glob: "^nvme"
 # BCM's no-local-OS mode. It is what makes an empty disksetup legal, and it is
 # what a dd-install wants: the node-installer runs over NFS and the FINALIZE
