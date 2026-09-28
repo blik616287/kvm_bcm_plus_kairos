@@ -172,6 +172,7 @@
       ansible.builtin.lineinfile:
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
+        regexp: "> /etc/dracut.conf.d/99-skip-nfit.conf"
         line: "{{ kairos_dracut_indent }}    RUN echo 'omit_dracutmodules+=\" nfit \"' > /etc/dracut.conf.d/99-skip-nfit.conf"
 
     # Ubuntu 26.04 ships systemd 259 built +APPARMOR, which dlopens
@@ -185,6 +186,7 @@
       ansible.builtin.lineinfile:
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
+        regexp: "> /etc/dracut.conf.d/10-apparmor.conf"
         line: "{{ kairos_dracut_indent }}    RUN echo 'install_items+=\" /usr/lib/x86_64-linux-gnu/libapparmor.so.1 \"' > /etc/dracut.conf.d/10-apparmor.conf"
 
     # Pull the dracut `mdraid` module (+ its mdadm binary) into the initramfs so
@@ -196,6 +198,7 @@
       ansible.builtin.lineinfile:
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
+        regexp: "> /etc/dracut.conf.d/15-mdraid.conf"
         line: "{{ kairos_dracut_indent }}    RUN echo 'add_dracutmodules+=\" mdraid \"' > /etc/dracut.conf.d/15-mdraid.conf"
       when: kairos_build_mdraid | default(false) | bool
 
@@ -213,6 +216,7 @@
       ansible.builtin.lineinfile:
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
+        regexp: "RUN mkdir -p /etc/mdadm && echo 'ARRAY /dev/md0 "
         line: "{{ kairos_dracut_indent }}    RUN mkdir -p /etc/mdadm && echo 'ARRAY /dev/md0 metadata={{ kairos_os_raid.metadata | default('1.0') }} name=md0 homehost=none devices={{ kairos_os_raid.devices | default([]) | map('regex_replace', '^', '/dev/disk/by-path/') | join(',') }}' > /etc/mdadm/mdadm.conf"
       when: kairos_build_mdraid | default(false) | bool
 
@@ -227,6 +231,7 @@
       ansible.builtin.lineinfile:
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
+        regexp: "> /etc/dracut.conf.d/16-mdadm-conf.conf"
         line: "{{ kairos_dracut_indent }}    RUN echo 'mdadmconf=\"yes\"' > /etc/dracut.conf.d/16-mdadm-conf.conf"
       when: kairos_build_mdraid | default(false) | bool
 
