@@ -19,6 +19,32 @@
   changed_when: true
   failed_when: false
 
+# BCM keeps a one-shot `nextinstallmode` that overrides `installmode` for the very
+# next boot. The node's own cloud-config disarm sets installmode=NOSYNC, which lands
+# here as nextinstallmode=NOSYNC and poisons the re-image: the installer applies it,
+# finds the category diskless, and aborts "Sync mode is NOSYNC, but this is a
+# diskless node". Clear it after arming, then prove it is gone.
+- name: Clear the one-shot nextinstallmode override left by the node's NOSYNC disarm
+  ansible.builtin.command:
+    cmd: cmsh
+    stdin: |
+      device
+      use {{ bcm_target_node }}
+      clear nextinstallmode
+      commit
+  delegate_to: bcm
+  when: bcm_target_node | default('', true) | length > 0
+  changed_when: true
+  failed_when: false
+
+- name: Assert the target node carries no stale NOSYNC override
+  ansible.builtin.command: cmsh -c "device; use \"{{ bcm_target_node }}\"; get nextinstallmode"
+  delegate_to: bcm
+  when: bcm_target_node | default('', true) | length > 0
+  register: dd_nextinstallmode
+  changed_when: false
+  failed_when: "'NOSYNC' in dd_nextinstallmode.stdout"
+
 - name: Register a fresh compute node (local-KVM / no target device)
   when: bcm_target_node | default('', true) | length == 0
   delegate_to: bcm
