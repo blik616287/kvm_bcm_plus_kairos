@@ -50,6 +50,82 @@
   changed_when: true
   failed_when: false
 
+- name: Reconcile the category disksetup with the dd-install
+  # See dd_disksetup_strip_glob in defaults/main.yml: BCM must not claim a disk
+  # the FINALIZE stage owns, or it re-partitions it on the next PXE boot.
+  when:
+    - deploy_dd_finalize_install | default(false) | bool
+    - dd_disksetup_reconcile | default(false) | bool
+  delegate_to: bcm
+  block:
+    - name: List the Kairos disks the category disksetup still claims
+      ansible.builtin.shell: |
+        cmsh -c "category use {{ kairos_profile }}; get disksetup" 2> /dev/null \
+          | grep -o '<blockdev[^>]*>[^<]*</blockdev>' \
+          | sed -e 's|<blockdev[^>]*>||' -e 's|</blockdev>||' -e 's|^/dev/||' \
+          | grep -E '{{ dd_disksetup_strip_glob }}' || true
+      register: dd_ds_claimed
+      changed_when: false
+
+    - name: Refuse to deploy while the category claims a Kairos disk
+      ansible.builtin.fail:
+        msg: >-
+          Category '{{ kairos_profile }}' claims Kairos-owned disks
+          ({{ dd_ds_claimed.stdout_lines | join(', ') }}). BCM re-partitions
+          these on every PXE boot, which would destroy the Kairos install and
+          re-provision the node in a loop. Either point dd_disksetup_xml_file at
+          a disksetup that omits them, or leave dd_category_datanode=true.
+      when:
+        - dd_ds_claimed.stdout_lines | length > 0
+        - not (dd_category_datanode | bool)
+        - dd_disksetup_xml_file | default('') | length == 0
+
+    - name: Give the category a diskless disksetup so BCM partitions nothing
+      # An empty <diskSetup></diskSetup> is rejected ("If diskless is not set,
+      # there should be at least one device") -- `diskless` is an XML element,
+      # not an attribute -- so point BCM at the diskless layout it ships.
+      # Multiline stdin, not `cmsh -c`: the one-liner form silently no-ops on
+      # some verbs (observed on `remove`, which returned rc=0 having removed
+      # nothing), which would read as success here.
+      ansible.builtin.command:
+        cmd: cmsh
+        stdin: |
+          category
+          use {{ kairos_profile }}
+          set disksetup {{ dd_disksetup_diskless_file }}
+          set datanode yes
+          commit
+      register: dd_ds_fix
+      changed_when: dd_ds_fix.rc == 0
+      when:
+        - dd_ds_claimed.stdout_lines | length > 0
+        - dd_category_datanode | bool
+        - dd_disksetup_xml_file | default('') | length == 0
+
+    - name: Apply the operator-supplied disksetup
+      # Multiline stdin for the same reason as the diskless task above.
+      ansible.builtin.command:
+        cmd: cmsh
+        stdin: |
+          category
+          use {{ kairos_profile }}
+          set disksetup {{ dd_disksetup_xml_file }}
+          commit
+      changed_when: true
+      when:
+        - dd_ds_claimed.stdout_lines | length > 0
+        - dd_disksetup_xml_file | default('') | length > 0
+
+    - name: Verify the category no longer claims a Kairos disk
+      ansible.builtin.shell: |
+        cmsh -c "category use {{ kairos_profile }}; get disksetup" 2> /dev/null \
+          | grep -o '<blockdev[^>]*>[^<]*</blockdev>' \
+          | sed -e 's|<blockdev[^>]*>||' -e 's|</blockdev>||' -e 's|^/dev/||' \
+          | grep -E '{{ dd_disksetup_strip_glob }}' || true
+      register: dd_ds_after
+      changed_when: false
+      failed_when: dd_ds_after.stdout_lines | length > 0
+
 - name: Set the category kernel parameters (serial console + stable NIC naming)
   ansible.builtin.command: >-
     cmsh -c "category; use {{ kairos_profile }}; set kernelparameters \"console=ttyS0,115200n8 net.ifnames=0 biosdevname=0\"; commit"

@@ -55,6 +55,8 @@ Everything it does is logged to **`/dev/shm/kairos-install.log`** on the node.
 | `kairos_profile` | which built artifact + BCM state to deploy |
 | `kairos_target_disk` | the disk `dd` overwrites (e.g. `/dev/vda` local, `/dev/nvme0n1` remote) — **explicit, never auto-guessed** |
 | `kairos_wipe_disks` | sibling disks to `wipefs` (clears stale LVM/RAID) |
+| `kairos_wipe_all_nvme` | finalize also wipes **every** NVMe namespace, not just the list (default `false`) |
+| `dd_disksetup_reconcile` | finalize installs: give the category a diskless disksetup + `datanode yes` so BCM never re-partitions Kairos disks (default `false`) |
 | `bcm_source_category` | category to clone for `<profile>` (default `default`) |
 | `bcm_target_node` | **remote only** — existing cmsh device to re-image |
 | `kairos_vm_mac` | local-KVM node MAC (registration) |

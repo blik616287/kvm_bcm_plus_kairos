@@ -43,7 +43,6 @@ echo 1 > /proc/sys/kernel/printk 2> /dev/null || true
 # reboot at the end.
 sync
 swapoff -a 2> /dev/null || true
-for d in ${WIPE_DISKS}; do [ -b "/dev/$d" ] && wipefs -a -f "/dev/$d" 2> /dev/null || true; done
 for mp in $(awk -v d="${DISK}" '$1 ~ ("^" d) {print $2}' /proc/mounts | sort -r); do
     umount -fl "$mp" 2> /dev/null || true
 done
@@ -51,6 +50,65 @@ umount -Rfl /localdisk 2> /dev/null || true
 vgchange -an 2> /dev/null || true
 mdadm --stop "${DISK}"* 2> /dev/null || true
 dmsetup remove_all 2> /dev/null || true
+udevadm settle --timeout=20 2> /dev/null || true
+# Release any md array that currently holds one of our target disks. A previous
+# install on this node leaves md metadata that udev/mdadm auto-assembles at boot,
+# under whatever md node it lands on (md127/md126, not the md0 we stop above); a
+# member still held by a live array cannot be wiped or re-created, so the create
+# below dies with "Device or resource busy" - and opaquely, because the wipe is
+# best-effort. Stop the owning arrays first, then assert the members came free.
+# Without this a RE-image of a node that already carries arrays fails where a
+# first install on a bare node succeeds.
+# The kernel records md membership on the MEMBER as holders/mdN (on the whole
+# disk, or on a partition of it); there is no reverse "md" link on a member.
+_md_holders() {
+    _hb=$(basename "$(readlink -f "$1")")
+    for _h in /sys/class/block/"${_hb}"/holders/md* /sys/class/block/"${_hb}"/"${_hb}"*/holders/md*; do
+        [ -e "${_h}" ] && basename "${_h}"
+    done | sort -u
+}
+_release_md_members() {
+    for _m in "$@"; do
+        [ -b "${_m}" ] || continue
+        for _md in $(_md_holders "${_m}"); do
+            echo "[kairos-finalize $(date)] $(basename "${_m}") is held by ${_md}; stopping it"
+            mdadm --stop "/dev/${_md}" 2> /dev/null || true
+        done
+    done
+    udevadm settle --timeout=20 2> /dev/null || true
+}
+# Loud, early failure naming the device beats an opaque mdadm --create abort later.
+_assert_md_members_free() {
+    for _m in "$@"; do
+        [ -b "${_m}" ] || continue
+        _held=$(_md_holders "${_m}" | tr '\n' ' ')
+        if [ -n "${_held}" ]; then
+            echo "[kairos-finalize $(date)] FATAL: $(basename "${_m}") still held by ${_held% } after stop; refusing to build a partial array"
+            exit 1
+        fi
+    done
+}
+
+# Wipe only AFTER the holders are released: wiping signatures out from under a live
+# device is what produced the EBUSY/partprobe failures. That includes arrays a
+# previous install left behind, which auto-assemble under md127/md126 and so are
+# not caught by the `mdadm --stop "${DISK}"*` above.
+_WIPE="${WIPE_DISKS}"
+{% if kairos_wipe_all_nvme | default(false) | bool %}
+# kairos_wipe_all_nvme: the var list is a floor, not the truth -- names are not
+# stable across boots -- so union it with every nvme namespace the kernel exposes,
+# including the 2nd-controller paths (*c*n*) the var list omits. Destroys every
+# nvme on the node; only for profiles where Kairos owns all of them.
+for _wd in /sys/block/nvme*n1; do
+    [ -e "${_wd}" ] || continue
+    _wb=$(basename "${_wd}")
+    case " ${_WIPE} " in *" ${_wb} "*) ;; *) _WIPE="${_WIPE} ${_wb}" ;; esac
+done
+{% endif %}
+_WIPE_DEVS=""
+for d in ${_WIPE}; do _WIPE_DEVS="${_WIPE_DEVS} /dev/${d}"; done
+_release_md_members ${_WIPE_DEVS}
+for d in ${_WIPE}; do [ -b "/dev/$d" ] && wipefs -a -f "/dev/$d" 2> /dev/null || true; done
 udevadm settle --timeout=20 2> /dev/null || true
 
 # --- Drive selection. kairos_raid_select controls how the kairos_os_raid /
@@ -70,11 +128,23 @@ _resolve_dev() {
         *) echo "/dev/$1" ;;
     esac
 }
+
 {% if (kairos_raid_select | default('name')) == 'size' %}
 # size mode: OS mirror = smallest N (N = len(kairos_os_raid.devices)), data = the rest.
 # Assumes a single data array (the DGX 2x-OS + 8x-data layout).
 _OSN={{ kairos_os_raid.devices | length }}
-_ALL=$(for _d in /sys/block/nvme*n1; do [ -e "${_d}" ] || continue; printf '%s %s\n' "$(cat "${_d}/size" 2> /dev/null || echo 0)" "$(basename "${_d}")"; done | sort -n | awk '{print $2}')
+_ALL=$(for _d in /sys/block/nvme*n1; do
+    [ -e "${_d}" ] || continue
+    _b=$(basename "${_d}")
+    # skip the 2nd-controller paths (nvmeXcYn1): same physical drive seen twice
+    case "${_b}" in *c*n*) continue ;; esac
+    # skip anything whose size we cannot read: a silent 0 sorts first and would be
+    # picked for the OS mirror
+    _sz=$(cat "${_d}/size" 2> /dev/null) || continue
+    [ -n "${_sz}" ] || continue
+    [ "${_sz}" -gt 0 ] 2> /dev/null || continue
+    printf '%s %s\n' "${_sz}" "${_b}"
+done | sort -n | awk '{print $2}')
 AUTO_OS_MEMBERS=""
 AUTO_DATA_MEMBERS=""
 _i=0
@@ -93,18 +163,72 @@ echo "[kairos-finalize $(date)] size-selected data array: ${AUTO_DATA_MEMBERS}"
 OS_MEMBERS="${AUTO_OS_MEMBERS}"
 {% else %}
 OS_MEMBERS=""
-for _s in {% for d in kairos_os_raid.devices %}{{ d }} {% endfor %}; do OS_MEMBERS="${OS_MEMBERS}$(_resolve_dev "${_s}") "; done
+for _s in {% for d in kairos_os_raid.devices %}{{ d }} {% endfor %}; do
+    _r=$(_resolve_dev "${_s}")
+    if [ -z "${_r}" ] || [ ! -b "${_r}" ]; then
+        echo "[kairos-finalize $(date)] FATAL: kairos_os_raid device '${_s}' did not resolve to a block device (got '${_r}'); refusing to build a partial array"
+        exit 1
+    fi
+    OS_MEMBERS="${OS_MEMBERS}${_r} "
+done
+{% endif %}
+{% if kairos_os_raid_assert_smallest | default(true) %}
+# Guard the selection: a by-path/name spec that resolves is not necessarily the
+# RIGHT disk. A pin that lands on a data disk builds a RAID1 whose members differ
+# in size, which thrashes and hangs boot. Members must match each other and be
+# the {{ kairos_os_raid.devices | length }} smallest whole disks present.
+_OS_SIZES=""
+for _gm in ${OS_MEMBERS}; do
+    _gz=$(cat "/sys/class/block/$(basename "${_gm}")/size" 2> /dev/null) || _gz=""
+    if [ -z "${_gz}" ]; then
+        echo "[kairos-finalize $(date)] FATAL: cannot read the size of OS mirror member '${_gm}'"
+        exit 1
+    fi
+    _OS_SIZES="${_OS_SIZES} ${_gz}"
+done
+_FIRST=$(echo ${_OS_SIZES} | awk '{print $1}')
+for _gz in ${_OS_SIZES}; do
+    if [ "${_gz}" != "${_FIRST}" ]; then
+        echo "[kairos-finalize $(date)] FATAL: OS mirror members differ in size (${_OS_SIZES}); check the device specs"
+        exit 1
+    fi
+done
+_SMALLEST=$(for _gd in /sys/block/nvme*n1; do
+    [ -e "${_gd}" ] || continue
+    _gb=$(basename "${_gd}")
+    case "${_gb}" in *c*n*) continue ;; esac
+    _gzz=$(cat "${_gd}/size" 2> /dev/null) || continue
+    [ -n "${_gzz}" ] || continue
+    [ "${_gzz}" -gt 0 ] 2> /dev/null || continue
+    printf '%s %s\n' "${_gzz}" "${_gb}"
+done | sort -n | awk -v n={{ kairos_os_raid.devices | length }} 'NR <= n {print $2}' | sort | tr '\n' ' ')
+_MEMBERS=$(for _gm in ${OS_MEMBERS}; do basename "${_gm}"; done | sort | tr '\n' ' ')
+if [ "${_SMALLEST}" != "${_MEMBERS}" ]; then
+    echo "[kairos-finalize $(date)] FATAL: OS mirror members '${_MEMBERS% }' are not the {{ kairos_os_raid.devices | length }} smallest disks '${_SMALLEST% }'; check the device specs"
+    exit 1
+fi
+echo "[kairos-finalize $(date)] OS mirror selection OK: ${_MEMBERS% } (${_FIRST} sectors each)"
 {% endif %}
 echo "[kairos-finalize $(date)] building OS RAID1 ${DISK} (metadata {{ kairos_os_raid.metadata | default('1.0') }}) over: ${OS_MEMBERS}"
 mdadm --stop "${DISK}" 2> /dev/null || true
+_release_md_members ${OS_MEMBERS}
+_assert_md_members_free ${OS_MEMBERS}
 for m in ${OS_MEMBERS}; do
     for mp in $(awk -v d="$m" '$1 ~ ("^" d) {print $2}' /proc/mounts | sort -r); do umount -fl "$mp" 2> /dev/null || true; done
     wipefs -a -f "$m" 2> /dev/null || true
     mdadm --zero-superblock "$m" 2> /dev/null || true
 done
+# --name/--homehost pin the array identity: without them mdadm stamps it
+# "<hostname>:0" with the installer's hostname, which the booted node does not
+# match, so udev assembles it as a foreign array (md127, auto-read-only).
+# --homehost=any is the documented "assemble on any host" value; a literal
+# --homehost=none records "none:md0", which is just another foreign host.
+# --assume-clean skips the initial resync: the dd below overwrites both members with
+# the same image anyway, and the resync never finished before the forced reboot.
 yes | mdadm --create "${DISK}" --level=1 --metadata={{ kairos_os_raid.metadata | default('1.0') }} \
-    --raid-devices={{ kairos_os_raid.devices | length }} --run ${OS_MEMBERS} \
-    || echo "[kairos-finalize $(date)] FATAL: mdadm --create ${DISK} failed"
+    --raid-devices={{ kairos_os_raid.devices | length }} \
+    --name=md0 --homehost=any --assume-clean --run ${OS_MEMBERS} \
+    || { echo "[kairos-finalize $(date)] FATAL: mdadm --create ${DISK} failed"; exit 1; }
 udevadm settle --timeout=20 2> /dev/null || true
 mdadm --detail "${DISK}" 2>&1 | grep -E 'Raid Level|State|Active Devices' || true
 {% endif %}
@@ -216,6 +340,7 @@ for _s in {% for d in arr.devices %}{{ d }} {% endfor %}; do DATA_MEMBERS="${DAT
 DATA_COUNT=$(set -- ${DATA_MEMBERS}; echo $#)
 echo "[kairos-finalize $(date)] building data array {{ arr.name }} (raid{{ arr.level }}) over: ${DATA_MEMBERS}"
 mdadm --stop "/dev/md/{{ arr.name }}" 2> /dev/null || true
+_release_md_members ${DATA_MEMBERS}
 for m in ${DATA_MEMBERS}; do wipefs -a -f "$m" 2> /dev/null || true; mdadm --zero-superblock "$m" 2> /dev/null || true; done
 yes | mdadm --create "/dev/md/{{ arr.name }}" --level={{ arr.level }} \
     --raid-devices="${DATA_COUNT}" --run ${DATA_MEMBERS} \

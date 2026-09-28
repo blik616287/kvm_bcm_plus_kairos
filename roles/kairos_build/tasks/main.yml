@@ -502,7 +502,7 @@
         ESP=""
         for p in "${LOOP}"p*; do
           [ -b "$p" ] || continue
-          [ "$(blkid -o value -s TYPE "$p" 2>/dev/null)" = vfat ] && { ESP="$p"; break; }
+          [ "$(blkid -p -o value -s TYPE "$p" 2>/dev/null)" = vfat ] && { ESP="$p"; break; }
         done
         if [ -z "$ESP" ]; then
           errs+=("[no EFI System Partition (vfat) found]")
@@ -518,7 +518,7 @@
         found_active=0
         for p in "${LOOP}"p*; do
           [ -b "$p" ] || continue
-          case "$(blkid -o value -s TYPE "$p" 2>/dev/null)" in ext2|ext3|ext4) ;; *) continue ;; esac
+          case "$(blkid -p -o value -s TYPE "$p" 2>/dev/null)" in ext2|ext3|ext4) ;; *) continue ;; esac
           mount -o ro "$p" /tmp/kairos-verify-state 2>/dev/null || continue
           if [ -f /tmp/kairos-verify-state/cOS/active.img ]; then
             found_active=1

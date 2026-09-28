@@ -550,6 +550,22 @@ Force a full rebuild with `make clean && make all` (local-KVM) or `make clean &&
 Milestones and notable changes, newest first. Each entry links its JIRA ticket
 (project `IN`) and PR. New milestones append here as part of the same PR.
 
+### 2026-09-28
+
+- **dgx02 profile: slot-pinned OS mirror, JBOD data disks, and re-imaging a node
+  that already carries arrays** ([#63](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/63)) —
+  `profiles/kairos-dgx2.yml` pins the OS RAID1 by PCIe slot and leaves the eight data
+  disks bare for the storage layer. The finalize now stops md arrays a previous install
+  left assembled (found via each member's `holders/`, since they come up as
+  `md127`/`md126` rather than `md0`) before wiping or re-creating, asserts the mirror
+  members match in size and are the smallest disks, and fails instead of continuing when
+  `mdadm --create` fails. The OS mirror is created with `--homehost=any` so it assembles
+  as a local array on the booted node. Two opt-in, node-wide settings back the profile:
+  `kairos_wipe_all_nvme` and `dd_disksetup_reconcile` (diskless disksetup + `datanode yes`
+  on the category so BCM never re-partitions a Kairos disk). Both default off, so
+  `dgx-raid`, `dgx-raid-kvm` and `palette-appliance` keep their current category and
+  wipe behaviour.
+
 ### 2026-09-24
 
 - **The licensed artifact set is group_vars, not a profile literal**
