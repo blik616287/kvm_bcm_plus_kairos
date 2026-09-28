@@ -257,6 +257,32 @@
           RUN apt-get update && apt-get install -y --no-install-recommends {{ kairos_extra_apt_packages | join(' ') }} && rm -rf /var/lib/apt/lists/*
       when: kairos_extra_apt_packages | default([]) | length > 0
 
+    # dracut assembles the md array only when rd.auto is on the kernel line. The
+    # day-2 Palette path never runs the raw's post-install bootargs patch, so the
+    # provider image must carry rd.auto in its own /etc/cos/bootargs.cfg instead
+    # of depending on the node's grubenv alone. provider-image and iso-image are
+    # both FROM +base-image, so this one RUN reaches both. Guarded so UKI images
+    # (no bootargs.cfg) are skipped, and idempotent so a re-run cannot duplicate
+    # the token -- the same shape as the existing
+    # systemd.unified_cgroup_hierarchy RUN just below it.
+    - name: Patch Dockerfile — pin rd.auto on the image cmdline (kairos_build_mdraid)
+      ansible.builtin.blockinfile:
+        path: "{{ canvos_dir }}/Dockerfile"
+        insertafter: 'Add any other image customizations here'
+        marker: "# {mark} mdraid rd.auto"
+        block: |
+          RUN if [ -f /etc/cos/bootargs.cfg ] && ! grep -Fq "rd.auto=1" /etc/cos/bootargs.cfg; then \
+                  sed -i 's|\(set baseCmd="[^"]*\)"|\1 rd.auto=1"|' /etc/cos/bootargs.cfg; \
+              fi
+      when: kairos_build_mdraid | default(false) | bool
+
+    - name: Assert rd.auto lands in the image cmdline (kairos_build_mdraid)
+      ansible.builtin.assert:
+        that:
+          - "'rd.auto=1' in lookup('file', canvos_dir ~ '/Dockerfile')"
+        fail_msg: "CanvOS Dockerfile does not pin rd.auto=1, so the provider image's own bootargs.cfg lacks it and dracut will not assemble the OS mirror after a Palette upgrade."
+      when: kairos_build_mdraid | default(false) | bool
+
     - name: Render custom k8s_version.json (overrides upstream CanvOS file)
       ansible.builtin.copy:
         content: "{{ kairos_k8s_versions | to_nice_json }}\n"
@@ -305,6 +331,30 @@
 
 # ---- Generate raw disk image ----
 
+# Stamp the raw build's INPUTS the same way the ISO is stamped. The raw's own
+# short-circuit below reuses a cached .raw whenever the file merely exists, and
+# the bootargs patch, the finalize and the mdraid assertion all live INSIDE that
+# block -- so a template or profile edit is inert on any host that already has a
+# raw: it never reaches the dd'd image. The stamp combines the ISO's inputs
+# (roles, profiles, inventory, cloud-config) with the ISO bytes themselves: a
+# cloud-config change moves the inputs but not the installed payload, while a
+# CanvOS bump moves the payload but not the inputs, so neither alone suffices.
+- name: Compute the raw-disk build-input stamp
+  ansible.builtin.shell: |
+    set -eu
+    iso=$(sha256sum {{ build_dir }}/{{ iso_name }}.iso | awk '{print $1}')
+    printf '%s %s\n' '{{ kairos_iso_stamp.stdout }}' "$iso" | sha256sum | awk '{print $1}'
+  register: kairos_raw_stamp
+  changed_when: false
+  when: kairos_build_raw_disk | default(true) | bool
+
+- name: Read the recorded raw-disk build-input stamp
+  ansible.builtin.command: cat {{ build_dir }}/.raw-stamp-{{ kairos_profile }}
+  register: kairos_raw_stamp_rec
+  changed_when: false
+  failed_when: false
+  when: kairos_build_raw_disk | default(true) | bool
+
 - name: Check if raw disk exists
   ansible.builtin.stat:
     path: "{{ raw_disk_path }}"
@@ -313,7 +363,8 @@
 - name: Generate raw disk image via QEMU
   when:
     - kairos_build_raw_disk | default(true) | bool
-    - not raw_disk_stat.stat.exists
+    - (not raw_disk_stat.stat.exists)
+      or ((kairos_raw_stamp_rec.stdout | default('')) != (kairos_raw_stamp.stdout | default('')))
   block:
     - name: Generate BCM SSH key pair if missing
       ansible.builtin.shell: |
@@ -676,6 +727,12 @@
       ansible.builtin.shell: |
         cd {{ build_dir }}
         sha256sum {{ kairos_profile }}-disk.raw > {{ kairos_profile }}-disk.raw.sha256
+
+    - name: Record the raw-disk build-input stamp
+      ansible.builtin.copy:
+        content: "{{ kairos_raw_stamp.stdout }}\n"
+        dest: "{{ build_dir }}/.raw-stamp-{{ kairos_profile }}"
+        mode: "0644"
 
 - name: Restore ownership of build artifacts to invoking user
   ansible.builtin.file:

@@ -66,15 +66,6 @@ stages:
       commands:
         - systemctl restart sshd || systemctl restart ssh || true
         - systemctl disable --now fail2ban 2>/dev/null || true
-{% if bcm_ssh_key_content is defined and bcm_ssh_key_content | length > 0 %}
-    - name: "Install BCM SSH key"
-      files:
-        - path: /var/lib/bcm/bcm-key
-          content: |
-{{ bcm_ssh_key_content | indent(12, first=true) }}
-          permissions: 0600
-          owner: 0
-          group: 0
     - name: "mdraid: pin rd.auto on the kernel line via the OEM grubenv"
       commands:
         - |
@@ -91,6 +82,16 @@ stages:
           if [ -f /oem/grubenv ] && command -v grub2-editenv > /dev/null 2>&1; then
             grub2-editenv /oem/grubenv set extra_active_cmdline="rd.auto=1 net.ifnames=0 biosdevname=0"
           fi
+
+{% if bcm_ssh_key_content is defined and bcm_ssh_key_content | length > 0 %}
+    - name: "Install BCM SSH key"
+      files:
+        - path: /var/lib/bcm/bcm-key
+          content: |
+{{ bcm_ssh_key_content | indent(12, first=true) }}
+          permissions: 0600
+          owner: 0
+          group: 0
     - name: "BCM integration: set NOSYNC + start cmd"
       commands:
         - |
