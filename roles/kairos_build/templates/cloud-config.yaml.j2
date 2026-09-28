@@ -78,19 +78,43 @@ stages:
     - name: "BCM integration: set NOSYNC + start cmd"
       commands:
         - |
+          # Interface-agnostic network gate. BCM's category sets net.ifnames=0,
+          # but the installed Kairos cmdline is sourced from the image's own
+          # bootargs.cfg and may not carry it, so eth0 need not exist at all.
+          # Resolve the egress interface for the BCM host instead of naming one.
           for i in $(seq 1 60); do
-            ip -4 addr show eth0 2>/dev/null | grep -q "inet " && \
+            BCM_IF=$(ip route get {{ bcm_internal_ip }} 2>/dev/null | awk '{for(j=1;j<=NF;j++) if($j=="dev"){print $(j+1); exit}}')
+            [ -n "${BCM_IF}" ] && \
+              ip -4 addr show "${BCM_IF}" 2>/dev/null | grep -q "inet " && \
               ping -c1 -W2 {{ bcm_internal_ip }} >/dev/null 2>&1 && break
             sleep 5
-          done || true
+          done
           ping -c1 -W2 {{ bcm_internal_ip }} >/dev/null 2>&1 || exit 0
           NODE_MAC=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}' | xargs -I{} ip link show {} 2>/dev/null | awk '/ether/{print $2}')
-          export NODE_NAME=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          # BCM keys each device on the MAC of the NIC it provisioned through,
+          # which need not be the default-route NIC -- and a DGX answers on the
+          # same address across ports, so the MAC that routes is often not the
+          # MAC BCM holds. Fetch the device list once, match every local MAC,
+          # then the routed IP, and fall back to the hostname only last. That
+          # fallback is the failure mode that matters: `cmsh device use
+          # edge-<uuid>` cannot find the device, so the NOSYNC disarm below
+          # silently never commits and the node stays armed for reinstall.
+          BCM_DEVLIST=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 -o LogLevel=ERROR -i /var/lib/bcm/bcm-key \
               root@{{ bcm_internal_ip }} \
-              "echo -e 'device\nlist' | cmsh 2>/dev/null | grep -i '${NODE_MAC}' | awk '{print \$2}'" \
-              2>/dev/null | grep -oE '^[a-zA-Z0-9_-]+$' | tail -1)
-          [ -z "${NODE_NAME}" ] && export NODE_NAME=$(hostname)
+              "echo -e 'device\nlist' | cmsh 2>/dev/null" 2>/dev/null)
+          export NODE_NAME=""
+          for _mac in $(cat /sys/class/net/*/address 2>/dev/null | tr 'A-Z' 'a-z'); do
+            [ "${_mac}" = "00:00:00:00:00:00" ] && continue
+            NODE_NAME=$(printf '%s\n' "${BCM_DEVLIST}" | awk -v m="${_mac}" 'tolower($3)==m {print $2; exit}')
+            [ -n "${NODE_NAME}" ] && break
+          done
+          if [ -z "${NODE_NAME}" ]; then
+            _ip=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+            NODE_NAME=$(printf '%s\n' "${BCM_DEVLIST}" | awk -v ip="${_ip}" '$5==ip {print $2; exit}')
+          fi
+          [ -z "${NODE_NAME}" ] && NODE_NAME=$(hostname)
+          export NODE_NAME
           hostnamectl set-hostname "${NODE_NAME}" 2>/dev/null || hostname "${NODE_NAME}" 2>/dev/null || true
           # Push BCM-derived labels to the Palette edge-host record via admin
           # API. Stylus's own cloud-config merge doesn't pick up /oem/*.yaml
