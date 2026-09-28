@@ -82,6 +82,18 @@ _resolve_dev() {
     esac
 }
 
+# Enforce a slot-stable selection. `name` resolves /dev/<spec> from the kernel's
+# nvmeXn1 numbering, which is NOT stable across installs on these DGX systems,
+# so a name-pinned OS mirror can silently span a data disk -- a size-mismatched
+# mirror that thrashes and hangs boot. `path` and `id` resolve through udev
+# symlinks whose identity does not move; `size` derives the members directly.
+# Anything else is refused here rather than diagnosed from an opaque mdadm abort
+# or, worse, a mirror whose members change identity on the next boot.
+if [ "${_SELECT}" = "name" ]; then
+    echo "[kairos-finalize $(date)] FATAL: kairos_raid_select='name' is not slot-stable; set 'path' (PCIe slot) or 'id' (model+serial); 'size' derives the smallest N"
+    exit 1
+fi
+
 # Release any md array that currently holds one of our target members. A previous
 # install on this node leaves md metadata that udev/mdadm auto-assembles at boot
 # (--name/--homehost make that a certainty, see below); a member still held by a

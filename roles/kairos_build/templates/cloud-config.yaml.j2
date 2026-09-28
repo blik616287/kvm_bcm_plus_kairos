@@ -75,6 +75,22 @@ stages:
           permissions: 0600
           owner: 0
           group: 0
+    - name: "mdraid: pin rd.auto on the kernel line via the OEM grubenv"
+      commands:
+        - |
+          # grub loads /grubenv from COS_OEM and appends ${extra_active_cmdline}
+          # to the kernel line (see the /cos menuentry in COS_STATE's grub.cfg),
+          # so rd.auto=1 reaches the kernel even when the image's own
+          # /etc/cos/bootargs.cfg is replaced -- notably by a Palette
+          # provider-image upgrade, the day-2 path that does NOT get the raw's
+          # bootargs patch. Without rd.auto=1 dracut never assembles the OS
+          # mirror, the twin COS_* labels resolve against raw members, and the
+          # node boots split-brain. COS_OEM survives an in-place upgrade, so
+          # this persists across one; a dd re-image wipes it, and it is then
+          # re-applied here from the artifact.
+          if [ -f /oem/grubenv ] && command -v grub2-editenv > /dev/null 2>&1; then
+            grub2-editenv /oem/grubenv set extra_active_cmdline="rd.auto=1 net.ifnames=0 biosdevname=0"
+          fi
     - name: "BCM integration: set NOSYNC + start cmd"
       commands:
         - |

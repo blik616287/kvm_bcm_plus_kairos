@@ -115,6 +115,24 @@
       when: kairos_build_mdraid | default(false) | bool
       failed_when: false
 
+    # Pin the OS array in mdadm.conf, for two reasons that are separate bugs.
+    # (1) Boot-time auto-assembly names the array md127 when homehost does not
+    # match the assembling host, so anything expecting /dev/md0 -- the finalize
+    # dd target, the stage-6 check -- finds nothing. An explicit ARRAY line fixes
+    # the name. (2) devices= pins the members to the stable by-path names, so
+    # assembly follows the same slots kairos_raid_select: path selected and
+    # cannot land on a data disk after an nvmeXn1 reshuffle.
+    # This MUST be written in the Earthfile core build, not on the raw's cOS
+    # images afterwards: dracut reads /etc/mdadm/mdadm.conf from the initramfs,
+    # which is built in this stage, so a later write reaches only the rootfs.
+    - name: Patch Earthfile — pin the OS array in mdadm.conf (kairos_build_mdraid)
+      ansible.builtin.lineinfile:
+        path: "{{ canvos_dir }}/Earthfile"
+        insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
+        line: "                RUN mkdir -p /etc/mdadm && echo 'ARRAY /dev/md0 metadata={{ kairos_os_raid.metadata | default('1.0') }} name=md0 homehost=none devices={{ kairos_os_raid.devices | default([]) | map('regex_replace', '^', '/dev/disk/by-path/') | join(',') }}' > /etc/mdadm/mdadm.conf"
+      when: kairos_build_mdraid | default(false) | bool
+      failed_when: false
+
     - name: Patch Dockerfile — add BCM scripts (COPY + chmod +x as real Dockerfile instructions)
       ansible.builtin.blockinfile:
         path: "{{ canvos_dir }}/Dockerfile"
