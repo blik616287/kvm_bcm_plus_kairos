@@ -12,6 +12,13 @@ kairos_profile: "default-kairos"
 # previously hardcoded; user overrides via inventory's `kairos_canvos_args`
 # dict are merged on top, and arbitrary new keys (e.g. anything else CanvOS
 # accepts) flow through to the rendered .arg verbatim.
+# CanvOS tree to build from. Pinned by version so the tree that gets patched and
+# the tree that gets built are the same on every host and every run. The legacy
+# `CanvOS` symlink is mutable (it has been repointed between releases), and
+# patching a symlink while a different tree is built silently ships an
+# unpatched image. To move to a new CanvOS release, bump this one value.
+kairos_canvos_version: "v4.9.36"
+
 kairos_canvos_defaults:
   CUSTOM_TAG: "bcm-test"
   IMAGE_REGISTRY: "ttl.sh"

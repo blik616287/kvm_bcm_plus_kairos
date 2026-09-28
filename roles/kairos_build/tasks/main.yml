@@ -12,7 +12,7 @@
 
 - name: Resolve effective CanvOS .arg dict (defaults | user overrides)
   ansible.builtin.set_fact:
-    canvos_dir: "{{ e2e_dir }}/CanvOS"
+    canvos_dir: "{{ e2e_dir }}/CanvOS-{{ kairos_canvos_version }}"
     kairos_canvos_args_effective: "{{ kairos_canvos_defaults | combine(kairos_canvos_args | default({})) }}"
 
 - name: Derive pipeline-load-bearing facts from the merged .arg dict
@@ -32,6 +32,7 @@
   ansible.builtin.git:
     repo: https://github.com/spectrocloud/CanvOS.git
     dest: "{{ canvos_dir }}"
+    version: "{{ kairos_canvos_version }}"
   when: not canvos_stat.stat.exists
 
 # ---- Build Kairos ISO ----
@@ -47,12 +48,36 @@
     path: "{{ build_dir }}/{{ iso_name }}.iso"
   register: kairos_iso_stat
 
+# Stamp the build's INPUTS. The day-1 short-circuit below reuses a cached ISO
+# whenever the .iso file merely exists -- and because every Earthfile and
+# Dockerfile patch AND ./earthly.sh +iso live INSIDE that block, a cached ISO
+# makes any later patch inert on this host: it never reaches the ISO, the
+# rootfs, or the initramfs. Stamping the inputs means editing a role, profile,
+# or overlay forces a rebuild instead of silently shipping the old image.
+- name: Compute the ISO build-input stamp
+  ansible.builtin.shell: |
+    find {{ e2e_dir }}/roles/kairos_build {{ e2e_dir }}/files/canvos \
+         {{ e2e_dir }}/profiles/{{ kairos_profile }}.yml \
+         {{ e2e_dir }}/inventory/group_vars/all.yml \
+         -type f -print0 2>/dev/null \
+      | sort -z | xargs -0 sha256sum 2>/dev/null | sha256sum | awk '{print $1}'
+  register: kairos_iso_stamp
+  changed_when: false
+
+- name: Read the recorded ISO build-input stamp
+  ansible.builtin.command: cat {{ build_dir }}/.iso-stamp-{{ kairos_profile }}
+  register: kairos_iso_stamp_rec
+  changed_when: false
+  failed_when: false
+
 # Day-1 (raw_disk=true) skips this when the ISO already exists in build/.
 # Day-2 (raw_disk=false) always runs — the goal is to push provider images
 # to the registry, no local-artifact short-circuit applies.
 - name: Build Kairos ISO
   when:
-    - not kairos_iso_stat.stat.exists or not (kairos_build_raw_disk | default(true) | bool)
+    - (not kairos_iso_stat.stat.exists)
+      or (kairos_iso_stamp_rec.stdout | default('') != kairos_iso_stamp.stdout)
+      or not (kairos_build_raw_disk | default(true) | bool)
   block:
     - name: Generate .arg file from merged dict
       ansible.builtin.template:
@@ -81,12 +106,73 @@
         regexp: 'apt-get install --no-install-recommends kbd'
         replace: 'apt-get install --no-install-recommends wget ifupdown nfs-common {{ "mdadm " if (kairos_build_mdraid | default(false) | bool) else "" }}kbd'
 
+    # The replace above is a no-op when the apt line changes shape in a new
+    # release, which would leave dracut unable to build the mdraid initramfs.
+    # Assert the patched text is present rather than trusting the no-op.
+    - name: Assert mdadm landed in the CanvOS core-build package list (kairos_build_mdraid)
+      ansible.builtin.assert:
+        that:
+          - "'nfs-common mdadm kbd' in lookup('file', canvos_dir ~ '/Earthfile')"
+        fail_msg: "CanvOS Earthfile package list has no 'nfs-common mdadm kbd' — its apt line shape changed, so mdadm is not installed in the core build and the mdraid initramfs cannot be built."
+      when: kairos_build_mdraid | default(false) | bool
+
+    # CanvOS writes `RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get
+    # upgrade ...`. The env assignment binds only to `apt-get update`, so the
+    # upgrade runs with debconf's default Dialog frontend; with no controlling
+    # tty that falls back to Teletype and prompts on stdin, and any package whose
+    # config script dereferences an unset debconf value dies mid-upgrade.
+    # console-setup 1.226ubuntu1.1 (noble-updates) does exactly this, failing
+    # dpkg 100 with "sed: -e expression #1, char 8: unterminated `s' command".
+    # Setting the frontend once for the whole stage fixes the class, not just
+    # that one package. The ENV is placed at the anchor's own indent. Remove-
+    # then-insert keeps this stable: a re-run rewrites identical bytes and
+    # reports unchanged rather than duplicating the line.
+    - name: Patch Earthfile — run the base-image apt stage noninteractively
+      ansible.builtin.shell: |
+        set -eu
+        f={{ canvos_dir }}/Earthfile
+        before=$(sha256sum "$f" | cut -d' ' -f1)
+        sed -i '/^[[:space:]]*ENV DEBIAN_FRONTEND=noninteractive$/d' "$f"
+        i=$(grep -nE '^[[:space:]]*LET APT_UPGRADE_FLAGS=' "$f" | head -1 | cut -d: -f1)
+        [ -n "$i" ] || { echo "APT_UPGRADE_FLAGS anchor not found in $f" >&2; exit 1; }
+        ind=$(sed -n "${i}p" "$f" | sed 's/LET .*//')
+        awk -v n="$i" -v ind="$ind" 'NR==n{print ind "ENV DEBIAN_FRONTEND=noninteractive"} {print}' "$f" > "$f.tmp"
+        mv "$f.tmp" "$f"
+        after=$(sha256sum "$f" | cut -d' ' -f1)
+        if [ "$before" = "$after" ]; then echo unchanged; else echo changed; fi
+      register: kairos_apt_env_patch
+      changed_when: "'changed' in kairos_apt_env_patch.stdout"
+
+    - name: Assert the base-image apt stage is noninteractive
+      ansible.builtin.assert:
+        that:
+          - "'ENV DEBIAN_FRONTEND=noninteractive' in lookup('file', canvos_dir ~ '/Earthfile')"
+        fail_msg: "CanvOS Earthfile base-image stage is not noninteractive — apt can then fail on a debconf prompt (console-setup 1.226ubuntu1.1 fails this way with 'unterminated s command')."
+
+    # Resolve the dracut guard's indentation at runtime instead of hardcoding it.
+    # CanvOS releases nest this IF differently (v4.9.36 at 12 spaces,
+    # v4.10.0-rc.2 at 16), and a line inserted at the wrong depth lands outside
+    # the block that runs dracut — the conf files get written but never reach the
+    # initramfs. Fails loudly if a release renames or drops the guard, rather
+    # than silently producing an initrd with no mdraid and no pinned array.
+    - name: Locate the dracut FIPS guard in the CanvOS Earthfile
+      ansible.builtin.shell: |
+        set -eu
+        i=$(grep -nE '^[[:space:]]*IF \[ "\$FIPS_ENABLED" = "false" \]' {{ canvos_dir }}/Earthfile | head -1 | cut -d: -f1)
+        [ -n "$i" ] || { echo "dracut FIPS guard not found in {{ canvos_dir }}/Earthfile" >&2; exit 1; }
+        sed -n "${i}p" {{ canvos_dir }}/Earthfile | sed 's/IF \[.*//' | tr -d '\n'
+      register: kairos_dracut_guard
+      changed_when: false
+
+    - name: Record the dracut guard indentation
+      ansible.builtin.set_fact:
+        kairos_dracut_indent: "{{ kairos_dracut_guard.stdout }}"
+
     - name: Patch Earthfile — skip dracut nfit
       ansible.builtin.lineinfile:
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
-        line: "                RUN echo 'omit_dracutmodules+=\" nfit \"' > /etc/dracut.conf.d/99-skip-nfit.conf"
-      failed_when: false
+        line: "{{ kairos_dracut_indent }}    RUN echo 'omit_dracutmodules+=\" nfit \"' > /etc/dracut.conf.d/99-skip-nfit.conf"
 
     # Ubuntu 26.04 ships systemd 259 built +APPARMOR, which dlopens
     # libapparmor.so.1 when it execs a service. The Kairos initramfs build does
@@ -99,8 +185,7 @@
       ansible.builtin.lineinfile:
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
-        line: "                RUN echo 'install_items+=\" /usr/lib/x86_64-linux-gnu/libapparmor.so.1 \"' > /etc/dracut.conf.d/10-apparmor.conf"
-      failed_when: false
+        line: "{{ kairos_dracut_indent }}    RUN echo 'install_items+=\" /usr/lib/x86_64-linux-gnu/libapparmor.so.1 \"' > /etc/dracut.conf.d/10-apparmor.conf"
 
     # Pull the dracut `mdraid` module (+ its mdadm binary) into the initramfs so
     # the node can `mdadm --assemble` its OS array in the initqueue, before the
@@ -111,9 +196,8 @@
       ansible.builtin.lineinfile:
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
-        line: "                RUN echo 'add_dracutmodules+=\" mdraid \"' > /etc/dracut.conf.d/15-mdraid.conf"
+        line: "{{ kairos_dracut_indent }}    RUN echo 'add_dracutmodules+=\" mdraid \"' > /etc/dracut.conf.d/15-mdraid.conf"
       when: kairos_build_mdraid | default(false) | bool
-      failed_when: false
 
     # Pin the OS array in mdadm.conf, for two reasons that are separate bugs.
     # (1) Boot-time auto-assembly names the array md127 when homehost does not
@@ -129,9 +213,29 @@
       ansible.builtin.lineinfile:
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
-        line: "                RUN mkdir -p /etc/mdadm && echo 'ARRAY /dev/md0 metadata={{ kairos_os_raid.metadata | default('1.0') }} name=md0 homehost=none devices={{ kairos_os_raid.devices | default([]) | map('regex_replace', '^', '/dev/disk/by-path/') | join(',') }}' > /etc/mdadm/mdadm.conf"
+        line: "{{ kairos_dracut_indent }}    RUN mkdir -p /etc/mdadm && echo 'ARRAY /dev/md0 metadata={{ kairos_os_raid.metadata | default('1.0') }} name=md0 homehost=none devices={{ kairos_os_raid.devices | default([]) | map('regex_replace', '^', '/dev/disk/by-path/') | join(',') }}' > /etc/mdadm/mdadm.conf"
       when: kairos_build_mdraid | default(false) | bool
-      failed_when: false
+
+    # dracut's 90mdraid module installs mdadm.conf only when $hostonly is set or
+    # mdadmconf="yes"; Kairos images are built non-hostonly (one image must boot
+    # on any node), so without this the ARRAY line above stays in the rootfs and
+    # never reaches the initramfs. dracut then auto-assembles the array as md127
+    # instead of md0, and the finalize dd target and the stage-6 checks find
+    # nothing. parse-md.sh reads /etc/mdadm.conf inside the initrd; the module
+    # installs the rootfs /etc/mdadm/mdadm.conf under that name.
+    - name: Patch Earthfile — force mdadm.conf into the initramfs (kairos_build_mdraid)
+      ansible.builtin.lineinfile:
+        path: "{{ canvos_dir }}/Earthfile"
+        insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
+        line: "{{ kairos_dracut_indent }}    RUN echo 'mdadmconf=\"yes\"' > /etc/dracut.conf.d/16-mdadm-conf.conf"
+      when: kairos_build_mdraid | default(false) | bool
+
+    - name: Assert mdadm.conf is forced into the initramfs (kairos_build_mdraid)
+      ansible.builtin.assert:
+        that:
+          - "'16-mdadm-conf.conf' in lookup('file', canvos_dir ~ '/Earthfile')"
+        fail_msg: "CanvOS Earthfile does not write /etc/dracut.conf.d/16-mdadm-conf.conf (mdadmconf=yes), so dracut omits mdadm.conf from the initramfs and the array assembles as md127 instead of md0."
+      when: kairos_build_mdraid | default(false) | bool
 
     - name: Patch Dockerfile — add BCM scripts (COPY + chmod +x as real Dockerfile instructions)
       ansible.builtin.blockinfile:
@@ -190,6 +294,13 @@
         src: "{{ canvos_dir }}/build/{{ iso_name }}.iso"
         dest: "{{ build_dir }}/{{ iso_name }}.iso"
         remote_src: true
+      when: kairos_build_raw_disk | default(true) | bool
+
+    - name: Record the ISO build-input stamp
+      ansible.builtin.copy:
+        content: "{{ kairos_iso_stamp.stdout }}\n"
+        dest: "{{ build_dir }}/.iso-stamp-{{ kairos_profile }}"
+        mode: "0644"
       when: kairos_build_raw_disk | default(true) | bool
 
 # ---- Generate raw disk image ----
@@ -487,8 +598,9 @@
     # actually landed — otherwise the failure only surfaces as a dracut
     # emergency shell on the real node, after a full deploy. Checks the mdadm
     # binary is in the rootfs (dracut sources the initramfs copy from here), the
-    # initramfs carries the mdraid module (best-effort lsinitrd), and rd.auto is
-    # on the kernel cmdline. No-op unless kairos_build_mdraid is true.
+    # initramfs carries the mdraid module AND the pinned ARRAY line -- parsed
+    # from the initrd directly, since lsinitrd is not installed here -- and
+    # rd.auto is on the kernel cmdline. No-op unless kairos_build_mdraid is true.
     - name: Assert mdraid capability landed in the built image (kairos_build_mdraid)
       when: kairos_build_mdraid | default(false) | bool
       become: true
@@ -522,10 +634,24 @@
             R=/tmp/kairos-mdraid-img
             { [ -e "$R/usr/sbin/mdadm" ] || [ -e "$R/sbin/mdadm" ] || [ -e "$R/usr/bin/mdadm" ]; } \
               || errs+=("[mdadm binary not found in image rootfs]")
+            # The ARRAY line must be in the ROOTFS mdadm.conf AND inside the
+            # initramfs -- dracut reads /etc/mdadm.conf from the initrd at boot.
+            # Without it auto-assembly names the array md127 (homehost mismatch),
+            # so the finalize dd target /dev/md0 and the stage-6 checks find
+            # nothing. A rootfs-only write silently passes a rootfs-only check.
+            grep -q '^ARRAY /dev/md0' "$R/etc/mdadm/mdadm.conf" 2>/dev/null \
+              || errs+=("[no ARRAY /dev/md0 line in rootfs mdadm.conf]")
+            # Check the initramfs directly. lsinitrd is not installed on this
+            # host, and gating the check on it is exactly how a missing
+            # mdadm.conf once survived a passing build -- so this runs
+            # unconditionally and parses the initrd itself (early cpio followed
+            # by an xz/gzip/bzip2/zstd main cpio).
             INITRD=$(ls "$R"/boot/initrd* 2>/dev/null | head -1 || true)
-            if [ -n "$INITRD" ] && command -v lsinitrd >/dev/null 2>&1; then
-              lsinitrd "$INITRD" 2>/dev/null | grep -qiE 'mdadm|mdraid' \
-                || errs+=("[initramfs has no mdraid/mdadm module]")
+            if [ -n "$INITRD" ]; then
+              python3 {{ e2e_dir }}/scripts/mdadm-initrd-audit.py "$INITRD" /dev/md0 \
+                || errs+=("[initramfs audit failed: no mdraid module, or no ARRAY /dev/md0 in its mdadm.conf]")
+            else
+              errs+=("[no initrd under the image boot/ -- cannot verify the initramfs]")
             fi
             [ -f "$R/etc/cos/bootargs.cfg" ] && { grep -q 'rd.auto' "$R/etc/cos/bootargs.cfg" \
               || errs+=("[rd.auto missing from bootargs.cfg — array will not assemble]"); }
