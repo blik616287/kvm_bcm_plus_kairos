@@ -23,6 +23,16 @@ stylus:
     tags:
       palette.ai: "true"
       palette.ai/control-plane: "true"
+    # Primary kairos password path. Applied by the early user-sync stage, so it
+    # does not depend on any boot stage completing.
+    users:
+      kairos:
+        username: kairos
+        passwd: {{ kairos_user_password_hash }}
+        homedir: /home/kairos
+        groups:
+        - admin
+        password_expiry: ""
 {% if palette_installation_mode is defined %}
   installationMode: {{ palette_installation_mode }}
 {% endif %}
@@ -31,6 +41,8 @@ stylus:
 {% endif %}
   vip:
     skip: true
+# lock_passwd: false only stops cloud-init locking the account; the password
+# itself comes from stylus.site.users above.
 users:
   - name: kairos
     shell: /bin/bash
@@ -51,7 +63,25 @@ stages:
           owner: 0
           group: 0
 {% endif %}
+    # eth2 has no static config, so it falls through to 20-dhcp-legacy.network
+    # and the lab DHCP hands it 10.184.70.7 -- eth1's address. Two NICs answering
+    # ARP for .7 flaps the MAC BCM derives NODE_NAME from. Sorts before 20-.
+    - name: "Pin eth2 to no address so DHCP cannot duplicate the node IP"
+      files:
+        - path: /etc/systemd/network/05-eth2.network
+          content: |
+            [Match]
+            Name=eth2
+
+            [Network]
+            DHCP=no
+            LinkLocalAddressing=no
+          permissions: 0644
+          owner: 0
+          group: 0
   boot:
+    # Fallback only — a boot step sits behind every earlier stage, so a wedge
+    # upstream leaves the account locked. stylus.site.users above is primary.
     - name: "Set kairos user password"
       users:
         kairos:

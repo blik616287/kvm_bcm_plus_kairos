@@ -521,6 +521,16 @@
       ansible.builtin.set_fact:
         bcm_ssh_key_content: "{{ bcm_key_file.content | b64decode }}"
 
+    # A plaintext value here renders a scalar entities cannot use and the
+    # account comes up locked — the defect this shape exists to remove.
+    - name: Assert the kairos password hash is a usable crypt hash
+      ansible.builtin.assert:
+        that:
+          - kairos_user_password_hash | default('') | length > 30
+          - kairos_user_password_hash is match('^\$[0-9a-z]{1,2}\$')
+        fail_msg: "kairos_user_password_hash must be a crypt hash (e.g. $6$... or $y$...), not a plaintext password."
+      when: kairos_build_raw_disk | default(true) | bool
+
     - name: Render cloud-config
       ansible.builtin.template:
         src: cloud-config.yaml.j2
