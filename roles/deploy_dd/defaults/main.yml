@@ -95,3 +95,8 @@ dd_disksetup_diskless_file: "/cm/local/apps/cmd/etc/htdocs/disk-setup/slave-disk
 # Escape hatch: a full disksetup XML to apply instead — e.g. to keep a dormant
 # BCM root on disks that are NOT Kairos-owned. Takes precedence over datanode.
 dd_disksetup_xml_file: ""
+
+# Pre-authorize the node-installer's FULL-install confirmation so installs run
+# unattended (ZTP); the window is finite so a stale rule can't rubber-stamp a later one.
+deploy_dd_autoconfirm_install: true
+deploy_dd_autoconfirm_window: "2h"

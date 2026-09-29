@@ -45,6 +45,19 @@
   changed_when: false
   failed_when: "'NOSYNC' in dd_nextinstallmode.stdout"
 
+# Pre-authorize the FULL-install interaction for a bounded window so the install runs unattended.
+- name: Pre-authorize the FULL-install interaction for the install window
+  ansible.builtin.command: >-
+    cmsh -c "device; use \"{{ bcm_target_node }}\";
+    installerinteractions -w --confirm --mode full-install
+    --for {{ deploy_dd_autoconfirm_window }}"
+  delegate_to: bcm
+  when:
+    - bcm_target_node | default('', true) | length > 0
+    - deploy_dd_autoconfirm_install | bool
+  changed_when: true
+  failed_when: false
+
 - name: Register a fresh compute node (local-KVM / no target device)
   when: bcm_target_node | default('', true) | length == 0
   delegate_to: bcm
