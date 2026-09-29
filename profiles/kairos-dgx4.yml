@@ -35,6 +35,17 @@ kairos_canvos_args:
   OS_DISTRIBUTION: "ubuntu"
   OS_VERSION: "24.04"
   ISO_NAME: "kairos-dgx4-installer"
+  K8S_DISTRIBUTION: "kubeadm"    # must match a key in CanvOS/k8s_version.json (kubeadm), else the provider build no-ops
+
+# One provider image, reproducibly: the role rewrites CanvOS/k8s_version.json
+# from this dict, so the narrowing to kubeadm 1.35.3 no longer depends on a
+# one-off -e. v4.9.36's own matrix carries 58 kubeadm versions (1.27.2..1.35.3)
+# and the role default distribution is k3s, so leaving this unset would fan the
+# day-2 push out to the whole k3s list.
+kairos_k8s_versions:
+  kubeadm:
+    - "1.35.3"
+
 
 # --- Stage 4: array layout ---
 # OS = the two small NVMe (2x 1.92 TB M.2) mirrored. Data = the eight big NVMe

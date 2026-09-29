@@ -209,6 +209,12 @@
     # the name. (2) devices= pins the members to the stable by-path names, so
     # assembly follows the same slots kairos_raid_select: path selected and
     # cannot land on a data disk after an nvmeXn1 reshuffle.
+    # HOMEHOST is a SEPARATE top-level directive, NOT an ARRAY-line token. Written
+    # the other way it read `ARRAY /dev/md0 ... homehost=none ...`, which mdadm 4.3
+    # rejects outright -- "unrecognised word on ARRAY line: homehost=none" -- and
+    # the WHOLE line is then discarded, taking name= and devices= with it. The pin
+    # silently did nothing and the array came up as md127 on dgx04 (2026-09-28).
+    # printf, not echo: the file needs two lines and echo cannot emit the newline.
     # This MUST be written in the Earthfile core build, not on the raw's cOS
     # images afterwards: dracut reads /etc/mdadm/mdadm.conf from the initramfs,
     # which is built in this stage, so a later write reaches only the rootfs.
@@ -216,8 +222,11 @@
       ansible.builtin.lineinfile:
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
-        regexp: "RUN mkdir -p /etc/mdadm && echo 'ARRAY /dev/md0 "
-        line: "{{ kairos_dracut_indent }}    RUN mkdir -p /etc/mdadm && echo 'ARRAY /dev/md0 metadata={{ kairos_os_raid.metadata | default('1.0') }} name=md0 homehost=none devices={{ kairos_os_raid.devices | default([]) | map('regex_replace', '^', '/dev/disk/by-path/') | join(',') }}' > /etc/mdadm/mdadm.conf"
+        # Matches either the old echo form or the new printf form, so a CanvOS
+        # checkout already patched by the broken version gets REPLACED rather
+        # than gaining a second, still-broken ARRAY line.
+        regexp: "RUN mkdir -p /etc/mdadm"
+        line: "{{ kairos_dracut_indent }}    RUN mkdir -p /etc/mdadm && printf 'HOMEHOST none\\nARRAY /dev/md0 metadata={{ kairos_os_raid.metadata | default('1.0') }} name=md0 devices={{ kairos_os_raid.devices | default([]) | map('regex_replace', '^', '/dev/disk/by-path/') | join(',') }}\\n' > /etc/mdadm/mdadm.conf"
       when: kairos_build_mdraid | default(false) | bool
 
     # dracut's 90mdraid module installs mdadm.conf only when $hostonly is set or
@@ -235,11 +244,18 @@
         line: "{{ kairos_dracut_indent }}    RUN echo 'mdadmconf=\"yes\"' > /etc/dracut.conf.d/16-mdadm-conf.conf"
       when: kairos_build_mdraid | default(false) | bool
 
-    - name: Assert mdadm.conf is forced into the initramfs (kairos_build_mdraid)
+    - name: Assert the initramfs mdadm.conf will actually be honoured by mdadm
       ansible.builtin.assert:
         that:
           - "'16-mdadm-conf.conf' in lookup('file', canvos_dir ~ '/Earthfile')"
-        fail_msg: "CanvOS Earthfile does not write /etc/dracut.conf.d/16-mdadm-conf.conf (mdadmconf=yes), so dracut omits mdadm.conf from the initramfs and the array assembles as md127 instead of md0."
+          - "'HOMEHOST none' in lookup('file', canvos_dir ~ '/Earthfile')"
+          - "'homehost=' not in lookup('file', canvos_dir ~ '/Earthfile')"
+        fail_msg: >-
+          mdadm.conf handling is wrong. dracut must ship the file (mdadmconf=yes,
+          above) AND mdadm must accept it. `homehost=` is NOT an ARRAY-line token:
+          mdadm rejects the whole line with "unrecognised word on ARRAY line", so
+          name= and devices= are dropped with it and the array assembles as md127.
+          Homehost belongs on its own top-level HOMEHOST line.
       when: kairos_build_mdraid | default(false) | bool
 
     - name: Patch Dockerfile — add BCM scripts (COPY + chmod +x as real Dockerfile instructions)
@@ -312,12 +328,127 @@
       poll: 30
       when: kairos_build_raw_disk | default(true) | bool
 
-    - name: Run CanvOS build (day-2 — push provider images, skip ISO)
+    # ---- Day-2 runs as TWO phases so a failed UPLOAD never costs a rebuild ----
+    # `SAVE IMAGE --push` only marks the image; the push executes only when the
+    # CLI is given `--push`. So WITHOUT `--push` phase 1 LOADS the image into the
+    # local Docker daemon and never touches the registry: it cannot fail on a
+    # flaky upload, and it leaves the image behind for a retry. Phase 2 is the
+    # only step that talks to the registry, and it is retried.
+    # Why: 2026-09-28 two day-2 runs reached "100% exporting outputs" and then
+    # died in POST /v2/ubuntu/blobs/uploads/ with a header timeout, leaving
+    # nothing local to retry from.
+    - name: Derive the provider-image refs the day-2 push would address
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json, re, sys
+        d = "{{ canvos_dir }}"
+        a = {}
+        for l in open(d + "/.arg"):
+            l = l.strip()
+            if not l or l.startswith("#") or "=" not in l:
+                continue
+            k, v = l.split("=", 1)
+            a[k.strip()] = v.strip()
+        m = re.search(r"(?m)^\s*ARG\s+PE_VERSION=(\S+)", open(d + "/Earthfile").read())
+        if not m:
+            sys.exit(0)
+        try:
+            matrix = json.load(open(d + "/k8s_version.json"))
+        except Exception:
+            sys.exit(0)
+        for dist, versions in matrix.items():
+            for v in versions:
+                print("%s/%s:%s-%s-%s-%s" % (a["IMAGE_REGISTRY"], a["IMAGE_REPO"],
+                                              dist, v, m.group(1), a["CUSTOM_TAG"]))
+        PY
+      register: kairos_provider_refs
+      changed_when: false
+      failed_when: false
+      when: not (kairos_build_raw_disk | default(true) | bool)
+
+    - name: Stat the expected provider image in the local Docker daemon
+      ansible.builtin.command: docker image inspect {{ item }}
+      loop: "{{ kairos_provider_refs.stdout_lines | default([]) }}"
+      register: kairos_provider_local
+      changed_when: false
+      failed_when: false
+      when: not (kairos_build_raw_disk | default(true) | bool)
+
+    # Read BEFORE it is consumed below -- the stamp is the guard against a tag
+    # that exists locally but was built from older inputs.
+    - name: Read the recorded provider-image build-input stamp
+      ansible.builtin.command: cat {{ build_dir }}/.provider-image-stamp-{{ kairos_profile }}
+      register: kairos_image_stamp_rec
+      changed_when: false
+      failed_when: false
+      when: not (kairos_build_raw_disk | default(true) | bool)
+
+    - name: Decide whether a local provider image matches the current build inputs
+      ansible.builtin.set_fact:
+        kairos_provider_cached: >-
+          {{ (kairos_provider_refs.stdout_lines | default([]) | length > 0)
+             and ((kairos_provider_local.results | default([])
+                   | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | list | length)
+                  == (kairos_provider_refs.stdout_lines | default([]) | length))
+             and ((kairos_image_stamp_rec.stdout | default('') | trim)
+                  == (kairos_iso_stamp.stdout | trim)) }}
+      when: not (kairos_build_raw_disk | default(true) | bool)
+
+    - name: Decide whether this run builds or uploads only
+      ansible.builtin.set_fact:
+        kairos_upload_only: "{{ (kairos_image_upload_only | default(false) | bool) or (kairos_provider_cached | default(false) | bool) }}"
+      when: not (kairos_build_raw_disk | default(true) | bool)
+
+    - name: Assert an image is actually built when upload-only was forced
+      ansible.builtin.assert:
+        that:
+          - kairos_provider_refs.stdout_lines | default([]) | length > 0
+          - (kairos_provider_local.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | list | length) > 0
+        fail_msg: >-
+          kairos_image_upload_only=true but no local provider image matches the
+          expected refs {{ kairos_provider_refs.stdout_lines | default([]) | join(', ') }}.
+          Run `make kairos-image` to build it first.
+      when:
+        - not (kairos_build_raw_disk | default(true) | bool)
+        - kairos_image_upload_only | default(false) | bool
+
+    - name: Run CanvOS build (day-2 phase 1 -- build + LOAD, no registry traffic)
       ansible.builtin.shell: |
         cd {{ canvos_dir }}
-        ./earthly.sh --push +build-provider-images --ARCH={{ arch }}
+        ./earthly.sh +build-provider-images --ARCH={{ arch }}
       async: 3600
       poll: 30
+      when:
+        - not (kairos_build_raw_disk | default(true) | bool)
+        - not (kairos_upload_only | default(false) | bool)
+
+    - name: Record the provider-image build-input stamp
+      ansible.builtin.copy:
+        content: "{{ kairos_iso_stamp.stdout }}\n"
+        dest: "{{ build_dir }}/.provider-image-stamp-{{ kairos_profile }}"
+        mode: "0644"
+      when:
+        - not (kairos_build_raw_disk | default(true) | bool)
+        - not (kairos_upload_only | default(false) | bool)
+
+    - name: Upload the provider images (day-2 phase 2 -- retried, blob-resumed)
+      ansible.builtin.shell: |
+        # NOTE: runs under /bin/sh (dash) -- no `set -o pipefail` here; there is
+        # no pipeline, and dash rejects the bash-ism (killed the push in 4ms on
+        # 2026-09-28 with "/bin/sh: 1: set: Illegal option -o pipefail").
+        rc=0
+        for ref in {{ kairos_provider_refs.stdout_lines | default([]) | join(' ') }}; do
+          echo "== pushing $ref"
+          ok=0
+          for i in $(seq 1 {{ kairos_upload_attempts | default(3) }}); do
+            if timeout {{ kairos_upload_timeout | default(1800) }} docker push "$ref"; then
+              ok=1; break
+            fi
+            echo "!! push attempt $i for $ref failed; retrying" >&2
+          done
+          [ "$ok" = 1 ] || { echo "!! giving up on $ref" >&2; rc=1; }
+        done
+        exit $rc
       when: not (kairos_build_raw_disk | default(true) | bool)
 
     - name: Copy ISO to build directory
@@ -697,6 +828,13 @@
             # nothing. A rootfs-only write silently passes a rootfs-only check.
             grep -q '^ARRAY /dev/md0' "$R/etc/mdadm/mdadm.conf" 2>/dev/null \
               || errs+=("[no ARRAY /dev/md0 line in rootfs mdadm.conf]")
+            # Presence of the ARRAY line is not enough -- mdadm must ACCEPT it.
+            # `homehost=` on that line makes mdadm discard the whole line, which
+            # is how a passing build shipped an image whose array came up md127.
+            grep -q '^HOMEHOST' "$R/etc/mdadm/mdadm.conf" 2>/dev/null \
+              || errs+=("[no HOMEHOST directive in rootfs mdadm.conf]")
+            grep -q 'homehost=' "$R/etc/mdadm/mdadm.conf" 2>/dev/null \
+              && errs+=("[homehost= on an ARRAY line -- mdadm rejects the line; use a top-level HOMEHOST]")
             # Check the initramfs directly. lsinitrd is not installed on this
             # host, and gating the check on it is exactly how a missing
             # mdadm.conf once survived a passing build -- so this runs

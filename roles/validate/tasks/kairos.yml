@@ -22,6 +22,7 @@
     - { key: cmdline, cmd: "cat /proc/cmdline" }
     - { key: md0_members, cmd: "sudo mdadm --detail /dev/md0 2>/dev/null | awk '$NF ~ /nvme/ {print $NF}' | xargs -r -n1 basename | sort | tr '\n' ' '" }
     - { key: md0_smallest, cmd: "for d in /sys/block/nvme*n1; do b=${d##*/}; case $b in *c*n*) continue;; esac; cat $d/size 2>/dev/null | tr -d '\n'; echo \" $b\"; done | sort -n | head -2 | awk '{print $2}' | sort | tr '\n' ' '" }
+    - { key: md_dev, cmd: "ls /dev/md/ 2>/dev/null | xargs -r echo" }
     - { key: cos_oem, cmd: "sudo blkid -L COS_OEM" }
     - { key: cos_recovery, cmd: "sudo blkid -L COS_RECOVERY" }
     - { key: cos_state, cmd: "sudo blkid -L COS_STATE" }
@@ -58,7 +59,7 @@
       - { name: "net.ifnames=0", status: "{{ 'PASS' if ('net.ifnames=0' in (_ko.cmdline | default(''))) else 'WARN' }}", detail: "" }
       - { name: "Kairos boot chain", status: "{{ 'PASS' if (('rd.immucore' in (_ko.cmdline | default(''))) or ('rd.cos' in (_ko.cmdline | default('')))) else 'WARN' }}", detail: "" }
       - { name: "rd.auto=1 on cmdline", status: "{{ 'PASS' if ('rd.auto=1' in (_ko.cmdline | default(''))) else 'FAIL' }}", detail: "{{ 'the OS mirror only assembles if this is present' if ('rd.auto=1' not in (_ko.cmdline | default(''))) else '' }}" }
-      - { name: "md0 assembled", status: "{{ 'PASS' if (_ko.md0_members | default('') | length > 0) else 'FAIL' }}", detail: "{{ _ko.md0_members | default('no members reported by mdadm') }}" }
+      - { name: "md0 assembled", status: "{{ 'PASS' if (_ko.md0_members | default('') | length > 0) else 'FAIL' }}", detail: "{{ _ko.md0_members | default('no array at /dev/md0 -- /dev/md/ holds: ' ~ (_ko.md_dev | default('nothing'))) }}" }
       - { name: "md0 = 2 smallest disks", status: "{{ 'PASS' if ((_ko.md0_members | default('') | length > 0) and ((_ko.md0_members | default('')) == (_ko.md0_smallest | default('none')))) else 'FAIL' }}", detail: "{{ 'md0=[' ~ (_ko.md0_members | default('')) ~ '] smallest=[' ~ (_ko.md0_smallest | default('')) ~ ']' }}" }
       - { name: "COS_OEM", status: "{{ 'PASS' if (_kc.cos_oem == 0) else 'WARN' }}", detail: "{{ _ko.cos_oem }}" }
       - { name: "COS_RECOVERY", status: "{{ 'PASS' if (_kc.cos_recovery == 0) else 'WARN' }}", detail: "{{ _ko.cos_recovery }}" }

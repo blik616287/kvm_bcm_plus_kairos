@@ -72,6 +72,21 @@ kairos_user_data: ""
 # `make kairos-image` flips this to false automatically.
 kairos_build_raw_disk: true
 
+# Day-2 runs in two phases: (1) build + LOAD the provider image into the local
+# Docker daemon with no registry traffic, (2) `docker push` it. Splitting them is
+# what makes an upload-only retry possible -- the old coupled `earthly.sh --push`
+# left NOTHING local when the upload failed (2026-09-28 13:43 and 14:58: both runs
+# reached "100% exporting outputs" then died in POST /v2/ubuntu/blobs/uploads/ with
+# a header timeout). A re-run that finds every expected provider image locally AND
+# built from the same inputs skips phase 1 and retries only the upload.
+kairos_image_upload_only: false
+
+# Upload-phase tuning. The failure mode is a HANG, so each attempt is bounded and
+# the loop re-enters; `docker push` HEADs blobs first, so a retry re-sends only
+# what the registry never committed.
+kairos_upload_timeout: 1800
+kairos_upload_attempts: 3
+
 # Build a RAID-capable Kairos image (opt-in; default false = byte-identical to
 # today). When true, the build makes the image's initramfs able to assemble a
 # Linux software-RAID (mdadm) array at boot, so the raw image can later be

@@ -49,6 +49,12 @@ done
 umount -Rfl /localdisk 2> /dev/null || true
 vgchange -an 2> /dev/null || true
 mdadm --stop "${DISK}"* 2> /dev/null || true
+# Stop EVERY md array before touching a disk. A previous install leaves md metadata
+# that udev auto-assembles at installer boot; a member held by a live array cannot be
+# re-created, because mdadm --create opens O_EXCL and dies "Device or resource busy".
+# By scan and by name, so an auto-assembled md127 (no mdadm.conf entry) is released too.
+mdadm --stop --scan 2> /dev/null || true
+for _md in /dev/md*; do [ -b "${_md}" ] && mdadm --stop "${_md}" 2> /dev/null || true; done
 dmsetup remove_all 2> /dev/null || true
 udevadm settle --timeout=20 2> /dev/null || true
 # Wipe only AFTER the holders are released: wiping signatures out from under a live
@@ -105,11 +111,15 @@ fi
 _release_md_members() {
     for _m in "$@"; do
         [ -b "${_m}" ] || continue
-        _lnk="/sys/class/block/$(basename "${_m}")/md"
-        [ -L "${_lnk}" ] || continue
-        _md=$(basename "$(readlink "${_lnk}")")
-        echo "[kairos-finalize $(date)] member $(basename "${_m}") is held by ${_md}; stopping it"
-        mdadm --stop "/dev/${_md}" 2> /dev/null || mdadm --stop "${_md}" 2> /dev/null || true
+        # /sys/class/block/<dev>/md does NOT exist for an array udev auto-assembled
+        # (no mdadm.conf entry -> first free number, md127); /sys/block/<dev>/holders/
+        # is the real interface. Probing the former silently no-ops and the create
+        # below then dies O_EXCL: "Device or resource busy".
+        for _md in $(ls "/sys/block/$(basename "${_m}")/holders" 2> /dev/null); do
+            [ -b "/dev/${_md}" ] || continue
+            echo "[kairos-finalize $(date)] member $(basename "${_m}") is held by ${_md}; stopping it"
+            mdadm --stop "/dev/${_md}" 2> /dev/null || mdadm --stop "${_md}" 2> /dev/null || true
+        done
     done
     udevadm settle --timeout=20 2> /dev/null || true
 }
@@ -117,9 +127,9 @@ _release_md_members() {
 _assert_md_members_free() {
     for _m in "$@"; do
         [ -b "${_m}" ] || continue
-        _lnk="/sys/class/block/$(basename "${_m}")/md"
-        if [ -L "${_lnk}" ]; then
-            echo "[kairos-finalize $(date)] FATAL: member $(basename "${_m}") still held by $(basename "$(readlink "${_lnk}")") after stop; refusing to build a partial array"
+        _still=$(ls "/sys/block/$(basename "${_m}")/holders" 2> /dev/null)
+        if [ -n "${_still}" ]; then
+            echo "[kairos-finalize $(date)] FATAL: member $(basename "${_m}") still held by ${_still} after stop; refusing to build a partial array"
             exit 1
         fi
     done
