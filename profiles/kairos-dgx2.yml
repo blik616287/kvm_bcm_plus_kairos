@@ -45,6 +45,12 @@ kairos_canvos_args:
   OS_DISTRIBUTION: "ubuntu"
   OS_VERSION: "24.04"          # verified running on dgx02 2026-09-25
   ISO_NAME: "kairos-dgx2-installer"
+  K8S_DISTRIBUTION: "kubeadm"    # must match a key in CanvOS/k8s_version.json (kubeadm), else the provider build no-ops
+
+# Match dgx04: narrow CanvOS/k8s_version.json to kubeadm 1.35.3 only (v4.9.36 defaults to k3s).
+kairos_k8s_versions:
+  kubeadm:
+    - "1.35.3"
 
 # --- Stage 4: array layout ---
 # Selection is by PCIe SLOT, not by name: nvmeXn1 names are NOT stable across
