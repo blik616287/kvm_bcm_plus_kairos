@@ -32,6 +32,9 @@
   register: dd_raw_stat
   failed_when: not dd_raw_stat.stat.exists
 
+- name: Authorize the image's BCM SSH key on the BCM (node-side cloud-config needs it)
+  ansible.builtin.import_tasks: bcm_key.yml
+
 - name: Wait for the BCM cmd daemon + cmsh to be ready
   ansible.builtin.command: cmsh -c "device; list"
   delegate_to: bcm
