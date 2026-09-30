@@ -537,6 +537,21 @@
         dest: "{{ build_dir }}/cloud-config.yaml"
         mode: "0644"
 
+    # Gate the artifact: a plaintext passwd renders a value the account cannot use.
+    - name: Read the rendered cloud-config
+      ansible.builtin.slurp:
+        src: "{{ build_dir }}/cloud-config.yaml"
+      register: cc_rendered
+      when: kairos_build_raw_disk | default(true) | bool
+
+    - name: Assert the rendered cloud-config carries the hash and no plaintext password
+      ansible.builtin.assert:
+        that:
+          - kairos_user_password_hash in (cc_rendered.content | b64decode)
+          - "'passwd: kairos' not in (cc_rendered.content | b64decode)"
+        fail_msg: "The rendered cloud-config must carry kairos_user_password_hash; a plaintext passwd cannot be used by the account."
+      when: kairos_build_raw_disk | default(true) | bool
+
     # User-supplied additional cloud-config YAML, layered into /oem/99_userdata.yaml.
     # Only written when kairos_user_data is non-empty; the FAT32 image and the
     # nc-over-serial cp commands check for the file's presence before acting.

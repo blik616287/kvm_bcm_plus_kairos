@@ -80,12 +80,10 @@ stages:
           owner: 0
           group: 0
   boot:
-    # Fallback only — a boot step sits behind every earlier stage, so a wedge
-    # upstream leaves the account locked. stylus.site.users above is primary.
-    - name: "Set kairos user password"
-      users:
-        kairos:
-          passwd: kairos
+    # /etc/shadow is rebuilt on every boot, so the hash must be re-asserted here.
+    - name: "Re-assert the kairos password hash on the ephemeral /etc"
+      commands:
+        - usermod -p {{ kairos_user_password_hash | quote }} kairos || useradd -p {{ kairos_user_password_hash | quote }} -m -s /bin/bash -G admin kairos
     - name: "Enable SSH password auth + disable fail2ban"
       files:
         - path: /etc/ssh/sshd_config.d/99-kairos-test.conf
@@ -162,7 +160,7 @@ stages:
           fi
           [ -z "${NODE_NAME}" ] && NODE_NAME=$(hostname)
           export NODE_NAME
-          hostnamectl set-hostname "${NODE_NAME}" 2>/dev/null || hostname "${NODE_NAME}" 2>/dev/null || true
+          # Never written to the hostname: the node's identity is the Palette edge-host id, not NODE_NAME.
           # Push BCM-derived labels to the Palette edge-host record via admin
           # API. Stylus's own cloud-config merge doesn't pick up /oem/*.yaml
           # files written from stages.boot (kairos-agent's initramfs merge

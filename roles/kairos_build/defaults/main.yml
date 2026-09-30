@@ -52,13 +52,7 @@ kairos_extra_apt_packages: []
 # block — those are owned by the base 90_custom.yaml.
 kairos_user_data: ""
 
-# Default `kairos` password, held as a crypt hash so it can be declared in the
-# stylus.site.users shape. That shape is applied by the early "Sync users from
-# cloud-init config to the system" stage, which runs before the stages that can
-# wedge — so the account is unlocked on every boot even when a later stage hangs.
-# The plaintext is still `kairos`. The salt is fixed so the hash is byte-identical
-# across builds and the render reports unchanged rather than churning. Override
-# per profile to set a real password.
+# Default `kairos` password (`kairos`) as a crypt hash; a fixed salt keeps the render stable across builds.
 kairos_user_password_hash: "$6$k4ir0s0112345678$ITJF/ShuOumrIp1XTVVrCluFuVdrc8lgjFN7wP0j2KD6qhPtzCNai5cQzlPAZj4HoTRqlYYx631zZKM8CqPE90"
 
 # Switches the role between two Earthly targets and gates the OVMF QEMU
