@@ -39,6 +39,7 @@ setup: ## Verify prerequisites (ansible, qemu, docker, sshpass, etc.)
 	@echo "Checking prerequisites..."
 	@command -v ansible-playbook >/dev/null || { echo "MISSING: ansible"; exit 1; }
 	@command -v qemu-system-x86_64 >/dev/null || { echo "MISSING: qemu-system-x86_64"; exit 1; }
+	@if [ ! -e /dev/kvm ]; then echo "WARN: /dev/kvm absent - kairos_build_qemu_accel=kvm will fail the build; use kairos_build_qemu_accel=tcg or a KVM-capable host"; fi
 	@command -v docker >/dev/null || { echo "MISSING: docker"; exit 1; }
 	@command -v sshpass >/dev/null || { echo "MISSING: sshpass"; exit 1; }
 	@command -v xorriso >/dev/null || { echo "MISSING: xorriso"; exit 1; }

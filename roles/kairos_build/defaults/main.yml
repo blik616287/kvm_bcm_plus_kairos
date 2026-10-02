@@ -122,3 +122,10 @@ kairos_k8s_versions: {}
 # Stylus edge-host VIP. false = do not skip; set true per profile to
 # restore the previous skip: true behaviour.
 vip_skip:  false
+
+# QEMU accelerator for the in-QEMU kairos-agent install. "kvm" needs a usable
+# /dev/kvm on the host running make kairos-build; "tcg" is the pure-emulation
+# fallback for hosts with no hardware virtualisation (CI runners, nested guests
+# without VMX/AMD-V). Asserted before the install so a host that cannot
+# virtualise fails loudly instead of leaving a blank raw disk behind.
+kairos_build_qemu_accel: kvm

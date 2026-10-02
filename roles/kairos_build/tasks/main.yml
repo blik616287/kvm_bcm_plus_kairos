@@ -580,6 +580,28 @@
     - name: Create blank raw disk
       ansible.builtin.shell: truncate -s 81920M {{ raw_disk_path }}
 
+    # Fail loudly BEFORE the install if the accelerator or firmware is missing.
+    # A qemu that cannot start writes no pidfile, and the install task below then
+    # leaves a blank raw that the verify step only notices minutes later.
+    - name: Assert the QEMU accelerator and OVMF firmware are usable
+      ansible.builtin.shell: |
+        set -eu
+        accel="{{ kairos_build_qemu_accel }}"
+        case "$accel" in
+          kvm)
+            [ -e /dev/kvm ] || { echo "FATAL: kairos_build_qemu_accel=kvm but /dev/kvm is absent: no hardware virtualisation on this host (nested guest without VMX/AMD-V, or the kvm module is not loaded). Build on a KVM-capable host, or set kairos_build_qemu_accel=tcg." >&2; exit 1; }
+            { [ -r /dev/kvm ] && [ -w /dev/kvm ]; } || { echo "FATAL: /dev/kvm exists but is not rw for uid $(id -u)." >&2; exit 1; }
+            ;;
+          tcg) : ;;
+          *) echo "FATAL: unknown kairos_build_qemu_accel '${accel}' (expected kvm or tcg)." >&2; exit 1 ;;
+        esac
+        for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/qemu/OVMF.fd /usr/share/ovmf/OVMF.fd; do
+          [ -f "$f" ] && { echo "accel=$accel firmware=$f OK"; exit 0; }
+        done
+        echo "FATAL: no OVMF firmware found (looked for OVMF_CODE_4M.fd, qemu/OVMF.fd, ovmf/OVMF.fd). Install the ovmf package." >&2
+        exit 1
+      changed_when: false
+
     # OVMF (UEFI) so kairos-agent detects UEFI and installs GRUB-EFI into an ESP.
     # The resulting raw image is bootable on UEFI hardware (physical Dell servers etc.).
     # BIOS-only platforms would need a separate image built with SeaBIOS.
@@ -592,8 +614,14 @@
         [ -f "$OVMF_CODE" ] || OVMF_CODE=/usr/share/qemu/OVMF.fd
         [ -f "$OVMF_VARS_SRC" ] || OVMF_VARS_SRC=/usr/share/ovmf/OVMF.fd
         cp -f "$OVMF_VARS_SRC" {{ build_dir }}/ovmf-vars.fd
+        # kvm = hardware acceleration; tcg = pure emulation with no /dev/kvm.
+        if [ "{{ kairos_build_qemu_accel }}" = kvm ]; then
+          ACCEL="-enable-kvm -cpu host"
+        else
+          ACCEL="-accel tcg -cpu max"
+        fi
         qemu-system-x86_64 \
-          -enable-kvm -m 4096 -smp 2 -cpu host \
+          $ACCEL -m 4096 -smp 2 \
           -machine q35 \
           -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
           -drive if=pflash,format=raw,file={{ build_dir }}/ovmf-vars.fd \
@@ -605,8 +633,17 @@
           -drive format=raw,media=cdrom,readonly=on,file={{ build_dir }}/{{ iso_name }}.iso \
           -boot d \
           -pidfile {{ build_dir }}/.qemu-install.pid \
-          -daemonize
-        QEMU_PID=$(cat {{ build_dir }}/.qemu-install.pid)
+          -D {{ build_dir }}/qemu-debug.log \
+          -daemonize 2>{{ build_dir }}/qemu-start.log
+        QEMU_PID=$(cat {{ build_dir }}/.qemu-install.pid 2>/dev/null || true)
+        # A qemu that cannot start writes no pidfile; without this check the wait
+        # loop below falls through on an empty PID and the task reports SUCCESS,
+        # leaving a blank raw that only the verify task notices minutes later.
+        if [ -z "$QEMU_PID" ] || ! kill -0 "$QEMU_PID" 2>/dev/null; then
+          echo "FATAL: QEMU failed to start (no live pid in .qemu-install.pid). qemu stderr:" >&2
+          cat {{ build_dir }}/qemu-start.log >&2 2>/dev/null || true
+          exit 1
+        fi
         INSTALL_LOG={{ e2e_dir }}/logs/qemu-install.log
         : > "$INSTALL_LOG"
         (
@@ -713,6 +750,7 @@
         if [ -n "${errs[*]:-}" ]; then
           echo "kairos-agent install verification FAILED: ${errs[*]}" >&2
           echo "Inspect {{ e2e_dir }}/logs/qemu-install.log for the installer output." >&2
+          echo "An empty qemu-install.log means the VM never booted: see {{ build_dir }}/qemu-start.log for qemu's stderr." >&2
           exit 1
         fi
         echo "install verification OK — ESP has a bootloader and active.img is populated"
