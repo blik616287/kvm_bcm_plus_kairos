@@ -118,3 +118,7 @@ kairos_build_mdraid: false
 #     rke2:
 #       - "1.32.1"
 kairos_k8s_versions: {}
+
+# Stylus edge-host VIP. false = do not skip; set true per profile to
+# restore the previous skip: true behaviour.
+vip_skip:  false

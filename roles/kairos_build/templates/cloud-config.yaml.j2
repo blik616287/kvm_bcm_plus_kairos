@@ -39,8 +39,10 @@ stylus:
 {% if palette_management_mode is defined %}
   managementMode: {{ palette_management_mode }}
 {% endif %}
+
   vip:
-    skip: true
+    skip: {{ 'true' if (vip_skip | default(true) | bool) else 'false' }}
+
 # lock_passwd: false only stops cloud-init locking the account; the password
 # itself comes from stylus.site.users above.
 users:
