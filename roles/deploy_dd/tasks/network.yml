@@ -19,7 +19,6 @@
       ansible.builtin.systemd_service:
         name: named
         state: restarted
-      failed_when: false
 
     - name: Enable IPv4 forwarding (runtime + persistent)
       ansible.posix.sysctl:

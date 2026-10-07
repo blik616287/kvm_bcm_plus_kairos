@@ -4,6 +4,12 @@
 # freshly-registered local-KVM node. The compute IP formula (node001 -> .10)
 # mirrors roles/kairos_vm/defaults so the two stages agree (plan C.1 will hoist
 # it to a shared var).
+#
+# cmsh exits non-zero when `use <name>` cannot find the device, but every
+# set/commit in the same -c string is then a silent no-op — so a swallowed exit
+# code reports success while nothing was armed (how dgx04 sat unarmed while the
+# device was named edge-<uuid>). Nothing here masks the exit code, and each
+# mutating task is followed by a `get` that proves the effect landed.
 
 - name: Assign an existing BCM device to the profile (targeted/remote BCM)
   ansible.builtin.command: >-
@@ -17,7 +23,16 @@
   delegate_to: bcm
   when: bcm_target_node | default('', true) | length > 0
   changed_when: true
-  failed_when: false
+
+- name: Assert the target device is registered and took the profile category
+  ansible.builtin.command: cmsh -c "device; use \"{{ bcm_target_node }}\"; get category"
+  delegate_to: bcm
+  when: bcm_target_node | default('', true) | length > 0
+  register: dd_node_category
+  changed_when: false
+  failed_when: >-
+    dd_node_category.rc != 0
+    or kairos_profile not in dd_node_category.stdout
 
 # BCM keeps a one-shot `nextinstallmode` that overrides `installmode` for the very
 # next boot. The node's own cloud-config disarm sets installmode=NOSYNC, which lands
@@ -35,7 +50,8 @@
   delegate_to: bcm
   when: bcm_target_node | default('', true) | length > 0
   changed_when: true
-  failed_when: false
+  # No failed_when here on purpose: `clear` on an already-clear attribute is a
+  # no-op, and the assert below is what actually proves the override is gone.
 
 - name: Assert the target node carries no stale NOSYNC override
   ansible.builtin.command: cmsh -c "device; use \"{{ bcm_target_node }}\"; get nextinstallmode"
@@ -43,7 +59,11 @@
   when: bcm_target_node | default('', true) | length > 0
   register: dd_nextinstallmode
   changed_when: false
-  failed_when: "'NOSYNC' in dd_nextinstallmode.stdout"
+  # rc is checked too: `use <unknown-device>` exits non-zero with an empty stdout,
+  # so a NOSYNC-only test would pass that off as a clean node.
+  failed_when: >-
+    dd_nextinstallmode.rc != 0
+    or 'NOSYNC' in dd_nextinstallmode.stdout
 
 # Pre-authorize the FULL-install interaction for a bounded window so the install runs unattended.
 - name: Pre-authorize the FULL-install interaction for the install window
@@ -56,7 +76,6 @@
     - bcm_target_node | default('', true) | length > 0
     - deploy_dd_autoconfirm_install | bool
   changed_when: true
-  failed_when: false
 
 - name: Register a fresh compute node (local-KVM / no target device)
   when: bcm_target_node | default('', true) | length == 0
@@ -64,10 +83,17 @@
   vars:
     dd_compute_ip: "{{ bcm_internal_ip.rsplit('.', 1)[0] }}.{{ 9 + (dd_target_node | regex_replace('[^0-9]', '') | int) }}"
   block:
+    # `device remove` exits 0 for a device that is not there, so ask before removing.
+    - name: Probe for a stale registration of the node
+      ansible.builtin.command: cmsh -c "device; use {{ dd_target_node }}; get hostname"
+      register: dd_node_probe
+      changed_when: false
+      failed_when: false
+
     - name: Remove any stale registration for the node
       ansible.builtin.command: cmsh -c "device; remove {{ dd_target_node }}; commit"
+      when: dd_node_probe.rc == 0
       changed_when: true
-      failed_when: false
 
     # provisioninginterface is enp0s2: the local-KVM compute VM runs q35+OVMF, so
     # the installer env's systemd-networkd names the virtio NIC enp0s2 regardless
@@ -82,4 +108,11 @@
         set provisioninginterface enp0s2;
         commit"
       changed_when: true
-      failed_when: false
+
+    - name: Assert the fresh node registered with the profile category
+      ansible.builtin.command: cmsh -c "device; use {{ dd_target_node }}; get category"
+      register: dd_new_node_category
+      changed_when: false
+      failed_when: >-
+        dd_new_node_category.rc != 0
+        or kairos_profile not in dd_new_node_category.stdout

@@ -92,7 +92,6 @@
         path: /etc/dhcpd.conf
         regexp: 'not authoritative'
         replace: 'authoritative'
-      failed_when: false
       notify: Restart dhcpd
 
     - name: Point the DHCP pool at the provisioning network (.16–.250)
@@ -100,7 +99,6 @@
         path: /etc/dhcpd.conf
         regexp: 'range .*'
         replace: "range {{ dd_pool_prefix }}.16 {{ dd_pool_prefix }}.250;"
-      failed_when: false
       notify: Restart dhcpd
 
 - name: Apply NFS/DHCP changes now (don't wait for end-of-play flush)

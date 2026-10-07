@@ -12,7 +12,6 @@
   ansible.builtin.command: cmsh -c "category; use {{ kairos_profile }}; set softwareimage {{ dd_installer_image }}; commit"
   delegate_to: bcm
   changed_when: true
-  failed_when: false
 
 - name: Read back the category software image
   ansible.builtin.command: cmsh -c "category; use {{ kairos_profile }}; get softwareimage"
