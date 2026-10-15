@@ -421,32 +421,15 @@
     # died in POST /v2/ubuntu/blobs/uploads/ with a header timeout, leaving
     # nothing local to retry from.
     - name: Derive the provider-image refs the day-2 push would address
-      ansible.builtin.shell: |
-        python3 - <<'PY'
-        import json, re, sys
-        d = "{{ canvos_dir }}"
-        a = {}
-        for l in open(d + "/.arg"):
-            l = l.strip()
-            if not l or l.startswith("#") or "=" not in l:
-                continue
-            k, v = l.split("=", 1)
-            a[k.strip()] = v.strip()
-        m = re.search(r"(?m)^\s*ARG\s+PE_VERSION=(\S+)", open(d + "/Earthfile").read())
-        if not m:
-            sys.exit(0)
-        try:
-            matrix = json.load(open(d + "/k8s_version.json"))
-        except Exception:
-            sys.exit(0)
-        for dist, versions in matrix.items():
-            for v in versions:
-                print("%s/%s:%s-%s-%s-%s" % (a["IMAGE_REGISTRY"], a["IMAGE_REPO"],
-                                              dist, v, m.group(1), a["CUSTOM_TAG"]))
-        PY
+      # Fails (naming what is missing) instead of yielding an empty list: an
+      # empty list would make the upload loop below push nothing and succeed.
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ e2e_dir }}/scripts/provider-image-refs.py"
+          - "{{ canvos_dir }}"
       register: kairos_provider_refs
       changed_when: false
-      failed_when: false
       when: not (kairos_build_raw_disk | default(true) | bool)
 
     - name: Stat the expected provider image in the local Docker daemon
