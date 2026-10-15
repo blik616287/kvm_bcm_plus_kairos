@@ -252,6 +252,13 @@ make stop               # Stop all VMs
 make bcm-serial         # Tail BCM serial log
 make kairos-serial      # Tail Kairos serial log
 
+# Quality gates (CI runs all of these; see CONTRIBUTING.md)
+make check              # fmt-check + lint + analyze + guards + render-check + test
+make guards             # merge leftovers, duplicate tasks, safe defaults, secrets ignores
+make render-check       # every profile's finalize/installer/cloud-config vs tests/golden/
+make render-update      # regenerate tests/golden/ after an intended change
+make test               # unit tests for the repo's scripts
+
 # Cleanup
 make clean              # Stop VMs, then remove build/, logs/
 make clean-dist         # Remove downloaded ISOs
@@ -386,6 +393,7 @@ Full detail, including the failure signatures for each of the five settings, is 
 - `docs/POC_Client_Deployment.md` — client-facing POC deployment document (also rendered to `docs/POC_Client_Deployment.pdf`)
 - `docs/pipeline-deep-dive.md` — engineer-level walkthrough of every stage, including the exact commands each role issues and why
 - `docs/stage-palette-appliance.md` — the optional self-hosted Palette appliance (networking, ordering, troubleshooting)
+- `CONTRIBUTING.md` — how to land a change upstream without changing anyone else's node: branching from current upstream, resolving conflicts, opt-in rules, `make check`, the golden render diff, and what CI guards
 
 ## Key Design Points
 
@@ -549,6 +557,20 @@ Force a full rebuild with `make clean && make all` (local-KVM) or `make clean &&
 
 Milestones and notable changes, newest first. Each entry links its JIRA ticket
 (project `IN`) and PR. New milestones append here as part of the same PR.
+
+### 2026-10-15
+
+- **Contribution guide and CI regression guards** — `CONTRIBUTING.md` documents
+  how to bring lab work upstream (branch from current upstream, one topic per
+  PR, conflict-resolution rules, opt-in defaults, profile-only site settings)
+  and a PR template carries the checklist. CI gains a `regression-guards` job,
+  run on the PR merged into current main: `make guards` (conflict markers,
+  duplicated sibling tasks, `.gitignore` secret patterns, opt-in defaults pinned
+  in `tests/safe-defaults.yml`, CanvOS patches gated by `when:`, dict/list
+  conditionals, unread profile keys), `make render-check` (every profile's
+  finalize script, installer and cloud-config must render, validate and match
+  the committed `tests/golden/`), and `make test`. Each guard maps to a defect
+  that reached a branch while integrating #63-#65.
 
 ### 2026-09-28
 

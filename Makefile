@@ -62,7 +62,7 @@ install-deps: ## Install all build dependencies
 # through scripts/shellcheck-templates.sh (renders then shellchecks). Gates
 # ratchet via SHELLCHECK_SEVERITY (error -> warning -> style). See plan Part C.
 SHELLCHECK_SEVERITY ?= error
-SH_FILES = $(shell git ls-files '*.sh' | grep -v -E '^(CanvOS/|build/|dist/|logs/)')
+SH_FILES = $(shell git ls-files '*.sh' | grep -v -E '^(CanvOS/|build/|dist/|logs/|tests/golden/)')
 
 .PHONY: lint
 lint: ## Lint bash (.sh + .sh.j2), YAML, and Ansible
@@ -92,6 +92,25 @@ analyze: ## Static analysis: secrets (gitleaks) + IaC (checkov) + Python (bandit
 	  echo "== checkov (soft-fail during rollout) =="; checkov --config-file .checkov.yaml || true; \
 	  echo "== bandit (Python; none yet) =="; bandit -r . -c pyproject.toml -q 2>/dev/null || true; \
 	} 2>&1 | tee $(LOGS_DIR)/analyze.log
+
+.PHONY: guards
+guards: ## Structural guards: merge leftovers, duplicate tasks, safe defaults, secrets ignores
+	python3 -I scripts/repo-guards.py
+
+.PHONY: render-check
+render-check: ## Render every profile's node artifacts; validate + diff against tests/golden/
+	scripts/render-profiles.sh check
+
+.PHONY: render-update
+render-update: ## Rewrite tests/golden/ after an intended change (review the diff!)
+	scripts/render-profiles.sh update
+
+.PHONY: test
+test: ## Unit tests for the repo's own scripts (pytest)
+	python3 -m pytest -q -p no:cacheprovider tests/
+
+.PHONY: check
+check: fmt-check lint analyze guards render-check test ## Everything CI runs, locally
 
 .PHONY: lint-fix
 lint-fix: fmt ## Apply safe auto-fixes (shfmt format; ansible-lint --fix)
