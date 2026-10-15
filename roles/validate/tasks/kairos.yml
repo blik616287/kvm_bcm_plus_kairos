@@ -58,9 +58,6 @@
       - { name: "stylus-agent", status: "{{ 'PASS' if (_ko.stylus == 'active') else 'WARN' }}", detail: "{{ _ko.stylus }}" }
       - { name: "net.ifnames=0", status: "{{ 'PASS' if ('net.ifnames=0' in (_ko.cmdline | default(''))) else 'WARN' }}", detail: "" }
       - { name: "Kairos boot chain", status: "{{ 'PASS' if (('rd.immucore' in (_ko.cmdline | default(''))) or ('rd.cos' in (_ko.cmdline | default('')))) else 'WARN' }}", detail: "" }
-      - { name: "rd.auto=1 on cmdline", status: "{{ 'PASS' if ('rd.auto=1' in (_ko.cmdline | default(''))) else 'FAIL' }}", detail: "{{ 'the OS mirror only assembles if this is present' if ('rd.auto=1' not in (_ko.cmdline | default(''))) else '' }}" }
-      - { name: "md0 assembled", status: "{{ 'PASS' if (_ko.md0_members | default('') | length > 0) else 'FAIL' }}", detail: "{{ _ko.md0_members | default('no array at /dev/md0 -- /dev/md/ holds: ' ~ (_ko.md_dev | default('nothing'))) }}" }
-      - { name: "md0 = 2 smallest disks", status: "{{ 'PASS' if ((_ko.md0_members | default('') | length > 0) and ((_ko.md0_members | default('')) == (_ko.md0_smallest | default('none')))) else 'FAIL' }}", detail: "{{ 'md0=[' ~ (_ko.md0_members | default('')) ~ '] smallest=[' ~ (_ko.md0_smallest | default('')) ~ ']' }}" }
       - { name: "COS_OEM", status: "{{ 'PASS' if (_kc.cos_oem == 0) else 'WARN' }}", detail: "{{ _ko.cos_oem }}" }
       - { name: "COS_RECOVERY", status: "{{ 'PASS' if (_kc.cos_recovery == 0) else 'WARN' }}", detail: "{{ _ko.cos_recovery }}" }
       - { name: "COS_STATE", status: "{{ 'PASS' if (_kc.cos_state == 0) else 'WARN' }}", detail: "{{ _ko.cos_state }}" }
@@ -68,3 +65,19 @@
       - { name: "Root immutable (ro)", status: "{{ 'PASS' if (('ro,' in (_ko.root | default(''))) or ('ro ' in (_ko.root | default('')))) else 'WARN' }}", detail: "" }
       - { name: "OEM cloud-config", status: "{{ 'PASS' if (_ko.oem | length > 0) else 'FAIL' }}", detail: "{{ _ko.oem }}" }
       - { name: "Palette registration", status: "{{ 'PASS' if ((_ko.palette | default('0') | int) > 0) else 'WARN' }}", detail: "{{ 'registered (stylus log)' if ((_ko.palette | default('0') | int) > 0) else 'no registration log entries' }}" }
+
+# RAID profiles only (kairos_build_mdraid + an OS array): the node must boot with
+# rd.auto on the kernel line and its OS mirror assembled as /dev/md0 over the N
+# smallest disks. Rendered as a separate step so a single-disk node never sees
+# these, rather than failing checks that do not apply to it.
+- name: Record Kairos RAID check results (kairos_build_mdraid)
+  ansible.builtin.set_fact:
+    validate_results: "{{ validate_results + _items }}"
+  when:
+    - kairos_build_mdraid | default(false) | bool
+    - kairos_os_raid is defined and kairos_os_raid
+  vars:
+    _items:
+      - { name: "rd.auto=1 on cmdline", status: "{{ 'PASS' if ('rd.auto=1' in (_ko.cmdline | default(''))) else 'FAIL' }}", detail: "{{ 'the OS mirror only assembles if this is present' if ('rd.auto=1' not in (_ko.cmdline | default(''))) else '' }}" }
+      - { name: "md0 assembled", status: "{{ 'PASS' if (_ko.md0_members | default('') | length > 0) else 'FAIL' }}", detail: "{{ _ko.md0_members | default('no array at /dev/md0 -- /dev/md/ holds: ' ~ (_ko.md_dev | default('nothing'))) }}" }
+      - { name: "md0 = 2 smallest disks", status: "{{ 'PASS' if ((_ko.md0_members | default('') | length > 0) and ((_ko.md0_members | default('')) == (_ko.md0_smallest | default('none')))) else 'FAIL' }}", detail: "{{ 'md0=[' ~ (_ko.md0_members | default('')) ~ '] smallest=[' ~ (_ko.md0_smallest | default('')) ~ ']' }}" }
