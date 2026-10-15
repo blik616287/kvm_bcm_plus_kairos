@@ -188,3 +188,8 @@ vip_skip: true
 # without VMX/AMD-V). Asserted before the install so a host that cannot
 # virtualise fails loudly instead of leaving a blank raw disk behind.
 kairos_build_qemu_accel: kvm
+
+# Interfaces to pin to NO address (a 05-<iface>.network with DHCP=no), so DHCP
+# cannot hand a second NIC the node's own IP. Empty by default; the DGX lab
+# profiles set [eth2], whose DHCP otherwise duplicates eth1's address.
+kairos_no_address_ifaces: []

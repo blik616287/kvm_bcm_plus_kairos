@@ -54,10 +54,14 @@ users:
 {# A stage key with no entries under it renders as YAML null, and the kairos
    collector panics (nil deref in DeepMerge) instead of installing -- so every
    stage key below is emitted only when something is actually written into it. #}
-{% set want_initramfs = palette_api_key is defined and palette_api_key | length > 0 and palette_project_uid is defined and palette_project_uid | length > 0 %}
+{% set want_palette_env = palette_api_key is defined and palette_api_key | length > 0 and palette_project_uid is defined and palette_project_uid | length > 0 %}
+{% set noaddr_ifaces = kairos_no_address_ifaces | default([]) %}
+{% set want_initramfs = want_palette_env or (noaddr_ifaces | length > 0) %}
 stages:
 {% if want_initramfs %}
   initramfs:
+{% endif %}
+{% if want_palette_env %}
     - name: "Write Palette admin creds for pre-registration cleanup"
       files:
         - path: /oem/palette-admin.env
@@ -69,15 +73,17 @@ stages:
           owner: 0
           group: 0
 {% endif %}
-    # eth2 has no static config, so it falls through to 20-dhcp-legacy.network
-    # and the lab DHCP hands it 10.184.70.7 -- eth1's address. Two NICs answering
-    # ARP for .7 flaps the MAC BCM derives NODE_NAME from. Sorts before 20-.
-    - name: "Pin eth2 to no address so DHCP cannot duplicate the node IP"
+{% for iface in noaddr_ifaces %}
+    # kairos_no_address_ifaces: an interface with no static config falls through
+    # to 20-dhcp-legacy.network; on the DGX lab the DHCP server hands eth2 the
+    # same address as eth1, and two NICs answering ARP for it flaps the MAC that
+    # BCM derives NODE_NAME from. 05- sorts before 20-.
+    - name: "Pin {{ iface }} to no address so DHCP cannot duplicate the node IP"
       files:
-        - path: /etc/systemd/network/05-eth2.network
+        - path: /etc/systemd/network/05-{{ iface }}.network
           content: |
             [Match]
-            Name=eth2
+            Name={{ iface }}
 
             [Network]
             DHCP=no
@@ -85,6 +91,7 @@ stages:
           permissions: 0644
           owner: 0
           group: 0
+{% endfor %}
   boot:
     # /etc/shadow is rebuilt on every boot, so the hash must be re-asserted here.
     - name: "Re-assert the kairos password hash on the ephemeral /etc"
@@ -100,6 +107,7 @@ stages:
       commands:
         - systemctl restart sshd || systemctl restart ssh || true
         - systemctl disable --now fail2ban 2>/dev/null || true
+{% if kairos_build_mdraid | default(false) | bool %}
     - name: "mdraid: pin rd.auto on the kernel line via the OEM grubenv"
       commands:
         - |
@@ -116,7 +124,7 @@ stages:
           if [ -f /oem/grubenv ] && command -v grub2-editenv > /dev/null 2>&1; then
             grub2-editenv /oem/grubenv set extra_active_cmdline="rd.auto=1 net.ifnames=0 biosdevname=0"
           fi
-
+{% endif %}
 {% if bcm_ssh_key_content is defined and bcm_ssh_key_content | length > 0 %}
     - name: "Install BCM SSH key"
       files:
