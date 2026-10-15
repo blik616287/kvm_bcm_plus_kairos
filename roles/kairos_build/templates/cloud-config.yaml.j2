@@ -249,7 +249,14 @@ stages:
               -i /var/lib/bcm/bcm-key \
               root@{{ bcm_internal_ip }}:/cm/node-installer/certificates/${NODE_MAC}/key \
               /var/lib/cm/cmd-etc/cert.key 2>/dev/null || true
-          nohup unshare --mount --fork /bin/bash -c "
+          # cmd reports the KERNEL hostname to the head node, and BCM renames the
+          # device to whatever it reports. The system hostname stays the Palette
+          # edge-host id (kubelet's node identity is bound to it), so give cmd its
+          # own UTS namespace carrying the BCM device name instead: without this
+          # the node renames its own BCM device to edge-<uuid>, and every later
+          # `device use <name>` (deploy-dd, the NOSYNC disarm, validate) misses.
+          nohup unshare --mount --uts --fork /bin/bash -c "
+            hostname ${NODE_NAME} 2>/dev/null || echo ${NODE_NAME} > /proc/sys/kernel/hostname
             mount --bind /var/lib/cm/cmd-etc /var/lib/cm/rootfs/cm/local/apps/cmd/etc
             mount -t proc proc /var/lib/cm/rootfs/proc 2>/dev/null || true
             mount -t sysfs sysfs /var/lib/cm/rootfs/sys 2>/dev/null || true
