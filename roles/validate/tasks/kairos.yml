@@ -75,7 +75,7 @@
     validate_results: "{{ validate_results + _items }}"
   when:
     - kairos_build_mdraid | default(false) | bool
-    - kairos_os_raid is defined and kairos_os_raid
+    - (kairos_os_raid | default({})) | length > 0
   vars:
     _items:
       - { name: "rd.auto=1 on cmdline", status: "{{ 'PASS' if ('rd.auto=1' in (_ko.cmdline | default(''))) else 'FAIL' }}", detail: "{{ 'the OS mirror only assembles if this is present' if ('rd.auto=1' not in (_ko.cmdline | default(''))) else '' }}" }
