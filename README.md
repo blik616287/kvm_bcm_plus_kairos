@@ -255,6 +255,13 @@ make stop               # Stop all VMs
 make bcm-serial         # Tail BCM serial log
 make kairos-serial      # Tail Kairos serial log
 
+# Quality gates (CI runs all of these; see CONTRIBUTING.md)
+make check              # fmt-check + lint + analyze + guards + render-check + test
+make guards             # merge leftovers, duplicate tasks, safe defaults, secrets ignores
+make render-check       # every profile's finalize/installer/cloud-config vs tests/golden/
+make render-update      # regenerate tests/golden/ after an intended change
+make test               # unit tests for the repo's scripts
+
 # Cleanup
 make clean              # Stop VMs, then remove build/, logs/
 make clean-dist         # Remove downloaded ISOs
@@ -389,6 +396,7 @@ Full detail, including the failure signatures for each of the five settings, is 
 - `docs/POC_Client_Deployment.md` — client-facing POC deployment document (also rendered to `docs/POC_Client_Deployment.pdf`)
 - `docs/pipeline-deep-dive.md` — engineer-level walkthrough of every stage, including the exact commands each role issues and why
 - `docs/stage-palette-appliance.md` — the optional self-hosted Palette appliance (networking, ordering, troubleshooting)
+- `CONTRIBUTING.md` — how to land a change upstream without changing anyone else's node: branching from current upstream, resolving conflicts, opt-in rules, `make check`, the golden render diff, and what CI guards
 
 ## Key Design Points
 
@@ -574,7 +582,9 @@ Milestones and notable changes, newest first. Each entry links its JIRA ticket
   - **Day-2:** build/load and upload are separate phases (`make kairos-image-push`).
   - **Node identity:** the cloud-config resolves the BCM device name from every
     local MAC then the routed IP, no longer writes it into the hostname (that
-    desynced kubelet from its edge-host cert), and declares the `kairos` password
+    desynced kubelet from its edge-host cert) -- the node's BCM `cmd` runs in its own
+    UTS namespace carrying the BCM name instead, so BCM does not rename the device
+    to `edge-<uuid>` -- and declares the `kairos` password
     as a crypt hash under `stylus.site.users`. `vip_skip` exposes
     `stylus.vip.skip` (default unchanged: `true`).
   - **deploy-dd:** authorizes the image's BCM key on the head node (previously
@@ -585,6 +595,18 @@ Milestones and notable changes, newest first. Each entry links its JIRA ticket
     FULL-install prompt for 2h), `kairos_no_address_ifaces: [eth2]`,
     `kairos_wipe_all_nvme`, `dd_disksetup_reconcile`. All default off.
   CanvOS still tracks upstream `main` (the PR's `v4.9.36` pin was not taken).
+
+- **Contribution guide and CI regression guards** — `CONTRIBUTING.md` documents
+  how to bring lab work upstream (branch from current upstream, one topic per
+  PR, conflict-resolution rules, opt-in defaults, profile-only site settings)
+  and a PR template carries the checklist. CI gains a `regression-guards` job,
+  run on the PR merged into current main: `make guards` (conflict markers,
+  duplicated sibling tasks, `.gitignore` secret patterns, opt-in defaults pinned
+  in `tests/safe-defaults.yml`, CanvOS patches gated by `when:`, dict/list
+  conditionals, unread profile keys), `make render-check` (every profile's
+  finalize script, installer and cloud-config must render, validate and match
+  the committed `tests/golden/`), and `make test`. Each guard maps to a defect
+  that reached a branch while integrating #63-#65.
 
 ### 2026-09-28
 

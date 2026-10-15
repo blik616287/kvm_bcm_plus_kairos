@@ -11,6 +11,7 @@ exclude_paths:
   - logs/
   - .github/
   - tests/fixtures/
+  - tests/golden/
 
 # warn_list = known debt: surfaced but non-fatal. Burn these down as the stage
 # march converts orchestration to native tasks, then delete each entry (the

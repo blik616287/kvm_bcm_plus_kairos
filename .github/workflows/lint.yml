@@ -47,3 +47,32 @@ jobs:
 
       - name: make analyze
         run: make analyze
+
+  # Behaviour guards. Run on the PR *merged into current main* (the default
+  # pull_request checkout), so a merge that git resolved without a conflict but
+  # that changes a profile, duplicates a block, or breaks a template is caught
+  # here rather than on a node. See CONTRIBUTING.md, "What CI guards and why".
+  regression-guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools (pinned; the goldens are rendered with this ansible-core)
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          pip install --quiet "ansible-core==2.20.2" pyyaml pytest
+          ansible --version | head -1; shellcheck --version | sed -n 2p
+
+      - name: make guards (merge leftovers, duplicate tasks, safe defaults, secrets ignores)
+        run: make guards
+
+      - name: make render-check (every profile renders, validates, and matches tests/golden/)
+        run: make render-check
+
+      - name: make test (unit tests for the repo's scripts)
+        run: make test

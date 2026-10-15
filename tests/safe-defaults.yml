@@ -1,0 +1,21 @@
+---
+# Role defaults that keep today's behaviour for every profile that does not opt
+# in. scripts/repo-guards.py fails if a default drifts from the value pinned
+# here, so changing one is a deliberate two-file edit that a reviewer sees.
+# Add an entry whenever you introduce an opt-in knob (see CONTRIBUTING.md).
+
+roles/deploy_dd/defaults/main.yml:
+  deploy_dd_finalize_install: false   # dd from the node-installer, not the default path
+  kairos_raid_select: name
+  kairos_wipe_all_nvme: false         # wipes every nvme on the node
+  dd_disksetup_reconcile: false       # diskless category + datanode
+  dd_category_datanode: true          # only consulted when reconcile is on
+  dd_disksetup_xml_file: ""
+
+roles/kairos_build/defaults/main.yml:
+  kairos_build_mdraid: false          # RAID-capable image
+  kairos_build_raw_disk: true         # day-1 path unless `make kairos-image`
+  kairos_extra_apt_packages: []
+  kairos_k8s_versions: {}
+  kairos_build_bcm_integration: true
+  kairos_cloud_config_template: "cloud-config.yaml.j2"

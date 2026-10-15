@@ -1,0 +1,25 @@
+---
+# Stand-ins for the run-time facts and secrets the golden renders need
+# (scripts/render-profiles.sh). NOT deployment values: fixed placeholders, so a
+# render is byte-identical on every machine and a change in a golden file can
+# only come from a change in a template, a default, a profile, or this file.
+
+e2e_dir: "/opt/e2e"
+build_dir: "/opt/e2e/build"
+dist_dir: "/opt/e2e/dist"
+
+# Palette credentials present, so the edge cloud-config renders its initramfs
+# stage. tests/render/variants/default-no-palette.yml renders without them.
+palette_api_key: "FIXTURE-PALETTE-API-KEY"
+palette_project_uid: "FIXTURE-PROJECT-UID"
+
+# Set by kairos_build from build/bcm-kairos-key at run time.
+bcm_ssh_key_content: "FIXTURE-BCM-SSH-PRIVATE-KEY"
+
+# Computed by the appliance flow at run time.
+appliance_admin_password_hash: "FIXTURE-APPLIANCE-ADMIN-HASH"
+
+# Never defaulted by the roles (it picks the disk that gets dd'd); the
+# local-KVM example config sets /dev/vda, and profiles that need another
+# disk set their own.
+kairos_target_disk: "/dev/vda"

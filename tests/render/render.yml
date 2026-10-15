@@ -1,0 +1,29 @@
+---
+# Render the per-node artifacts of ONE profile into `out`, for the golden
+# render check (scripts/render-profiles.sh). Variables arrive as extra-vars
+# already merged in precedence order by tests/render/merge_vars.py.
+- name: Render the per-node artifacts of one profile
+  hosts: localhost
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Create the output directory
+      ansible.builtin.file:
+        path: "{{ out }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render the dd installer and the finalize script (stage 4)
+      ansible.builtin.template:
+        src: "{{ repo }}/roles/deploy_dd/templates/{{ item }}.j2"
+        dest: "{{ out }}/{{ item }}"
+        mode: "0644"
+      loop:
+        - install-kairos.sh
+        - kairos-finalize.sh
+
+    - name: Render the image cloud-config the profile selects (stage 3)
+      ansible.builtin.template:
+        src: "{{ repo }}/roles/kairos_build/templates/{{ kairos_cloud_config_template }}"
+        dest: "{{ out }}/cloud-config.yaml"
+        mode: "0644"

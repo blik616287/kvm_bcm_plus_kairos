@@ -1,0 +1,54 @@
+#!/bin/bash
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+set -euo pipefail
+LOG="/dev/shm/kairos-install.log"
+# Mirror all output to ttyS0 so it appears in the QEMU serial log file.
+exec > >(tee -a "$LOG" /dev/ttyS0) 2>&1
+HEAD_IP="192.168.98.2"
+RAW_URL="http://${HEAD_IP}:8888/palette-appliance/disk.raw.lz4"
+DISK="/dev/vda"
+WIPE_DISKS=""
+echo "[$(date)] Kairos Raw Image Installer"
+echo "[$(date)] URL: ${RAW_URL}  Target: ${DISK:-NOT FOUND}  Wipe: ${WIPE_DISKS:-<none>}"
+[[ -z "$DISK" || ! -b "$DISK" ]] && { echo "ERROR: No disk"; exit 1; }
+RETRIES=0
+while ! curl --fail --silent --head "$RAW_URL" >/dev/null 2>&1; do
+    RETRIES=$((RETRIES + 1)); (( RETRIES >= 60 )) && { echo "ERROR: Server unreachable"; exit 1; }; sleep 10
+done
+echo "[$(date)] Staging binaries to RAM..."
+RAMDIR="/dev/shm/kinstall"
+mkdir -p "$RAMDIR/lib"
+# Search each standard directory so we don't depend on PATH being fully set during staging.
+for bin in bash curl lz4 dd sync sleep timeout sgdisk wipefs dmsetup efibootmgr partprobe blkid awk e2fsck resize2fs partx vgchange pvscan udevadm umount swapoff mdadm findmnt; do
+    for dir in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+        [ -x "$dir/$bin" ] && cp "$dir/$bin" "$RAMDIR/" 2>/dev/null && echo "staged $bin from $dir" && break || true
+    done
+done
+for b in "$RAMDIR"/*; do
+    [ -f "$b" ] && [ -x "$b" ] || continue
+    ldd "$b" 2>/dev/null | awk '/=>/ {print $3} !/=>/ && /^\// {print $1}' | while read -r l; do
+        [ -f "$l" ] && cp -n "$l" "$RAMDIR/lib/" 2>/dev/null || true
+    done || true
+done
+
+# Enable sysrq while system bash still has full access to /proc
+echo 1 > /proc/sys/kernel/sysrq
+
+# run-dd.sh is shipped in the installer image (staged by deploy_dd into
+# /usr/local/sbin/run-dd.sh) — copy it to RAM and pass the install params via
+# env. (Was a 168-line inline heredoc; now a real, shellcheckable
+# roles/deploy_dd/files/run-dd.sh.)
+cp /usr/local/sbin/run-dd.sh "$RAMDIR/run-dd.sh"
+export DISK WIPE_DISKS RAW_URL
+chmod +x "$RAMDIR/run-dd.sh"
+# Belt-and-suspenders: strip any /dev/shm/kinstall/ absolute paths from command lines
+# so they use PATH (NFS system paths survive root remounts). Skip 'export' lines so
+# LD_LIBRARY_PATH and PATH keep their /dev/shm/kinstall references intact.
+sed -i '/^export /!s|/dev/shm/kinstall/||g' "$RAMDIR/run-dd.sh"
+echo "[$(date)] Starting dd..."
+# Stop udev BEFORE dd so new partition events are queued but not processed during install.
+# This prevents snapd/gpt-auto-generator from automounting Kairos partitions mid-install
+# and overlaying /dev/shm (breaking staged binaries) or /proc (breaking sysrq poweroff).
+udevadm control --stop-exec-queue 2>/dev/null || true
+export LD_LIBRARY_PATH="$RAMDIR/lib"
+exec "$RAMDIR/bash" "$RAMDIR/run-dd.sh"
