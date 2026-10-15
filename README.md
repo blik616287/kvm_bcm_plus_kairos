@@ -117,27 +117,29 @@ make kairos-image
 
 Wraps `ansible-playbook playbooks/03-kairos-build.yml -e kairos_build_raw_disk=false`,
 which switches the `kairos_build` role from the day-1 path
-(`./earthly.sh +iso`) to the day-2 path
-(`./earthly.sh --push +build-provider-images --ARCH=<arch>`).
+(`./earthly.sh +iso`) to the day-2 path, run as two phases so a failed upload
+never costs a rebuild:
 
-What happens during the run:
+1. **Build + load** — `./earthly.sh +build-provider-images --ARCH=<arch>`, with
+   no `--push`, so `SAVE IMAGE --push` only loads each provider image into the
+   local Docker daemon. CanvOS builds the `.arg` `K8S_DISTRIBUTION`, for each
+   version `CanvOS/k8s_version.json` lists under it (the role renders that file
+   from `kairos_k8s_versions`; empty dict = upstream file unmodified), or just
+   the `.arg` `K8S_VERSION` when one is set.
+2. **Upload** — `docker push` of each of those refs, each attempt bounded by
+   `kairos_upload_timeout` and retried `kairos_upload_attempts` times.
+   `scripts/provider-image-refs.py` derives the refs the same way the Earthfile
+   names them, and fails rather than pushing nothing.
 
-1. CanvOS's `+build-provider-images` target reads `CanvOS/k8s_version.json` —
-   the role renders this from the `kairos_k8s_versions` inventory variable
-   (empty dict = use upstream file unmodified).
-2. For each `(distribution, version)` entry, Earthly invokes
-   `+provider-image --K8S_VERSION=<version>`, which contains a
-   `SAVE IMAGE --push <full image ref>`.
-3. The `--push` CLI flag — passed by the role specifically for this day-2 path —
-   tells Earthly to actually upload. Without it, `SAVE IMAGE --push` in the
-   Earthfile is a no-op (image only goes to the local Docker daemon). Day-1's
-   `+iso` target intentionally doesn't push because dd-install never pulls
-   from a registry; only `make kairos-image` adds `--push`.
+`make kairos-image-push` retries only phase 2 against the images already in
+the local daemon. A plain `make kairos-image` re-run also skips phase 1 when
+every expected image is present locally and was built from the same inputs.
+Day-1's `+iso` never pushes: dd-install never pulls from a registry.
 
 Tag format: `<registry>/<repo>:<distribution>-<version>-<PE_VERSION>-<CUSTOM_TAG>`,
 e.g. `ttl.sh/ubuntu:k3s-1.31.6-v4.8.10-bcm-test`.
-`PE_VERSION` is set in the CanvOS Earthfile (currently `v4.8.10`). `CUSTOM_TAG`
-is from `.arg`.
+`PE_VERSION` comes from `.arg` when a profile sets it, else from the CanvOS
+Earthfile default. `CUSTOM_TAG` is from `.arg`.
 
 For a **multi-version matrix push**, use bare version strings (CanvOS appends
 the flavor tag itself):
@@ -216,6 +218,7 @@ make bcm-prepare        # Stage 1 — local-KVM only
 make bcm-vm             # Stage 2 — local-KVM only
 make kairos-build       # Stage 3 — builds Kairos raw image via CanvOS + OVMF (day-1)
 make kairos-image       # Stage 3 image-only — push container image only (day-2 upgrade)
+make kairos-image-push  # Stage 3 upload-only — retry the push of an already-built image
 make deploy-dd          # Stage 4 — push to BCM, configure PXE + kairos category
 make kairos-vm          # Stage 5 — local-KVM only (PXE boots a local compute VM)
 make validate           # Stage 6 — ~40-point health check
@@ -549,6 +552,39 @@ Force a full rebuild with `make clean && make all` (local-KVM) or `make clean &&
 
 Milestones and notable changes, newest first. Each entry links its JIRA ticket
 (project `IN`) and PR. New milestones append here as part of the same PR.
+
+### 2026-10-15
+
+- **DGX lab hardening from #65, ported onto main without regressions**
+  ([#65](https://github.com/blik616287/kvm_bcm_plus_kairos/pull/65)) —
+  jbergfeld's lab commits (plus Kem Okonkwo's cmsh read-back assertions), merged
+  onto current main. What they add:
+  - **md0 at boot:** the RAID image ships `HOMEHOST none` + `ARRAY /dev/md0 name=md0`
+    (by-path/by-id `devices=` for `path`/`id` profiles) in its initramfs
+    (`mdadmconf=yes`), pins `rd.auto=1` in the provider image's own bootargs and
+    the node's OEM grubenv so a Palette day-2 upgrade keeps it, and the build
+    audits the initrd directly (`scripts/mdadm-initrd-audit.py`). Finalize stops
+    every md array before touching disks and refuses `kairos_raid_select: name`
+    for profiles that build an array. Validate adds md0 / rd.auto checks for RAID
+    profiles.
+  - **Builds that cannot ship stale or blank images:** build-input stamps force an
+    ISO/raw rebuild when roles, profiles, overlay or `all.yml` change; the CanvOS
+    apt stage runs non-interactively; QEMU start failures fail the task
+    (`kairos_build_qemu_accel` kvm|tcg).
+  - **Day-2:** build/load and upload are separate phases (`make kairos-image-push`).
+  - **Node identity:** the cloud-config resolves the BCM device name from every
+    local MAC then the routed IP, no longer writes it into the hostname (that
+    desynced kubelet from its edge-host cert), and declares the `kairos` password
+    as a crypt hash under `stylus.site.users`. `vip_skip` exposes
+    `stylus.vip.skip` (default unchanged: `true`).
+  - **deploy-dd:** authorizes the image's BCM key on the head node (previously
+    done by hand), clears a stale one-shot `nextinstallmode`, and reads back
+    every cmsh mutation instead of ignoring its exit code.
+  - **DGX-only opt-ins**, set by `kairos-dgx2.yml` and the now-tracked
+    `kairos-dgx4.yml`: `deploy_dd_autoconfirm_install` (pre-approve BCM's
+    FULL-install prompt for 2h), `kairos_no_address_ifaces: [eth2]`,
+    `kairos_wipe_all_nvme`, `dd_disksetup_reconcile`. All default off.
+  CanvOS still tracks upstream `main` (the PR's `v4.9.36` pin was not taken).
 
 ### 2026-09-28
 
