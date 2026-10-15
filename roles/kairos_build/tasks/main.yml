@@ -125,15 +125,11 @@
         regexp: 'apt-get install --no-install-recommends kbd'
         replace: 'apt-get install --no-install-recommends wget ifupdown nfs-common {{ "mdadm " if (kairos_build_mdraid | default(false) | bool) else "" }}kbd'
 
-    # The replace above is a no-op when the apt line changes shape in a new
-    # release, which would leave dracut unable to build the mdraid initramfs.
-    # Assert the patched text is present rather than trusting the no-op.
-    - name: Assert mdadm landed in the CanvOS core-build package list (kairos_build_mdraid)
-      ansible.builtin.assert:
-        that:
-          - "'nfs-common mdadm kbd' in lookup('file', canvos_dir ~ '/Earthfile')"
-        fail_msg: "CanvOS Earthfile package list has no 'nfs-common mdadm kbd' — its apt line shape changed, so mdadm is not installed in the core build and the mdraid initramfs cannot be built."
-      when: kairos_build_mdraid | default(false) | bool
+    # NOTE: the replace above matches nothing on current CanvOS (the package list
+    # no longer has that shape), so it adds nothing; mdadm reaches the image from
+    # the Kairos base. Whether mdadm and the mdraid module actually landed is
+    # asserted on the BUILT image (rootfs + initramfs) further down, which checks
+    # the outcome rather than this text.
 
     # CanvOS writes `RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get
     # upgrade ...`. The env assignment binds only to `apt-get update`, so the
@@ -219,7 +215,7 @@
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
         regexp: "> /etc/dracut.conf.d/15-mdraid.conf"
         line: "{{ kairos_dracut_indent }}    RUN echo 'add_dracutmodules+=\" mdraid \"' > /etc/dracut.conf.d/15-mdraid.conf"
-      when: kairos_build_mdraid | default(false) | bool
+        state: "{{ 'present' if (kairos_build_mdraid | default(false) | bool) else 'absent' }}"
 
     # Pin the OS array in mdadm.conf, for two reasons that are separate bugs.
     # (1) Boot-time auto-assembly names the array md127 when homehost does not
@@ -245,8 +241,21 @@
         # checkout already patched by the broken version gets REPLACED rather
         # than gaining a second, still-broken ARRAY line.
         regexp: "RUN mkdir -p /etc/mdadm"
-        line: "{{ kairos_dracut_indent }}    RUN mkdir -p /etc/mdadm && printf 'HOMEHOST none\\nARRAY /dev/md0 metadata={{ kairos_os_raid.metadata | default('1.0') }} name=md0 devices={{ kairos_os_raid.devices | default([]) | map('regex_replace', '^', '/dev/disk/by-path/') | join(',') }}\\n' > /etc/mdadm/mdadm.conf"
-      when: kairos_build_mdraid | default(false) | bool
+        line: >-
+          {{ kairos_dracut_indent }}    RUN mkdir -p /etc/mdadm && printf 'HOMEHOST none\nARRAY /dev/md0
+          metadata={{ (kairos_os_raid | default({})).metadata | default('1.0') }} name=md0{{ kairos_mdadm_devices }}\n'
+          > /etc/mdadm/mdadm.conf
+        state: "{{ 'present' if (kairos_build_mdraid | default(false) | bool) else 'absent' }}"
+      vars:
+        # devices= only when the specs ARE stable udev names (path/id). Under
+        # `size` or `name` they are kernel names (nvme0n1) that do not exist
+        # under /dev/disk/by-*, and a devices= list matching nothing keeps
+        # `mdadm --assemble --scan` from assembling the array at all.
+        kairos_mdadm_devices: >-
+          {%- set sel = kairos_raid_select | default('name') -%}
+          {%- if sel in ['path', 'id'] -%}
+          {{ ' devices=' ~ ((kairos_os_raid | default({})).devices | default([]) | map('regex_replace', '^', '/dev/disk/by-' ~ sel ~ '/') | join(',')) }}
+          {%- endif -%}
 
     # dracut's 90mdraid module installs mdadm.conf only when $hostonly is set or
     # mdadmconf="yes"; Kairos images are built non-hostonly (one image must boot
@@ -261,7 +270,7 @@
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
         regexp: "> /etc/dracut.conf.d/16-mdadm-conf.conf"
         line: "{{ kairos_dracut_indent }}    RUN echo 'mdadmconf=\"yes\"' > /etc/dracut.conf.d/16-mdadm-conf.conf"
-      when: kairos_build_mdraid | default(false) | bool
+        state: "{{ 'present' if (kairos_build_mdraid | default(false) | bool) else 'absent' }}"
 
     - name: Assert the initramfs mdadm.conf will actually be honoured by mdadm
       ansible.builtin.assert:
@@ -331,7 +340,7 @@
           RUN if [ -f /etc/cos/bootargs.cfg ] && ! grep -Fq "rd.auto=1" /etc/cos/bootargs.cfg; then \
                   sed -i 's|\(set baseCmd="[^"]*\)"|\1 rd.auto=1"|' /etc/cos/bootargs.cfg; \
               fi
-      when: kairos_build_mdraid | default(false) | bool
+        state: "{{ 'present' if (kairos_build_mdraid | default(false) | bool) else 'absent' }}"
 
     - name: Assert rd.auto lands in the image cmdline (kairos_build_mdraid)
       ansible.builtin.assert:
