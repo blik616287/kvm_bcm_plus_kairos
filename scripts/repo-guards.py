@@ -45,10 +45,7 @@ REQUIRED_IGNORES = [
 
 # Known, pre-existing exceptions. Each entry must name its removal plan; delete
 # the entry in the change that fixes it.
-CANVOS_WHEN_ALLOWLIST = {
-    # Converted to state: present/absent by the PR #65 port.
-    "Patch Earthfile — include dracut mdraid module (kairos_build_mdraid)",
-}
+CANVOS_WHEN_ALLOWLIST = set()
 
 PATCH_MODULES = ("lineinfile", "blockinfile", "replace")
 MARKER = re.compile(r"^(<<<<<<< |>>>>>>> |=======$)", re.M)

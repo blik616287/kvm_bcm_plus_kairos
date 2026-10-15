@@ -49,6 +49,12 @@ done
 umount -Rfl /localdisk 2> /dev/null || true
 vgchange -an 2> /dev/null || true
 mdadm --stop "${DISK}"* 2> /dev/null || true
+# Stop EVERY md array before touching a disk. A previous install leaves md metadata
+# that udev auto-assembles at installer boot; a member held by a live array cannot be
+# re-created, because mdadm --create opens O_EXCL and dies "Device or resource busy".
+# By scan and by name, so an auto-assembled md127 (no mdadm.conf entry) is released too.
+mdadm --stop --scan 2> /dev/null || true
+for _md in /dev/md*; do [ -b "${_md}" ] && mdadm --stop "${_md}" 2> /dev/null || true; done
 dmsetup remove_all 2> /dev/null || true
 udevadm settle --timeout=20 2> /dev/null || true
 # Release any md array that currently holds one of our target disks. A previous

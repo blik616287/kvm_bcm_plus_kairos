@@ -10,8 +10,22 @@ stylus:
     tags:
       palette.ai: "true"
       palette.ai/control-plane: "true"
+    # Primary kairos password path. Applied by the early user-sync stage, so it
+    # does not depend on any boot stage completing.
+    users:
+      kairos:
+        username: kairos
+        passwd: $6$k4ir0s0112345678$ITJF/ShuOumrIp1XTVVrCluFuVdrc8lgjFN7wP0j2KD6qhPtzCNai5cQzlPAZj4HoTRqlYYx631zZKM8CqPE90
+        homedir: /home/kairos
+        groups:
+        - admin
+        password_expiry: ""
+
   vip:
     skip: true
+
+# lock_passwd: false only stops cloud-init locking the account; the password
+# itself comes from stylus.site.users above.
 users:
   - name: kairos
     shell: /bin/bash
@@ -31,10 +45,10 @@ stages:
           owner: 0
           group: 0
   boot:
-    - name: "Set kairos user password"
-      users:
-        kairos:
-          passwd: kairos
+    # /etc/shadow is rebuilt on every boot, so the hash must be re-asserted here.
+    - name: "Re-assert the kairos password hash on the ephemeral /etc"
+      commands:
+        - usermod -p '$6$k4ir0s0112345678$ITJF/ShuOumrIp1XTVVrCluFuVdrc8lgjFN7wP0j2KD6qhPtzCNai5cQzlPAZj4HoTRqlYYx631zZKM8CqPE90' kairos || useradd -p '$6$k4ir0s0112345678$ITJF/ShuOumrIp1XTVVrCluFuVdrc8lgjFN7wP0j2KD6qhPtzCNai5cQzlPAZj4HoTRqlYYx631zZKM8CqPE90' -m -s /bin/bash -G admin kairos
     - name: "Enable SSH password auth + disable fail2ban"
       files:
         - path: /etc/ssh/sshd_config.d/99-kairos-test.conf
@@ -56,20 +70,44 @@ stages:
     - name: "BCM integration: set NOSYNC + start cmd"
       commands:
         - |
+          # Interface-agnostic network gate. BCM's category sets net.ifnames=0,
+          # but the installed Kairos cmdline is sourced from the image's own
+          # bootargs.cfg and may not carry it, so eth0 need not exist at all.
+          # Resolve the egress interface for the BCM host instead of naming one.
           for i in $(seq 1 60); do
-            ip -4 addr show eth0 2>/dev/null | grep -q "inet " && \
+            BCM_IF=$(ip route get 192.168.98.2 2>/dev/null | awk '{for(j=1;j<=NF;j++) if($j=="dev"){print $(j+1); exit}}')
+            [ -n "${BCM_IF}" ] && \
+              ip -4 addr show "${BCM_IF}" 2>/dev/null | grep -q "inet " && \
               ping -c1 -W2 192.168.98.2 >/dev/null 2>&1 && break
             sleep 5
-          done || true
+          done
           ping -c1 -W2 192.168.98.2 >/dev/null 2>&1 || exit 0
           NODE_MAC=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}' | xargs -I{} ip link show {} 2>/dev/null | awk '/ether/{print $2}')
-          export NODE_NAME=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          # BCM keys each device on the MAC of the NIC it provisioned through,
+          # which need not be the default-route NIC -- and a DGX answers on the
+          # same address across ports, so the MAC that routes is often not the
+          # MAC BCM holds. Fetch the device list once, match every local MAC,
+          # then the routed IP, and fall back to the hostname only last. That
+          # fallback is the failure mode that matters: `cmsh device use
+          # edge-<uuid>` cannot find the device, so the NOSYNC disarm below
+          # silently never commits and the node stays armed for reinstall.
+          BCM_DEVLIST=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 -o LogLevel=ERROR -i /var/lib/bcm/bcm-key \
               root@192.168.98.2 \
-              "echo -e 'device\nlist' | cmsh 2>/dev/null | grep -i '${NODE_MAC}' | awk '{print \$2}'" \
-              2>/dev/null | grep -oE '^[a-zA-Z0-9_-]+$' | tail -1)
-          [ -z "${NODE_NAME}" ] && export NODE_NAME=$(hostname)
-          hostnamectl set-hostname "${NODE_NAME}" 2>/dev/null || hostname "${NODE_NAME}" 2>/dev/null || true
+              "echo -e 'device\nlist' | cmsh 2>/dev/null" 2>/dev/null)
+          export NODE_NAME=""
+          for _mac in $(cat /sys/class/net/*/address 2>/dev/null | tr 'A-Z' 'a-z'); do
+            [ "${_mac}" = "00:00:00:00:00:00" ] && continue
+            NODE_NAME=$(printf '%s\n' "${BCM_DEVLIST}" | awk -v m="${_mac}" 'tolower($3)==m {print $2; exit}')
+            [ -n "${NODE_NAME}" ] && break
+          done
+          if [ -z "${NODE_NAME}" ]; then
+            _ip=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+            NODE_NAME=$(printf '%s\n' "${BCM_DEVLIST}" | awk -v ip="${_ip}" '$5==ip {print $2; exit}')
+          fi
+          [ -z "${NODE_NAME}" ] && NODE_NAME=$(hostname)
+          export NODE_NAME
+          # Never written to the hostname: the node's identity is the Palette edge-host id, not NODE_NAME.
           # Push BCM-derived labels to the Palette edge-host record via admin
           # API. Stylus's own cloud-config merge doesn't pick up /oem/*.yaml
           # files written from stages.boot (kairos-agent's initramfs merge
@@ -144,7 +182,14 @@ stages:
               -i /var/lib/bcm/bcm-key \
               root@192.168.98.2:/cm/node-installer/certificates/${NODE_MAC}/key \
               /var/lib/cm/cmd-etc/cert.key 2>/dev/null || true
-          nohup unshare --mount --fork /bin/bash -c "
+          # cmd reports the KERNEL hostname to the head node, and BCM renames the
+          # device to whatever it reports. The system hostname stays the Palette
+          # edge-host id (kubelet's node identity is bound to it), so give cmd its
+          # own UTS namespace carrying the BCM device name instead: without this
+          # the node renames its own BCM device to edge-<uuid>, and every later
+          # `device use <name>` (deploy-dd, the NOSYNC disarm, validate) misses.
+          nohup unshare --mount --uts --fork /bin/bash -c "
+            hostname ${NODE_NAME} 2>/dev/null || echo ${NODE_NAME} > /proc/sys/kernel/hostname
             mount --bind /var/lib/cm/cmd-etc /var/lib/cm/rootfs/cm/local/apps/cmd/etc
             mount -t proc proc /var/lib/cm/rootfs/proc 2>/dev/null || true
             mount -t sysfs sysfs /var/lib/cm/rootfs/sys 2>/dev/null || true
