@@ -221,7 +221,9 @@
   # `fsmounts; remove` exits 0 whether or not it removed anything, so only the
   # read-back can tell us the mount will not be fstab'd onto the node.
   ansible.builtin.assert:
-    that: item not in dd_fs_after.stdout
+    # Whole mount-point token, as the strip's own `grep " <item> "` matches: a
+    # plain substring would also hit /cm/shared/apps or a master:/home device.
+    that: not (dd_fs_after.stdout is search('(^|\\s)' ~ (item | regex_escape) ~ '(\\s|$)', multiline=True))
     fail_msg: >-
       Category {{ kairos_profile }} still carries an fsmount for {{ item }}.
       BCM would write it into the node's /etc/fstab at install time.

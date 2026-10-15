@@ -23,11 +23,25 @@
     label: "{{ item.stat.path }}"
   delegate_to: bcm
 
+# BIOS PXE menu modules. A UEFI-only head node need not carry them, so a missing
+# source is reported rather than failing the deploy; a cp that fails with the
+# source present still fails.
 - name: Ensure the syslinux menu modules are present in /tftpboot
   ansible.builtin.shell: |
-    cp "/tftpboot/x86_64/bios/{{ item }}" "/tftpboot/{{ item }}" 2>/dev/null \
-      || cp "/usr/lib/syslinux/modules/bios/{{ item }}" "/tftpboot/{{ item }}"
+    for src in "/tftpboot/x86_64/bios/{{ item }}" "/usr/lib/syslinux/modules/bios/{{ item }}"; do
+      [ -f "$src" ] && { cp "$src" "/tftpboot/{{ item }}" || exit 1; echo copied; exit 0; }
+    done
+    echo "absent"
   args:
     creates: "/tftpboot/{{ item }}"
   loop: [menu.c32, libutil.c32, ldlinux.c32, libcom32.c32]
   delegate_to: bcm
+  register: dd_syslinux_mods
+  changed_when: "'copied' in (dd_syslinux_mods.stdout | default(''))"
+
+- name: Warn about syslinux menu modules the BCM does not have (BIOS PXE only)
+  ansible.builtin.debug:
+    msg: "No source for /tftpboot/{{ item.item }} on the BCM; BIOS PXE menus need it, UEFI boot does not."
+  loop: "{{ dd_syslinux_mods.results | selectattr('stdout', 'defined') | selectattr('stdout', 'equalto', 'absent') | list }}"
+  loop_control:
+    label: "{{ item.item }}"

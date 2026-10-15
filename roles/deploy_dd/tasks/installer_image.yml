@@ -148,11 +148,30 @@
   delegate_to: bcm
   when: dd_generators_dir.stat.exists
 
+# efibootmgr is optional downstream (install-kairos/finalize fall back to the
+# ESP's \EFI\BOOT\bootx64.efi without it), and a head node may keep it outside
+# /usr/bin or not have it at all. Probe for it, copy when found, say so when not.
+- name: Locate efibootmgr on the BCM
+  ansible.builtin.command: sh -c 'command -v efibootmgr'
+  delegate_to: bcm
+  register: dd_efibootmgr_src
+  changed_when: false
+  failed_when: false
+
 - name: Ensure efibootmgr is present in the image
-  ansible.builtin.command: "cp /usr/bin/efibootmgr {{ dd_image_root }}/usr/sbin/efibootmgr"
+  ansible.builtin.command: "cp {{ dd_efibootmgr_src.stdout | trim }} {{ dd_image_root }}/usr/sbin/efibootmgr"
   args:
     creates: "{{ dd_image_root }}/usr/sbin/efibootmgr"
   delegate_to: bcm
+  when: dd_efibootmgr_src.rc == 0
+
+- name: Warn that the installer image has no efibootmgr
+  ansible.builtin.debug:
+    msg: >-
+      efibootmgr is not on the BCM, so the installer image does not get it: the
+      node will boot the written disk through the ESP fallback loader rather
+      than a named Kairos UEFI boot entry.
+  when: dd_efibootmgr_src.rc != 0
 
 # ---- rsyncd module (additive, per profile) ----
 - name: Check for an existing rsyncd default-image module
