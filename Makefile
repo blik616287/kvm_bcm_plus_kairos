@@ -89,9 +89,10 @@ fmt-check: ## Check .sh formatting without writing (CI/gate)
 analyze: ## Static analysis: secrets (gitleaks) + IaC (checkov) + Python (bandit/vulture)
 	@mkdir -p $(LOGS_DIR)
 	@set -o pipefail; { \
-	  echo "== gitleaks (BLOCKING) =="; gitleaks detect --config .gitleaks.toml --redact -v --no-banner; \
+	  echo "== gitleaks (BLOCKING) =="; gitleaks detect --config .gitleaks.toml --redact -v --no-banner; gl=$$?; \
 	  echo "== checkov (soft-fail during rollout) =="; checkov --config-file .checkov.yaml || true; \
 	  echo "== bandit (Python; none yet) =="; bandit -r . -c pyproject.toml -q 2>/dev/null || true; \
+	  exit $$gl; \
 	} 2>&1 | tee $(LOGS_DIR)/analyze.log
 
 .PHONY: guards
