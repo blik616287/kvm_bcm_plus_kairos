@@ -91,6 +91,14 @@ kairos_wipe_all_nvme: true
 # disks. Checked and enforced on every deploy-dd.
 dd_disksetup_reconcile: true
 
+# Unattended re-image: pre-authorize BCM's FULL-install confirmation for the
+# install window (the console prompt otherwise blocks every install). Any reboot
+# of the node inside the window re-images it without asking.
+deploy_dd_autoconfirm_install: true
+
+# The lab DHCP hands eth2 the same address as eth1; pin it to no address.
+kairos_no_address_ifaces: [eth2]
+
 # Big disks -> the finalize-stage install (grow/timeout/efibootmgr fix) matters.
 deploy_dd_finalize_install: true
 

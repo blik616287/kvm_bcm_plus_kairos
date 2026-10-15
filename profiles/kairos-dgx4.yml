@@ -11,9 +11,6 @@
 # NOTE: the BCM category `kairos-dgx4` covers BOTH dgx03 and dgx04, so deploying
 # this profile rewrites the category both nodes provision from.
 #
-# NOTE: this file is GITIGNORED — .gitignore:66 ignores profiles/kairos-dgx4.yml by
-# exact name — so edits here are LOCAL to this checkout and reach nobody else.
-#
 # Palette endpoint/credentials are deliberately NOT here — they are shared and
 # live in the gitignored inventory/group_vars/all.yml. Pass it to every stage:
 #   make kairos-build ANSIBLE_ARGS="-e @profiles/kairos-dgx4.yml"
@@ -39,8 +36,8 @@ kairos_canvos_args:
 
 # One provider image, reproducibly: the role rewrites CanvOS/k8s_version.json
 # from this dict, so the narrowing to kubeadm 1.35.3 no longer depends on a
-# one-off -e. v4.9.36's own matrix carries 58 kubeadm versions (1.27.2..1.35.3)
-# and the role default distribution is k3s, so leaving this unset would fan the
+# one-off -e. CanvOS's own matrix carries dozens of kubeadm versions, and the
+# role default distribution is k3s, so leaving this unset would fan the
 # day-2 push out to the whole k3s list.
 kairos_k8s_versions:
   kubeadm:
@@ -84,10 +81,26 @@ kairos_target_disk: /dev/md0    # dd target = the assembled OS mirror
 # images to auto-mount it. Both behaviours are now off.
 kairos_data_raid: false
 
-# A floor, not the truth: the finalize unions this list with every nvme device the
-# kernel exposes, so a stale name can't leave a label-colliding superblock. This
-# clears any stray COS_*/raid labels; it does NOT put the disks into an array.
+# A floor, not the truth: with kairos_wipe_all_nvme the finalize unions this list
+# with every nvme device the kernel exposes, so a stale name can't leave a
+# label-colliding superblock. This clears any stray COS_*/raid labels; it does
+# NOT put the disks into an array.
 kairos_wipe_disks: "nvme0n1 nvme1n1 nvme2n1 nvme3n1 nvme4n1 nvme5n1 nvme6n1 nvme7n1 nvme8n1 nvme9n1"
+kairos_wipe_all_nvme: true
+
+# Keep BCM off every nvme: the category gets BCM's diskless disksetup and
+# datanode=yes, so BCM partitions nothing on PXE boot and the finalize owns the
+# disks. Checked and enforced on every deploy-dd. The node needs RAM larger than
+# the installer image, which BCM copies into a tmpfs (a DGX has plenty).
+dd_disksetup_reconcile: true
+
+# Unattended re-image: pre-authorize BCM's FULL-install confirmation for the
+# install window (the console prompt otherwise blocks every install). Any reboot
+# of the node inside the window re-images it without asking.
+deploy_dd_autoconfirm_install: true
+
+# The lab DHCP hands eth2 the same address as eth1; pin it to no address.
+kairos_no_address_ifaces: [eth2]
 
 # Big disks -> the finalize-stage install (grow/timeout/efibootmgr fix) matters.
 deploy_dd_finalize_install: true
