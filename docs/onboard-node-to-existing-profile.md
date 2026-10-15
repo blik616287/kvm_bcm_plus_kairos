@@ -4,7 +4,7 @@ The expensive work — building the image and configuring the BCM category — i
 **once per profile**. Every *additional* identical node just **joins that category** and
 gets triggered: **no `kairos-build`, no `deploy-dd`.** Worked example: onboarding
 **dgx03** onto the already-built **`kairos-dgx4`** category (24.04, OS RAID1 mirror +
-8-drive `/raid` RAID0, local Palette).
+8-drive JBOD, local Palette).
 
 ## The fleet model
 | Cost | How often |
@@ -30,7 +30,7 @@ sudo cmsh -c "device; use dgx03; set category kairos-dgx4; set installmode FULL;
 sudo cmsh -c "device; use dgx03; get category; get installmode"     # -> kairos-dgx4 / FULL
 ```
 That's the entire BCM side. The category already carries the image URL, the RAID
-finalize (`/dev/md0`, OS mirror + `/raid`), `installbootrecord=no`, and the ramdisk.
+finalize (`/dev/md0`, OS mirror, data disks left bare), `installbootrecord=no`, and the ramdisk.
 
 ## Step 2 — point the node's BMC at UEFI + disk-first + one-time PXE (per-node, not in BCM)
 ```bash
@@ -53,7 +53,8 @@ sudo cmsh -c "device; use dgx03; get status"        # DOWN/maintenance -> INSTAL
 sudo tail -f /var/log/node-installer                # "Finalize script:" lines
 ```
 Finalize sequence: erase members → `mdadm --create /dev/md0 --metadata=1.0` → dd image →
-grow last partition → build `/raid` RAID0 + inject the systemd mount → force reboot.
+grow last partition → force reboot. No data array is built: `kairos_data_raid` is
+false, so the eight big disks come out bare.
 (The `~/var/log/node-installer` may show `EFI variables are not supported` — the BCM PXE
 loader is legacy, so efibootmgr is skipped; the persistent UEFI BootOrder from Step 2 +
 the `\EFI\BOOT\bootx64.efi` fallback boot the mirror anyway.)
@@ -62,7 +63,7 @@ the `\EFI\BOOT\bootx64.efi` fallback boot the mirror anyway.)
 ```bash
 make validate ANSIBLE_ARGS="-e @profiles/<profile>.yml"        # 30-point health check
 # or directly on the node:
-ssh kairos@<node-ip> 'cat /proc/mdstat; findmnt /raid'         # md* [UU] mirror + /raid rw
+ssh kairos@<node-ip> 'cat /proc/mdstat'                        # md0 [UU] OS mirror; data disks bare
 ```
 The node UEFI-boots the mirror → Kairos → self-registers as a **unique**
 `edge-<smbios-uuid>` in the profile's Palette. Last step is a click: assign that edge-host

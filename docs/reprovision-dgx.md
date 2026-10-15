@@ -10,7 +10,7 @@ Palette/OS baked into the image. So you either (a) repoint an existing profile, 
 | dgx03's original target (dev-cloud Palette, 22.04) | `profiles/dgx-raid.yml` (already exists, RAID-capable image already built + staged) |
 | the same as dgx04 (Jon's local Palette `10.184.70.156`, 24.04) | `profiles/kairos-dgx4.yml` with `bcm_target_node: dgx03` (its image already registers to the local Palette) |
 
-Everything else (OS RAID1 mirror + `/raid` RAID0, `/dev/md0`, finalize, installbootrecord)
+Everything else (OS RAID1 mirror, `/dev/md0`, finalize, installbootrecord)
 is identical across nodes — it comes from the profile + the pipeline.
 
 ---
@@ -85,11 +85,11 @@ sudo cmsh -c "device; use dgx03; get status"          # -> INSTALLING (provision
 sudo tail -f /var/log/node-installer                  # "Finalize script:" building md0, writing image, reboot
 ```
 Finalize sequence: erase members → `mdadm --create /dev/md0 (metadata 1.0)` → dd image →
-grow → per-member efibootmgr → build `/raid` RAID0 + inject the systemd mount → reboot.
+grow → per-member efibootmgr → reboot. No data array — the big disks stay bare.
 
 **6. Verify:** dgx03 UEFI-boots the mirror → Kairos GRUB → registers as
 `edge-<smbios-uuid>` in Palette; then `make validate -e @profiles/<profile>.yml`
-(confirms md0 `[UU]`, `/raid` mounted, live `/dev/nvme*` names).
+(confirms md0 `[UU]`, live `/dev/nvme*` names).
 
 ---
 

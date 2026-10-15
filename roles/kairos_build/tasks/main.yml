@@ -47,12 +47,36 @@
     path: "{{ build_dir }}/{{ iso_name }}.iso"
   register: kairos_iso_stat
 
+# Stamp the build's INPUTS. The day-1 short-circuit below reuses a cached ISO
+# whenever the .iso file merely exists -- and because every Earthfile and
+# Dockerfile patch AND ./earthly.sh +iso live INSIDE that block, a cached ISO
+# makes any later patch inert on this host: it never reaches the ISO, the
+# rootfs, or the initramfs. Stamping the inputs means editing a role, profile,
+# or overlay forces a rebuild instead of silently shipping the old image.
+- name: Compute the ISO build-input stamp
+  ansible.builtin.shell: |
+    find {{ e2e_dir }}/roles/kairos_build {{ e2e_dir }}/files/canvos \
+         {{ e2e_dir }}/profiles/{{ kairos_profile }}.yml \
+         {{ e2e_dir }}/inventory/group_vars/all.yml \
+         -type f -print0 2>/dev/null \
+      | sort -z | xargs -0 sha256sum 2>/dev/null | sha256sum | awk '{print $1}'
+  register: kairos_iso_stamp
+  changed_when: false
+
+- name: Read the recorded ISO build-input stamp
+  ansible.builtin.command: cat {{ build_dir }}/.iso-stamp-{{ kairos_profile }}
+  register: kairos_iso_stamp_rec
+  changed_when: false
+  failed_when: false
+
 # Day-1 (raw_disk=true) skips this when the ISO already exists in build/.
 # Day-2 (raw_disk=false) always runs — the goal is to push provider images
 # to the registry, no local-artifact short-circuit applies.
 - name: Build Kairos ISO
   when:
-    - not kairos_iso_stat.stat.exists or not (kairos_build_raw_disk | default(true) | bool)
+    - (not kairos_iso_stat.stat.exists)
+      or (kairos_iso_stamp_rec.stdout | default('') != kairos_iso_stamp.stdout)
+      or not (kairos_build_raw_disk | default(true) | bool)
   block:
     - name: Generate .arg file from merged dict
       ansible.builtin.template:
@@ -101,12 +125,74 @@
         regexp: 'apt-get install --no-install-recommends kbd'
         replace: 'apt-get install --no-install-recommends wget ifupdown nfs-common {{ "mdadm " if (kairos_build_mdraid | default(false) | bool) else "" }}kbd'
 
+    # The replace above is a no-op when the apt line changes shape in a new
+    # release, which would leave dracut unable to build the mdraid initramfs.
+    # Assert the patched text is present rather than trusting the no-op.
+    - name: Assert mdadm landed in the CanvOS core-build package list (kairos_build_mdraid)
+      ansible.builtin.assert:
+        that:
+          - "'nfs-common mdadm kbd' in lookup('file', canvos_dir ~ '/Earthfile')"
+        fail_msg: "CanvOS Earthfile package list has no 'nfs-common mdadm kbd' — its apt line shape changed, so mdadm is not installed in the core build and the mdraid initramfs cannot be built."
+      when: kairos_build_mdraid | default(false) | bool
+
+    # CanvOS writes `RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get
+    # upgrade ...`. The env assignment binds only to `apt-get update`, so the
+    # upgrade runs with debconf's default Dialog frontend; with no controlling
+    # tty that falls back to Teletype and prompts on stdin, and any package whose
+    # config script dereferences an unset debconf value dies mid-upgrade.
+    # console-setup 1.226ubuntu1.1 (noble-updates) does exactly this, failing
+    # dpkg 100 with "sed: -e expression #1, char 8: unterminated `s' command".
+    # Setting the frontend once for the whole stage fixes the class, not just
+    # that one package. The ENV is placed at the anchor's own indent. Remove-
+    # then-insert keeps this stable: a re-run rewrites identical bytes and
+    # reports unchanged rather than duplicating the line.
+    - name: Patch Earthfile — run the base-image apt stage noninteractively
+      ansible.builtin.shell: |
+        set -eu
+        f={{ canvos_dir }}/Earthfile
+        before=$(sha256sum "$f" | cut -d' ' -f1)
+        sed -i '/^[[:space:]]*ENV DEBIAN_FRONTEND=noninteractive$/d' "$f"
+        i=$(grep -nE '^[[:space:]]*LET APT_UPGRADE_FLAGS=' "$f" | head -1 | cut -d: -f1)
+        [ -n "$i" ] || { echo "APT_UPGRADE_FLAGS anchor not found in $f" >&2; exit 1; }
+        ind=$(sed -n "${i}p" "$f" | sed 's/LET .*//')
+        awk -v n="$i" -v ind="$ind" 'NR==n{print ind "ENV DEBIAN_FRONTEND=noninteractive"} {print}' "$f" > "$f.tmp"
+        mv "$f.tmp" "$f"
+        after=$(sha256sum "$f" | cut -d' ' -f1)
+        if [ "$before" = "$after" ]; then echo unchanged; else echo changed; fi
+      register: kairos_apt_env_patch
+      changed_when: "'changed' in kairos_apt_env_patch.stdout"
+
+    - name: Assert the base-image apt stage is noninteractive
+      ansible.builtin.assert:
+        that:
+          - "'ENV DEBIAN_FRONTEND=noninteractive' in lookup('file', canvos_dir ~ '/Earthfile')"
+        fail_msg: "CanvOS Earthfile base-image stage is not noninteractive — apt can then fail on a debconf prompt (console-setup 1.226ubuntu1.1 fails this way with 'unterminated s command')."
+
+    # Resolve the dracut guard's indentation at runtime instead of hardcoding it.
+    # CanvOS releases nest this IF differently (v4.9.36 at 12 spaces,
+    # v4.10.0-rc.2 at 16), and a line inserted at the wrong depth lands outside
+    # the block that runs dracut — the conf files get written but never reach the
+    # initramfs. Fails loudly if a release renames or drops the guard, rather
+    # than silently producing an initrd with no mdraid and no pinned array.
+    - name: Locate the dracut FIPS guard in the CanvOS Earthfile
+      ansible.builtin.shell: |
+        set -eu
+        i=$(grep -nE '^[[:space:]]*IF \[ "\$FIPS_ENABLED" = "false" \]' {{ canvos_dir }}/Earthfile | head -1 | cut -d: -f1)
+        [ -n "$i" ] || { echo "dracut FIPS guard not found in {{ canvos_dir }}/Earthfile" >&2; exit 1; }
+        sed -n "${i}p" {{ canvos_dir }}/Earthfile | sed 's/IF \[.*//' | tr -d '\n'
+      register: kairos_dracut_guard
+      changed_when: false
+
+    - name: Record the dracut guard indentation
+      ansible.builtin.set_fact:
+        kairos_dracut_indent: "{{ kairos_dracut_guard.stdout }}"
+
     - name: Patch Earthfile — skip dracut nfit
       ansible.builtin.lineinfile:
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
-        line: "                RUN echo 'omit_dracutmodules+=\" nfit \"' > /etc/dracut.conf.d/99-skip-nfit.conf"
-      failed_when: false
+        regexp: "> /etc/dracut.conf.d/99-skip-nfit.conf"
+        line: "{{ kairos_dracut_indent }}    RUN echo 'omit_dracutmodules+=\" nfit \"' > /etc/dracut.conf.d/99-skip-nfit.conf"
 
     # Ubuntu 26.04 ships systemd 259 built +APPARMOR, which dlopens
     # libapparmor.so.1 when it execs a service. The Kairos initramfs build does
@@ -119,8 +205,8 @@
       ansible.builtin.lineinfile:
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
-        line: "                RUN echo 'install_items+=\" /usr/lib/x86_64-linux-gnu/libapparmor.so.1 \"' > /etc/dracut.conf.d/10-apparmor.conf"
-      failed_when: false
+        regexp: "> /etc/dracut.conf.d/10-apparmor.conf"
+        line: "{{ kairos_dracut_indent }}    RUN echo 'install_items+=\" /usr/lib/x86_64-linux-gnu/libapparmor.so.1 \"' > /etc/dracut.conf.d/10-apparmor.conf"
 
     # Pull the dracut `mdraid` module (+ its mdadm binary) into the initramfs so
     # the node can `mdadm --assemble` its OS array in the initqueue, before the
@@ -131,9 +217,65 @@
       ansible.builtin.lineinfile:
         path: "{{ canvos_dir }}/Earthfile"
         insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
-        line: "                RUN echo 'add_dracutmodules+=\" mdraid \"' > /etc/dracut.conf.d/15-mdraid.conf"
+        regexp: "> /etc/dracut.conf.d/15-mdraid.conf"
+        line: "{{ kairos_dracut_indent }}    RUN echo 'add_dracutmodules+=\" mdraid \"' > /etc/dracut.conf.d/15-mdraid.conf"
       when: kairos_build_mdraid | default(false) | bool
-      failed_when: false
+
+    # Pin the OS array in mdadm.conf, for two reasons that are separate bugs.
+    # (1) Boot-time auto-assembly names the array md127 when homehost does not
+    # match the assembling host, so anything expecting /dev/md0 -- the finalize
+    # dd target, the stage-6 check -- finds nothing. An explicit ARRAY line fixes
+    # the name. (2) devices= pins the members to the stable by-path names, so
+    # assembly follows the same slots kairos_raid_select: path selected and
+    # cannot land on a data disk after an nvmeXn1 reshuffle.
+    # HOMEHOST is a SEPARATE top-level directive, NOT an ARRAY-line token. Written
+    # the other way it read `ARRAY /dev/md0 ... homehost=none ...`, which mdadm 4.3
+    # rejects outright -- "unrecognised word on ARRAY line: homehost=none" -- and
+    # the WHOLE line is then discarded, taking name= and devices= with it. The pin
+    # silently did nothing and the array came up as md127 on dgx04 (2026-09-28).
+    # printf, not echo: the file needs two lines and echo cannot emit the newline.
+    # This MUST be written in the Earthfile core build, not on the raw's cOS
+    # images afterwards: dracut reads /etc/mdadm/mdadm.conf from the initramfs,
+    # which is built in this stage, so a later write reaches only the rootfs.
+    - name: Patch Earthfile — pin the OS array in mdadm.conf (kairos_build_mdraid)
+      ansible.builtin.lineinfile:
+        path: "{{ canvos_dir }}/Earthfile"
+        insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
+        # Matches either the old echo form or the new printf form, so a CanvOS
+        # checkout already patched by the broken version gets REPLACED rather
+        # than gaining a second, still-broken ARRAY line.
+        regexp: "RUN mkdir -p /etc/mdadm"
+        line: "{{ kairos_dracut_indent }}    RUN mkdir -p /etc/mdadm && printf 'HOMEHOST none\\nARRAY /dev/md0 metadata={{ kairos_os_raid.metadata | default('1.0') }} name=md0 devices={{ kairos_os_raid.devices | default([]) | map('regex_replace', '^', '/dev/disk/by-path/') | join(',') }}\\n' > /etc/mdadm/mdadm.conf"
+      when: kairos_build_mdraid | default(false) | bool
+
+    # dracut's 90mdraid module installs mdadm.conf only when $hostonly is set or
+    # mdadmconf="yes"; Kairos images are built non-hostonly (one image must boot
+    # on any node), so without this the ARRAY line above stays in the rootfs and
+    # never reaches the initramfs. dracut then auto-assembles the array as md127
+    # instead of md0, and the finalize dd target and the stage-6 checks find
+    # nothing. parse-md.sh reads /etc/mdadm.conf inside the initrd; the module
+    # installs the rootfs /etc/mdadm/mdadm.conf under that name.
+    - name: Patch Earthfile — force mdadm.conf into the initramfs (kairos_build_mdraid)
+      ansible.builtin.lineinfile:
+        path: "{{ canvos_dir }}/Earthfile"
+        insertafter: 'IF \[ "\$FIPS_ENABLED" = "false" \]'
+        regexp: "> /etc/dracut.conf.d/16-mdadm-conf.conf"
+        line: "{{ kairos_dracut_indent }}    RUN echo 'mdadmconf=\"yes\"' > /etc/dracut.conf.d/16-mdadm-conf.conf"
+      when: kairos_build_mdraid | default(false) | bool
+
+    - name: Assert the initramfs mdadm.conf will actually be honoured by mdadm
+      ansible.builtin.assert:
+        that:
+          - "'16-mdadm-conf.conf' in lookup('file', canvos_dir ~ '/Earthfile')"
+          - "'HOMEHOST none' in lookup('file', canvos_dir ~ '/Earthfile')"
+          - "'homehost=' not in lookup('file', canvos_dir ~ '/Earthfile')"
+        fail_msg: >-
+          mdadm.conf handling is wrong. dracut must ship the file (mdadmconf=yes,
+          above) AND mdadm must accept it. `homehost=` is NOT an ARRAY-line token:
+          mdadm rejects the whole line with "unrecognised word on ARRAY line", so
+          name= and devices= are dropped with it and the array assembles as md127.
+          Homehost belongs on its own top-level HOMEHOST line.
+      when: kairos_build_mdraid | default(false) | bool
 
     - name: Patch Dockerfile — add BCM scripts (COPY + chmod +x as real Dockerfile instructions)
       ansible.builtin.blockinfile:
@@ -171,6 +313,32 @@
         marker: "# {mark} profile extra dockerfile"
         block: "{{ kairos_dockerfile_extra }}"
         state: "{{ 'present' if kairos_dockerfile_extra | default('') | length > 0 else 'absent' }}"
+
+    # dracut assembles the md array only when rd.auto is on the kernel line. The
+    # day-2 Palette path never runs the raw's post-install bootargs patch, so the
+    # provider image must carry rd.auto in its own /etc/cos/bootargs.cfg instead
+    # of depending on the node's grubenv alone. provider-image and iso-image are
+    # both FROM +base-image, so this one RUN reaches both. Guarded so UKI images
+    # (no bootargs.cfg) are skipped, and idempotent so a re-run cannot duplicate
+    # the token -- the same shape as the existing
+    # systemd.unified_cgroup_hierarchy RUN just below it.
+    - name: Patch Dockerfile — pin rd.auto on the image cmdline (kairos_build_mdraid)
+      ansible.builtin.blockinfile:
+        path: "{{ canvos_dir }}/Dockerfile"
+        insertafter: 'Add any other image customizations here'
+        marker: "# {mark} mdraid rd.auto"
+        block: |
+          RUN if [ -f /etc/cos/bootargs.cfg ] && ! grep -Fq "rd.auto=1" /etc/cos/bootargs.cfg; then \
+                  sed -i 's|\(set baseCmd="[^"]*\)"|\1 rd.auto=1"|' /etc/cos/bootargs.cfg; \
+              fi
+      when: kairos_build_mdraid | default(false) | bool
+
+    - name: Assert rd.auto lands in the image cmdline (kairos_build_mdraid)
+      ansible.builtin.assert:
+        that:
+          - "'rd.auto=1' in lookup('file', canvos_dir ~ '/Dockerfile')"
+        fail_msg: "CanvOS Dockerfile does not pin rd.auto=1, so the provider image's own bootargs.cfg lacks it and dracut will not assemble the OS mirror after a Palette upgrade."
+      when: kairos_build_mdraid | default(false) | bool
 
     - name: Render custom k8s_version.json (overrides upstream CanvOS file)
       ansible.builtin.copy:
@@ -234,12 +402,127 @@
       poll: 30
       when: kairos_build_raw_disk | default(true) | bool
 
-    - name: Run CanvOS build (day-2 — push provider images, skip ISO)
+    # ---- Day-2 runs as TWO phases so a failed UPLOAD never costs a rebuild ----
+    # `SAVE IMAGE --push` only marks the image; the push executes only when the
+    # CLI is given `--push`. So WITHOUT `--push` phase 1 LOADS the image into the
+    # local Docker daemon and never touches the registry: it cannot fail on a
+    # flaky upload, and it leaves the image behind for a retry. Phase 2 is the
+    # only step that talks to the registry, and it is retried.
+    # Why: 2026-09-28 two day-2 runs reached "100% exporting outputs" and then
+    # died in POST /v2/ubuntu/blobs/uploads/ with a header timeout, leaving
+    # nothing local to retry from.
+    - name: Derive the provider-image refs the day-2 push would address
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json, re, sys
+        d = "{{ canvos_dir }}"
+        a = {}
+        for l in open(d + "/.arg"):
+            l = l.strip()
+            if not l or l.startswith("#") or "=" not in l:
+                continue
+            k, v = l.split("=", 1)
+            a[k.strip()] = v.strip()
+        m = re.search(r"(?m)^\s*ARG\s+PE_VERSION=(\S+)", open(d + "/Earthfile").read())
+        if not m:
+            sys.exit(0)
+        try:
+            matrix = json.load(open(d + "/k8s_version.json"))
+        except Exception:
+            sys.exit(0)
+        for dist, versions in matrix.items():
+            for v in versions:
+                print("%s/%s:%s-%s-%s-%s" % (a["IMAGE_REGISTRY"], a["IMAGE_REPO"],
+                                              dist, v, m.group(1), a["CUSTOM_TAG"]))
+        PY
+      register: kairos_provider_refs
+      changed_when: false
+      failed_when: false
+      when: not (kairos_build_raw_disk | default(true) | bool)
+
+    - name: Stat the expected provider image in the local Docker daemon
+      ansible.builtin.command: docker image inspect {{ item }}
+      loop: "{{ kairos_provider_refs.stdout_lines | default([]) }}"
+      register: kairos_provider_local
+      changed_when: false
+      failed_when: false
+      when: not (kairos_build_raw_disk | default(true) | bool)
+
+    # Read BEFORE it is consumed below -- the stamp is the guard against a tag
+    # that exists locally but was built from older inputs.
+    - name: Read the recorded provider-image build-input stamp
+      ansible.builtin.command: cat {{ build_dir }}/.provider-image-stamp-{{ kairos_profile }}
+      register: kairos_image_stamp_rec
+      changed_when: false
+      failed_when: false
+      when: not (kairos_build_raw_disk | default(true) | bool)
+
+    - name: Decide whether a local provider image matches the current build inputs
+      ansible.builtin.set_fact:
+        kairos_provider_cached: >-
+          {{ (kairos_provider_refs.stdout_lines | default([]) | length > 0)
+             and ((kairos_provider_local.results | default([])
+                   | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | list | length)
+                  == (kairos_provider_refs.stdout_lines | default([]) | length))
+             and ((kairos_image_stamp_rec.stdout | default('') | trim)
+                  == (kairos_iso_stamp.stdout | trim)) }}
+      when: not (kairos_build_raw_disk | default(true) | bool)
+
+    - name: Decide whether this run builds or uploads only
+      ansible.builtin.set_fact:
+        kairos_upload_only: "{{ (kairos_image_upload_only | default(false) | bool) or (kairos_provider_cached | default(false) | bool) }}"
+      when: not (kairos_build_raw_disk | default(true) | bool)
+
+    - name: Assert an image is actually built when upload-only was forced
+      ansible.builtin.assert:
+        that:
+          - kairos_provider_refs.stdout_lines | default([]) | length > 0
+          - (kairos_provider_local.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | list | length) > 0
+        fail_msg: >-
+          kairos_image_upload_only=true but no local provider image matches the
+          expected refs {{ kairos_provider_refs.stdout_lines | default([]) | join(', ') }}.
+          Run `make kairos-image` to build it first.
+      when:
+        - not (kairos_build_raw_disk | default(true) | bool)
+        - kairos_image_upload_only | default(false) | bool
+
+    - name: Run CanvOS build (day-2 phase 1 -- build + LOAD, no registry traffic)
       ansible.builtin.shell: |
         cd {{ canvos_dir }}
-        ./earthly.sh --push +build-provider-images --ARCH={{ arch }}
+        ./earthly.sh +build-provider-images --ARCH={{ arch }}
       async: 3600
       poll: 30
+      when:
+        - not (kairos_build_raw_disk | default(true) | bool)
+        - not (kairos_upload_only | default(false) | bool)
+
+    - name: Record the provider-image build-input stamp
+      ansible.builtin.copy:
+        content: "{{ kairos_iso_stamp.stdout }}\n"
+        dest: "{{ build_dir }}/.provider-image-stamp-{{ kairos_profile }}"
+        mode: "0644"
+      when:
+        - not (kairos_build_raw_disk | default(true) | bool)
+        - not (kairos_upload_only | default(false) | bool)
+
+    - name: Upload the provider images (day-2 phase 2 -- retried, blob-resumed)
+      ansible.builtin.shell: |
+        # NOTE: runs under /bin/sh (dash) -- no `set -o pipefail` here; there is
+        # no pipeline, and dash rejects the bash-ism (killed the push in 4ms on
+        # 2026-09-28 with "/bin/sh: 1: set: Illegal option -o pipefail").
+        rc=0
+        for ref in {{ kairos_provider_refs.stdout_lines | default([]) | join(' ') }}; do
+          echo "== pushing $ref"
+          ok=0
+          for i in $(seq 1 {{ kairos_upload_attempts | default(3) }}); do
+            if timeout {{ kairos_upload_timeout | default(1800) }} docker push "$ref"; then
+              ok=1; break
+            fi
+            echo "!! push attempt $i for $ref failed; retrying" >&2
+          done
+          [ "$ok" = 1 ] || { echo "!! giving up on $ref" >&2; rc=1; }
+        done
+        exit $rc
       when: not (kairos_build_raw_disk | default(true) | bool)
 
     - name: Copy ISO to build directory
@@ -249,7 +532,38 @@
         remote_src: true
       when: kairos_build_raw_disk | default(true) | bool
 
+    - name: Record the ISO build-input stamp
+      ansible.builtin.copy:
+        content: "{{ kairos_iso_stamp.stdout }}\n"
+        dest: "{{ build_dir }}/.iso-stamp-{{ kairos_profile }}"
+        mode: "0644"
+      when: kairos_build_raw_disk | default(true) | bool
+
 # ---- Generate raw disk image ----
+
+# Stamp the raw build's INPUTS the same way the ISO is stamped. The raw's own
+# short-circuit below reuses a cached .raw whenever the file merely exists, and
+# the bootargs patch, the finalize and the mdraid assertion all live INSIDE that
+# block -- so a template or profile edit is inert on any host that already has a
+# raw: it never reaches the dd'd image. The stamp combines the ISO's inputs
+# (roles, profiles, inventory, cloud-config) with the ISO bytes themselves: a
+# cloud-config change moves the inputs but not the installed payload, while a
+# CanvOS bump moves the payload but not the inputs, so neither alone suffices.
+- name: Compute the raw-disk build-input stamp
+  ansible.builtin.shell: |
+    set -eu
+    iso=$(sha256sum {{ build_dir }}/{{ iso_name }}.iso | awk '{print $1}')
+    printf '%s %s\n' '{{ kairos_iso_stamp.stdout }}' "$iso" | sha256sum | awk '{print $1}'
+  register: kairos_raw_stamp
+  changed_when: false
+  when: kairos_build_raw_disk | default(true) | bool
+
+- name: Read the recorded raw-disk build-input stamp
+  ansible.builtin.command: cat {{ build_dir }}/.raw-stamp-{{ kairos_profile }}
+  register: kairos_raw_stamp_rec
+  changed_when: false
+  failed_when: false
+  when: kairos_build_raw_disk | default(true) | bool
 
 - name: Check if raw disk exists
   ansible.builtin.stat:
@@ -259,7 +573,8 @@
 - name: Generate raw disk image via QEMU
   when:
     - kairos_build_raw_disk | default(true) | bool
-    - not raw_disk_stat.stat.exists
+    - (not raw_disk_stat.stat.exists)
+      or ((kairos_raw_stamp_rec.stdout | default('')) != (kairos_raw_stamp.stdout | default('')))
   block:
     - name: Generate BCM SSH key pair if missing
       ansible.builtin.shell: |
@@ -279,6 +594,16 @@
     - name: Set BCM SSH key content
       ansible.builtin.set_fact:
         bcm_ssh_key_content: "{{ bcm_key_file.content | b64decode }}"
+
+    # A plaintext value here renders a scalar entities cannot use and the
+    # account comes up locked — the defect this shape exists to remove.
+    - name: Assert the kairos password hash is a usable crypt hash
+      ansible.builtin.assert:
+        that:
+          - kairos_user_password_hash | default('') | length > 30
+          - kairos_user_password_hash is match('^\$[0-9a-z]{1,2}\$')
+        fail_msg: "kairos_user_password_hash must be a crypt hash (e.g. $6$... or $y$...), not a plaintext password."
+      when: kairos_build_raw_disk | default(true) | bool
 
     - name: Render cloud-config
       # Template is profile-selectable (kairos_cloud_config_template) so a
@@ -300,6 +625,21 @@
           - "{{ role_path }}/files/check-cloud-config.py"
           - "{{ build_dir }}/cloud-config.yaml"
       changed_when: false
+
+    # Gate the artifact: a plaintext passwd renders a value the account cannot use.
+    - name: Read the rendered cloud-config
+      ansible.builtin.slurp:
+        src: "{{ build_dir }}/cloud-config.yaml"
+      register: cc_rendered
+      when: kairos_build_raw_disk | default(true) | bool
+
+    - name: Assert the rendered cloud-config carries the hash and no plaintext password
+      ansible.builtin.assert:
+        that:
+          - kairos_user_password_hash in (cc_rendered.content | b64decode)
+          - "'passwd: kairos' not in (cc_rendered.content | b64decode)"
+        fail_msg: "The rendered cloud-config must carry kairos_user_password_hash; a plaintext passwd cannot be used by the account."
+      when: kairos_build_raw_disk | default(true) | bool
 
     # User-supplied additional cloud-config YAML, layered into /oem/99_userdata.yaml.
     # Only written when kairos_user_data is non-empty; the FAT32 image and the
@@ -329,6 +669,28 @@
     - name: Create blank raw disk
       ansible.builtin.shell: truncate -s {{ kairos_raw_disk_size }} {{ raw_disk_path }}
 
+    # Fail loudly BEFORE the install if the accelerator or firmware is missing.
+    # A qemu that cannot start writes no pidfile, and the install task below then
+    # leaves a blank raw that the verify step only notices minutes later.
+    - name: Assert the QEMU accelerator and OVMF firmware are usable
+      ansible.builtin.shell: |
+        set -eu
+        accel="{{ kairos_build_qemu_accel }}"
+        case "$accel" in
+          kvm)
+            [ -e /dev/kvm ] || { echo "FATAL: kairos_build_qemu_accel=kvm but /dev/kvm is absent: no hardware virtualisation on this host (nested guest without VMX/AMD-V, or the kvm module is not loaded). Build on a KVM-capable host, or set kairos_build_qemu_accel=tcg." >&2; exit 1; }
+            { [ -r /dev/kvm ] && [ -w /dev/kvm ]; } || { echo "FATAL: /dev/kvm exists but is not rw for uid $(id -u)." >&2; exit 1; }
+            ;;
+          tcg) : ;;
+          *) echo "FATAL: unknown kairos_build_qemu_accel '${accel}' (expected kvm or tcg)." >&2; exit 1 ;;
+        esac
+        for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/qemu/OVMF.fd /usr/share/ovmf/OVMF.fd; do
+          [ -f "$f" ] && { echo "accel=$accel firmware=$f OK"; exit 0; }
+        done
+        echo "FATAL: no OVMF firmware found (looked for OVMF_CODE_4M.fd, qemu/OVMF.fd, ovmf/OVMF.fd). Install the ovmf package." >&2
+        exit 1
+      changed_when: false
+
     # OVMF (UEFI) so kairos-agent detects UEFI and installs GRUB-EFI into an ESP.
     # The resulting raw image is bootable on UEFI hardware (physical Dell servers etc.).
     # BIOS-only platforms would need a separate image built with SeaBIOS.
@@ -342,8 +704,14 @@
         [ -f "$OVMF_CODE" ] || OVMF_CODE=/usr/share/qemu/OVMF.fd
         [ -f "$OVMF_VARS_SRC" ] || OVMF_VARS_SRC=/usr/share/ovmf/OVMF.fd
         cp -f "$OVMF_VARS_SRC" {{ build_dir }}/ovmf-vars.fd
+        # kvm = hardware acceleration; tcg = pure emulation with no /dev/kvm.
+        if [ "{{ kairos_build_qemu_accel }}" = kvm ]; then
+          ACCEL="-enable-kvm -cpu host"
+        else
+          ACCEL="-accel tcg -cpu max"
+        fi
         qemu-system-x86_64 \
-          -enable-kvm -m 4096 -smp 2 -cpu host \
+          $ACCEL -m 4096 -smp 2 \
           -machine q35 \
           -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
           -drive if=pflash,format=raw,file={{ build_dir }}/ovmf-vars.fd \
@@ -355,8 +723,17 @@
           -drive format=raw,media=cdrom,readonly=on,file={{ build_dir }}/{{ iso_name }}.iso \
           -boot d \
           -pidfile {{ build_dir }}/.qemu-install.pid \
-          -daemonize
-        QEMU_PID=$(cat {{ build_dir }}/.qemu-install.pid)
+          -D {{ build_dir }}/qemu-debug.log \
+          -daemonize 2>{{ build_dir }}/qemu-start.log
+        QEMU_PID=$(cat {{ build_dir }}/.qemu-install.pid 2>/dev/null || true)
+        # A qemu that cannot start writes no pidfile; without this check the wait
+        # loop below falls through on an empty PID and the task reports SUCCESS,
+        # leaving a blank raw that only the verify task notices minutes later.
+        if [ -z "$QEMU_PID" ] || ! kill -0 "$QEMU_PID" 2>/dev/null; then
+          echo "FATAL: QEMU failed to start (no live pid in .qemu-install.pid). qemu stderr:" >&2
+          cat {{ build_dir }}/qemu-start.log >&2 2>/dev/null || true
+          exit 1
+        fi
         INSTALL_LOG={{ e2e_dir }}/logs/qemu-install.log
         : > "$INSTALL_LOG"
         (
@@ -538,6 +915,7 @@
         if [ -n "${errs[*]:-}" ]; then
           echo "kairos-agent install verification FAILED: ${errs[*]}" >&2
           echo "Inspect {{ e2e_dir }}/logs/qemu-install.log for the installer output." >&2
+          echo "An empty qemu-install.log means the VM never booted: see {{ build_dir }}/qemu-start.log for qemu's stderr." >&2
           exit 1
         fi
         echo "install verification OK — ESP has a bootloader and active.img is populated"
@@ -638,8 +1016,9 @@
     # actually landed — otherwise the failure only surfaces as a dracut
     # emergency shell on the real node, after a full deploy. Checks the mdadm
     # binary is in the rootfs (dracut sources the initramfs copy from here), the
-    # initramfs carries the mdraid module (best-effort lsinitrd), and rd.auto is
-    # on the kernel cmdline. No-op unless kairos_build_mdraid is true.
+    # initramfs carries the mdraid module AND the pinned ARRAY line -- parsed
+    # from the initrd directly, since lsinitrd is not installed here -- and
+    # rd.auto is on the kernel cmdline. No-op unless kairos_build_mdraid is true.
     - name: Assert mdraid capability landed in the built image (kairos_build_mdraid)
       when: kairos_build_mdraid | default(false) | bool
       become: true
@@ -673,10 +1052,31 @@
             R=/tmp/kairos-mdraid-img
             { [ -e "$R/usr/sbin/mdadm" ] || [ -e "$R/sbin/mdadm" ] || [ -e "$R/usr/bin/mdadm" ]; } \
               || errs+=("[mdadm binary not found in image rootfs]")
+            # The ARRAY line must be in the ROOTFS mdadm.conf AND inside the
+            # initramfs -- dracut reads /etc/mdadm.conf from the initrd at boot.
+            # Without it auto-assembly names the array md127 (homehost mismatch),
+            # so the finalize dd target /dev/md0 and the stage-6 checks find
+            # nothing. A rootfs-only write silently passes a rootfs-only check.
+            grep -q '^ARRAY /dev/md0' "$R/etc/mdadm/mdadm.conf" 2>/dev/null \
+              || errs+=("[no ARRAY /dev/md0 line in rootfs mdadm.conf]")
+            # Presence of the ARRAY line is not enough -- mdadm must ACCEPT it.
+            # `homehost=` on that line makes mdadm discard the whole line, which
+            # is how a passing build shipped an image whose array came up md127.
+            grep -q '^HOMEHOST' "$R/etc/mdadm/mdadm.conf" 2>/dev/null \
+              || errs+=("[no HOMEHOST directive in rootfs mdadm.conf]")
+            grep -q 'homehost=' "$R/etc/mdadm/mdadm.conf" 2>/dev/null \
+              && errs+=("[homehost= on an ARRAY line -- mdadm rejects the line; use a top-level HOMEHOST]")
+            # Check the initramfs directly. lsinitrd is not installed on this
+            # host, and gating the check on it is exactly how a missing
+            # mdadm.conf once survived a passing build -- so this runs
+            # unconditionally and parses the initrd itself (early cpio followed
+            # by an xz/gzip/bzip2/zstd main cpio).
             INITRD=$(ls "$R"/boot/initrd* 2>/dev/null | head -1 || true)
-            if [ -n "$INITRD" ] && command -v lsinitrd >/dev/null 2>&1; then
-              lsinitrd "$INITRD" 2>/dev/null | grep -qiE 'mdadm|mdraid' \
-                || errs+=("[initramfs has no mdraid/mdadm module]")
+            if [ -n "$INITRD" ]; then
+              python3 {{ e2e_dir }}/scripts/mdadm-initrd-audit.py "$INITRD" /dev/md0 \
+                || errs+=("[initramfs audit failed: no mdraid module, or no ARRAY /dev/md0 in its mdadm.conf]")
+            else
+              errs+=("[no initrd under the image boot/ -- cannot verify the initramfs]")
             fi
             [ -f "$R/etc/cos/bootargs.cfg" ] && { grep -q 'rd.auto' "$R/etc/cos/bootargs.cfg" \
               || errs+=("[rd.auto missing from bootargs.cfg — array will not assemble]"); }
@@ -701,6 +1101,12 @@
       ansible.builtin.shell: |
         cd {{ build_dir }}
         sha256sum {{ kairos_profile }}-disk.raw > {{ kairos_profile }}-disk.raw.sha256
+
+    - name: Record the raw-disk build-input stamp
+      ansible.builtin.copy:
+        content: "{{ kairos_raw_stamp.stdout }}\n"
+        dest: "{{ build_dir }}/.raw-stamp-{{ kairos_profile }}"
+        mode: "0644"
 
 - name: Restore ownership of build artifacts to invoking user
   ansible.builtin.file:

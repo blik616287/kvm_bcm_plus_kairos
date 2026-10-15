@@ -131,6 +131,14 @@
     mode: "0644"
   delegate_to: bcm
 
+# Probe rather than swallow: not every base image ships a systemd generators
+# directory, but a link that fails inside one that does leaves GPT automounts on.
+- name: Look for the image's systemd generators directory
+  ansible.builtin.stat:
+    path: "{{ dd_image_root }}/lib/systemd/system-generators"
+  delegate_to: bcm
+  register: dd_generators_dir
+
 - name: Mask systemd-gpt-auto-generator in the image (no GPT automounts)
   ansible.builtin.file:
     src: /dev/null
@@ -138,14 +146,13 @@
     state: link
     force: true
   delegate_to: bcm
-  failed_when: false
+  when: dd_generators_dir.stat.exists
 
 - name: Ensure efibootmgr is present in the image
   ansible.builtin.command: "cp /usr/bin/efibootmgr {{ dd_image_root }}/usr/sbin/efibootmgr"
   args:
     creates: "{{ dd_image_root }}/usr/sbin/efibootmgr"
   delegate_to: bcm
-  failed_when: false
 
 # ---- rsyncd module (additive, per profile) ----
 - name: Check for an existing rsyncd default-image module

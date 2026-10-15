@@ -1,16 +1,27 @@
 ---
 # pxe.yml — [5/7] PXE template + syslinux modules (cluster-wide, profile-agnostic).
 
-- name: Force IPAPPEND 2 in the PXE templates (configure only the boot NIC)
-  ansible.builtin.replace:
+# The IPAPPEND templates are upstream BCM files; a head node serving HTTP boot
+# need not have them, so probe for them instead of swallowing a missing-file
+# error — absence stays tolerated, but visibly, in the task graph.
+- name: Look for the PXE boot templates
+  ansible.builtin.stat:
     path: "{{ item }}"
-    regexp: 'IPAPPEND 3'
-    replace: 'IPAPPEND 2'
   loop:
     - /tftpboot/pxelinux.cfg/template
     - /tftpboot/x86_64/bios/pxelinux.cfg/template
   delegate_to: bcm
-  failed_when: false
+  register: dd_pxe_tmpl
+
+- name: Force IPAPPEND 2 in the PXE templates (configure only the boot NIC)
+  ansible.builtin.replace:
+    path: "{{ item.stat.path }}"
+    regexp: 'IPAPPEND 3'
+    replace: 'IPAPPEND 2'
+  loop: "{{ dd_pxe_tmpl.results | selectattr('stat.exists') | list }}"
+  loop_control:
+    label: "{{ item.stat.path }}"
+  delegate_to: bcm
 
 - name: Ensure the syslinux menu modules are present in /tftpboot
   ansible.builtin.shell: |
@@ -20,4 +31,3 @@
     creates: "/tftpboot/{{ item }}"
   loop: [menu.c32, libutil.c32, ldlinux.c32, libcom32.c32]
   delegate_to: bcm
-  failed_when: false

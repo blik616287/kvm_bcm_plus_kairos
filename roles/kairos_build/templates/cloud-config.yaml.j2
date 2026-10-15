@@ -23,14 +23,28 @@ stylus:
     tags:
       palette.ai: "true"
       palette.ai/control-plane: "true"
+    # Primary kairos password path. Applied by the early user-sync stage, so it
+    # does not depend on any boot stage completing.
+    users:
+      kairos:
+        username: kairos
+        passwd: {{ kairos_user_password_hash }}
+        homedir: /home/kairos
+        groups:
+        - admin
+        password_expiry: ""
 {% if palette_installation_mode is defined %}
   installationMode: {{ palette_installation_mode }}
 {% endif %}
 {% if palette_management_mode is defined %}
   managementMode: {{ palette_management_mode }}
 {% endif %}
+
   vip:
-    skip: true
+    skip: {{ 'true' if (vip_skip | default(true) | bool) else 'false' }}
+
+# lock_passwd: false only stops cloud-init locking the account; the password
+# itself comes from stylus.site.users above.
 users:
   - name: kairos
     shell: /bin/bash
@@ -55,11 +69,27 @@ stages:
           owner: 0
           group: 0
 {% endif %}
+    # eth2 has no static config, so it falls through to 20-dhcp-legacy.network
+    # and the lab DHCP hands it 10.184.70.7 -- eth1's address. Two NICs answering
+    # ARP for .7 flaps the MAC BCM derives NODE_NAME from. Sorts before 20-.
+    - name: "Pin eth2 to no address so DHCP cannot duplicate the node IP"
+      files:
+        - path: /etc/systemd/network/05-eth2.network
+          content: |
+            [Match]
+            Name=eth2
+
+            [Network]
+            DHCP=no
+            LinkLocalAddressing=no
+          permissions: 0644
+          owner: 0
+          group: 0
   boot:
-    - name: "Set kairos user password"
-      users:
-        kairos:
-          passwd: kairos
+    # /etc/shadow is rebuilt on every boot, so the hash must be re-asserted here.
+    - name: "Re-assert the kairos password hash on the ephemeral /etc"
+      commands:
+        - usermod -p {{ kairos_user_password_hash | quote }} kairos || useradd -p {{ kairos_user_password_hash | quote }} -m -s /bin/bash -G admin kairos
     - name: "Enable SSH password auth + disable fail2ban"
       files:
         - path: /etc/ssh/sshd_config.d/99-kairos-test.conf
@@ -70,6 +100,23 @@ stages:
       commands:
         - systemctl restart sshd || systemctl restart ssh || true
         - systemctl disable --now fail2ban 2>/dev/null || true
+    - name: "mdraid: pin rd.auto on the kernel line via the OEM grubenv"
+      commands:
+        - |
+          # grub loads /grubenv from COS_OEM and appends ${extra_active_cmdline}
+          # to the kernel line (see the /cos menuentry in COS_STATE's grub.cfg),
+          # so rd.auto=1 reaches the kernel even when the image's own
+          # /etc/cos/bootargs.cfg is replaced -- notably by a Palette
+          # provider-image upgrade, the day-2 path that does NOT get the raw's
+          # bootargs patch. Without rd.auto=1 dracut never assembles the OS
+          # mirror, the twin COS_* labels resolve against raw members, and the
+          # node boots split-brain. COS_OEM survives an in-place upgrade, so
+          # this persists across one; a dd re-image wipes it, and it is then
+          # re-applied here from the artifact.
+          if [ -f /oem/grubenv ] && command -v grub2-editenv > /dev/null 2>&1; then
+            grub2-editenv /oem/grubenv set extra_active_cmdline="rd.auto=1 net.ifnames=0 biosdevname=0"
+          fi
+
 {% if bcm_ssh_key_content is defined and bcm_ssh_key_content | length > 0 %}
     - name: "Install BCM SSH key"
       files:
@@ -82,20 +129,44 @@ stages:
     - name: "BCM integration: set NOSYNC + start cmd"
       commands:
         - |
+          # Interface-agnostic network gate. BCM's category sets net.ifnames=0,
+          # but the installed Kairos cmdline is sourced from the image's own
+          # bootargs.cfg and may not carry it, so eth0 need not exist at all.
+          # Resolve the egress interface for the BCM host instead of naming one.
           for i in $(seq 1 60); do
-            ip -4 addr show eth0 2>/dev/null | grep -q "inet " && \
+            BCM_IF=$(ip route get {{ bcm_internal_ip }} 2>/dev/null | awk '{for(j=1;j<=NF;j++) if($j=="dev"){print $(j+1); exit}}')
+            [ -n "${BCM_IF}" ] && \
+              ip -4 addr show "${BCM_IF}" 2>/dev/null | grep -q "inet " && \
               ping -c1 -W2 {{ bcm_internal_ip }} >/dev/null 2>&1 && break
             sleep 5
-          done || true
+          done
           ping -c1 -W2 {{ bcm_internal_ip }} >/dev/null 2>&1 || exit 0
           NODE_MAC=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}' | xargs -I{} ip link show {} 2>/dev/null | awk '/ether/{print $2}')
-          export NODE_NAME=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          # BCM keys each device on the MAC of the NIC it provisioned through,
+          # which need not be the default-route NIC -- and a DGX answers on the
+          # same address across ports, so the MAC that routes is often not the
+          # MAC BCM holds. Fetch the device list once, match every local MAC,
+          # then the routed IP, and fall back to the hostname only last. That
+          # fallback is the failure mode that matters: `cmsh device use
+          # edge-<uuid>` cannot find the device, so the NOSYNC disarm below
+          # silently never commits and the node stays armed for reinstall.
+          BCM_DEVLIST=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=10 -o LogLevel=ERROR -i /var/lib/bcm/bcm-key \
               root@{{ bcm_internal_ip }} \
-              "echo -e 'device\nlist' | cmsh 2>/dev/null | grep -i '${NODE_MAC}' | awk '{print \$2}'" \
-              2>/dev/null | grep -oE '^[a-zA-Z0-9_-]+$' | tail -1)
-          [ -z "${NODE_NAME}" ] && export NODE_NAME=$(hostname)
-          hostnamectl set-hostname "${NODE_NAME}" 2>/dev/null || hostname "${NODE_NAME}" 2>/dev/null || true
+              "echo -e 'device\nlist' | cmsh 2>/dev/null" 2>/dev/null)
+          export NODE_NAME=""
+          for _mac in $(cat /sys/class/net/*/address 2>/dev/null | tr 'A-Z' 'a-z'); do
+            [ "${_mac}" = "00:00:00:00:00:00" ] && continue
+            NODE_NAME=$(printf '%s\n' "${BCM_DEVLIST}" | awk -v m="${_mac}" 'tolower($3)==m {print $2; exit}')
+            [ -n "${NODE_NAME}" ] && break
+          done
+          if [ -z "${NODE_NAME}" ]; then
+            _ip=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+            NODE_NAME=$(printf '%s\n' "${BCM_DEVLIST}" | awk -v ip="${_ip}" '$5==ip {print $2; exit}')
+          fi
+          [ -z "${NODE_NAME}" ] && NODE_NAME=$(hostname)
+          export NODE_NAME
+          # Never written to the hostname: the node's identity is the Palette edge-host id, not NODE_NAME.
           # Push BCM-derived labels to the Palette edge-host record via admin
           # API. Stylus's own cloud-config merge doesn't pick up /oem/*.yaml
           # files written from stages.boot (kairos-agent's initramfs merge

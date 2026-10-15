@@ -39,6 +39,7 @@ setup: ## Verify prerequisites (ansible, qemu, docker, sshpass, etc.)
 	@echo "Checking prerequisites..."
 	@command -v ansible-playbook >/dev/null || { echo "MISSING: ansible"; exit 1; }
 	@command -v qemu-system-x86_64 >/dev/null || { echo "MISSING: qemu-system-x86_64"; exit 1; }
+	@if [ ! -e /dev/kvm ]; then echo "WARN: /dev/kvm absent - kairos_build_qemu_accel=kvm will fail the build; use kairos_build_qemu_accel=tcg or a KVM-capable host"; fi
 	@command -v docker >/dev/null || { echo "MISSING: docker"; exit 1; }
 	@command -v sshpass >/dev/null || { echo "MISSING: sshpass"; exit 1; }
 	@command -v xorriso >/dev/null || { echo "MISSING: xorriso"; exit 1; }
@@ -121,6 +122,14 @@ kairos-build: ## Stage 3: Build Kairos ISO + raw disk image
 kairos-image: ## Stage 3 (image-only / day-2): build + push container image, skip raw disk
 	@mkdir -p $(LOGS_DIR)
 	ansible-playbook playbooks/03-kairos-build.yml -e kairos_build_raw_disk=false $(ANSIBLE_ARGS) 2>&1 | tee $(LOGS_DIR)/03-kairos-image.log
+
+# Upload-only retry: push an already-built provider image, never rebuild. The
+# role's gate forces upload-only and fails loudly if nothing matching the
+# expected refs is in the local Docker daemon.
+.PHONY: kairos-image-push
+kairos-image-push: ## Stage 3 (upload-only): (re)push an already-built provider image, no rebuild
+	@mkdir -p $(LOGS_DIR)
+	ansible-playbook playbooks/03-kairos-build.yml -e kairos_build_raw_disk=false -e kairos_image_upload_only=true $(ANSIBLE_ARGS) 2>&1 | tee $(LOGS_DIR)/03-kairos-image-push.log
 
 # ---- Custom Kairos base image (for OS versions Spectro hasn't published) ----
 # Build a Kairos "core" base from an upstream OS image via kairos-init, for use
