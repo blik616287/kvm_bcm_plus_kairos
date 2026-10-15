@@ -38,4 +38,7 @@ regexes = [
   # committed inventory (require bcm_password via the gitignored all.yml), then
   # delete this allowlist entry. Real passwords do NOT match this literal.
   '''bcm-test-pw''',
+  # Fixture convention (tests/fixtures/render-vars.yml): every stand-in for a
+  # secret is spelled FIXTURE-<WHAT>, so a real value never matches this.
+  '''FIXTURE-[A-Z0-9-]+''',
 ]
