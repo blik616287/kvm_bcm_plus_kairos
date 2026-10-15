@@ -11,6 +11,7 @@ roles/deploy_dd/defaults/main.yml:
   dd_disksetup_reconcile: false       # diskless category + datanode
   dd_category_datanode: true          # only consulted when reconcile is on
   dd_disksetup_xml_file: ""
+  deploy_dd_autoconfirm_install: false  # pre-approves BCM's FULL-install prompt
 
 roles/kairos_build/defaults/main.yml:
   kairos_build_mdraid: false          # RAID-capable image
@@ -19,3 +20,7 @@ roles/kairos_build/defaults/main.yml:
   kairos_k8s_versions: {}
   kairos_build_bcm_integration: true
   kairos_cloud_config_template: "cloud-config.yaml.j2"
+  vip_skip: true                      # stylus.vip.skip as it has always been
+  kairos_no_address_ifaces: []        # lab-only NIC pin (DGX profiles set [eth2])
+  kairos_image_upload_only: false
+  kairos_build_qemu_accel: kvm

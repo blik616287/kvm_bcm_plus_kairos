@@ -156,13 +156,18 @@ is a worked example (2-drive OS mirror + 8-drive data RAID0). ⚠️ Confirm the
 `/dev/nvme*` enumeration on the live box before deploying — BMC `Device#` ≠ Linux
 device name.
 
-`profiles/kairos-dgx2.yml` is the other DGX shape: an OS mirror pinned **by PCIe
+`profiles/kairos-dgx2.yml` (dgx02) and `profiles/kairos-dgx4.yml` (dgx04, whose
+category also covers dgx03) are the other DGX shape: an OS mirror pinned **by PCIe
 slot** (`kairos_raid_select: path`) with the eight data disks left as bare JBOD
-(`kairos_data_raid: false`) for the storage layer to consume whole. It also opts
-into two destructive, node-wide settings the other profiles leave off:
+(`kairos_data_raid: false`) for the storage layer to consume whole. Both opt
+into node-wide settings the other profiles leave off:
 
 - `kairos_wipe_all_nvme: true` — the finalize wipes every NVMe namespace the kernel
   exposes, not just `kairos_wipe_disks` (names shuffle between boots).
+- `deploy_dd_autoconfirm_install: true` — pre-approves BCM's FULL-install console
+  prompt for `deploy_dd_autoconfirm_window` (2h), so a re-image runs unattended.
+  Any reboot of the node inside that window re-images it without asking.
+- `kairos_no_address_ifaces: [eth2]` — the lab DHCP hands eth2 eth1's address.
 - `dd_disksetup_reconcile: true` — every `deploy-dd` gives the category BCM's
   diskless disksetup + `datanode yes`, so BCM never re-partitions a Kairos-owned
   disk on PXE boot (`dd_disksetup_strip_glob`, default `^nvme`, decides which

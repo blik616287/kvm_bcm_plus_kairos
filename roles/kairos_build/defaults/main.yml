@@ -89,6 +89,9 @@ kairos_cloud_config_template: "cloud-config.yaml.j2"
 # block — those are owned by the base 90_custom.yaml.
 kairos_user_data: ""
 
+# Default `kairos` password (`kairos`) as a crypt hash; a fixed salt keeps the render stable across builds.
+kairos_user_password_hash: "$6$k4ir0s0112345678$ITJF/ShuOumrIp1XTVVrCluFuVdrc8lgjFN7wP0j2KD6qhPtzCNai5cQzlPAZj4HoTRqlYYx631zZKM8CqPE90"
+
 # Switches the role between two Earthly targets and gates the OVMF QEMU
 # install + raw-disk patching half:
 #
@@ -108,6 +111,21 @@ kairos_user_data: ""
 #
 # `make kairos-image` flips this to false automatically.
 kairos_build_raw_disk: true
+
+# Day-2 runs in two phases: (1) build + LOAD the provider image into the local
+# Docker daemon with no registry traffic, (2) `docker push` it. Splitting them is
+# what makes an upload-only retry possible -- the old coupled `earthly.sh --push`
+# left NOTHING local when the upload failed (2026-09-28 13:43 and 14:58: both runs
+# reached "100% exporting outputs" then died in POST /v2/ubuntu/blobs/uploads/ with
+# a header timeout). A re-run that finds every expected provider image locally AND
+# built from the same inputs skips phase 1 and retries only the upload.
+kairos_image_upload_only: false
+
+# Upload-phase tuning. The failure mode is a HANG, so each attempt is bounded and
+# the loop re-enters; `docker push` HEADs blobs first, so a retry re-sends only
+# what the registry never committed.
+kairos_upload_timeout: 1800
+kairos_upload_attempts: 3
 
 # Build a RAID-capable Kairos image (opt-in; default false = byte-identical to
 # today). When true, the build makes the image's initramfs able to assemble a
@@ -158,3 +176,20 @@ kairos_raw_disk_size: "81920M"
 # for an image whose rootfs does not carry them -- see the task that consumes
 # this in tasks/main.yml.
 kairos_build_bcm_integration: true
+
+# stylus.vip.skip in the edge cloud-config. true (the long-standing behaviour)
+# tells stylus not to manage an edge-host VIP; set false in a profile whose
+# Palette cluster definition actually uses one.
+vip_skip: true
+
+# QEMU accelerator for the in-QEMU kairos-agent install. "kvm" needs a usable
+# /dev/kvm on the host running make kairos-build; "tcg" is the pure-emulation
+# fallback for hosts with no hardware virtualisation (CI runners, nested guests
+# without VMX/AMD-V). Asserted before the install so a host that cannot
+# virtualise fails loudly instead of leaving a blank raw disk behind.
+kairos_build_qemu_accel: kvm
+
+# Interfaces to pin to NO address (a 05-<iface>.network with DHCP=no), so DHCP
+# cannot hand a second NIC the node's own IP. Empty by default; the DGX lab
+# profiles set [eth2], whose DHCP otherwise duplicates eth1's address.
+kairos_no_address_ifaces: []

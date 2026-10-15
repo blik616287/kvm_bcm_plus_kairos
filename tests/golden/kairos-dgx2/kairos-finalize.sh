@@ -49,6 +49,12 @@ done
 umount -Rfl /localdisk 2> /dev/null || true
 vgchange -an 2> /dev/null || true
 mdadm --stop "${DISK}"* 2> /dev/null || true
+# Stop EVERY md array before touching a disk. A previous install leaves md metadata
+# that udev auto-assembles at installer boot; a member held by a live array cannot be
+# re-created, because mdadm --create opens O_EXCL and dies "Device or resource busy".
+# By scan and by name, so an auto-assembled md127 (no mdadm.conf entry) is released too.
+mdadm --stop --scan 2> /dev/null || true
+for _md in /dev/md*; do [ -b "${_md}" ] && mdadm --stop "${_md}" 2> /dev/null || true; done
 dmsetup remove_all 2> /dev/null || true
 udevadm settle --timeout=20 2> /dev/null || true
 # Release any md array that currently holds one of our target disks. A previous
@@ -127,6 +133,17 @@ _resolve_dev() {
     esac
 }
 
+# Enforce a slot-stable selection for RAID members. `name` resolves /dev/<spec>
+# from the kernel's nvmeXn1 numbering, which is NOT stable across installs on
+# these DGX systems, so a name-pinned OS mirror can silently span a data disk --
+# a size-mismatched mirror that thrashes and hangs boot. `path` and `id` resolve
+# through udev symlinks whose identity does not move; `size` derives the members
+# directly. Only rendered when the profile builds an array: a single-disk install
+# (e.g. palette-appliance) never resolves a member spec, so `name` is harmless.
+if [ "${_SELECT}" = "name" ]; then
+    echo "[kairos-finalize $(date)] FATAL: kairos_raid_select='name' is not slot-stable; set 'path' (PCIe slot) or 'id' (model+serial); 'size' derives the smallest N"
+    exit 1
+fi
 # --- Assemble the OS RAID1 mirror BEFORE the dd. metadata=1.0 puts the superblock
 # at the END of each member, so the ESP the image writes at LBA0 stays readable by
 # UEFI firmware off either member. dd then targets ${DISK} (= the array). ---

@@ -1,0 +1,113 @@
+---
+# Deploy profile for the DGX A100 "dgx04" — OS RAID1 mirror; data disks stay JBOD.
+#
+# Status 2026-09-28: dgx04 is in a SPLIT-BRAIN state and needs a re-image. It
+# carries TWO independent Kairos installs (on nvme1n1 and nvme6n1) with
+# byte-identical COS_STATE/COS_OEM labels and PARTUUIDs, no md array assembled,
+# and all eight 3.5T disks bare. The old RAID0 /raid divergence is itself RESOLVED
+# — the array is gone and the finalize no longer creates one — but the duplicate
+# labels are baked into the two existing installs, so only a re-image clears it.
+#
+# NOTE: the BCM category `kairos-dgx4` covers BOTH dgx03 and dgx04, so deploying
+# this profile rewrites the category both nodes provision from.
+#
+# Palette endpoint/credentials are deliberately NOT here — they are shared and
+# live in the gitignored inventory/group_vars/all.yml. Pass it to every stage:
+#   make kairos-build ANSIBLE_ARGS="-e @profiles/kairos-dgx4.yml"
+#   make deploy-dd    ANSIBLE_ARGS="-e @profiles/kairos-dgx4.yml"
+#   make validate     ANSIBLE_ARGS="-e @profiles/kairos-dgx4.yml"
+
+kairos_profile: "kairos-dgx4"
+
+# --- Stage 3: RAID-capable image ---
+# Adds mdadm + the dracut mdraid module + rd.auto=1 so the raw image can be
+# dd'd onto /dev/md0 and still boot. Without it the kernel never assembles the
+# array and Kairos label-resolves against the raw members. Off = single-disk.
+kairos_build_mdraid: true
+
+# Distinct ISO_NAME per profile: the build's "ISO already exists" short-circuit
+# keys on build/<ISO_NAME>.iso, so a shared name reuses another profile's (and
+# possibly non-mdraid) ISO. Kept in step with the category's softwareimage.
+kairos_canvos_args:
+  OS_DISTRIBUTION: "ubuntu"
+  OS_VERSION: "24.04"
+  ISO_NAME: "kairos-dgx4-installer"
+  K8S_DISTRIBUTION: "kubeadm"    # must match a key in CanvOS/k8s_version.json (kubeadm), else the provider build no-ops
+
+# One provider image, reproducibly: the role rewrites CanvOS/k8s_version.json
+# from this dict, so the narrowing to kubeadm 1.35.3 no longer depends on a
+# one-off -e. CanvOS's own matrix carries dozens of kubeadm versions, and the
+# role default distribution is k3s, so leaving this unset would fan the
+# day-2 push out to the whole k3s list.
+kairos_k8s_versions:
+  kubeadm:
+    - "1.35.3"
+
+
+# --- Stage 4: array layout ---
+# OS = the two small NVMe (2x 1.92 TB M.2) mirrored. Data = the eight big NVMe
+# (8x 3.84 TB) left as WHOLE-DISK JBOD, deliberately not an array (see below).
+#
+# Selection is by PCIe SLOT, not by name: nvmeXn1 names are NOT stable across
+# boots on these systems (a name maps to a different physical drive per install).
+# dgx04's by-path map, read off the node 2026-09-25 13:57:
+#   08:00.0 -> nvme0n1  09:00.0 -> nvme5n1  22:00.0 -> nvme1n1  23:00.0 -> nvme6n1
+#   52:00.0 -> nvme2n1  53:00.0 -> nvme8n1  89:00.0 -> nvme3n1  8a:00.0 -> nvme7n1
+#   ca:00.0 -> nvme4n1  cb:00.0 -> nvme9n1
+#   22:00.0 + 23:00.0 are the two 1920GB M.2s = the OS mirror; the other eight are
+#   the 3.5T data disks.
+# Compare the 2026-09-24 reading of the same slots: 22:00.0 was nvme7n1 and
+# 23:00.0 was nvme9n1 then. Same hardware, different names — which is the whole
+# reason selection is by path. The two M.2s sit in the same slots (22/23) as
+# dgx02's, so the platform's slot map holds across the fleet. The finalize also
+# asserts the mirror members match in size and are the smallest pair present, so a
+# wrong pin fails loudly instead of building a mirror that thrashes and hangs boot.
+kairos_raid_select: path
+
+kairos_os_raid:
+  level: 1
+  metadata: "1.0"          # superblock at END so UEFI can read the ESP off a member
+  devices: [pci-0000:22:00.0-nvme-1, pci-0000:23:00.0-nvme-1]
+kairos_target_disk: /dev/md0    # dd target = the assembled OS mirror
+
+# --- Data disks: JBOD on purpose — NOT an array ---
+# The eight 3.5T drives are consumed as WHOLE disks by the storage layer (the
+# persistent layer mounts /var/lib/rook, /var/lib/osd, /var/lib/longhorn), so they
+# must stay bare and individually addressable. false renders NO data-array step
+# into the finalize — no mdadm --create, no mkfs, no /raid systemd unit — leaving
+# them unpartitioned and unlabelled, which is the intended end state.
+# Matches profiles/kairos-dgx2.yml. History: this profile previously striped all
+# eight at /raid; the finalize injected a systemd .mount unit into the cOS root
+# images to auto-mount it. Both behaviours are now off.
+kairos_data_raid: false
+
+# A floor, not the truth: with kairos_wipe_all_nvme the finalize unions this list
+# with every nvme device the kernel exposes, so a stale name can't leave a
+# label-colliding superblock. This clears any stray COS_*/raid labels; it does
+# NOT put the disks into an array.
+kairos_wipe_disks: "nvme0n1 nvme1n1 nvme2n1 nvme3n1 nvme4n1 nvme5n1 nvme6n1 nvme7n1 nvme8n1 nvme9n1"
+kairos_wipe_all_nvme: true
+
+# Keep BCM off every nvme: the category gets BCM's diskless disksetup and
+# datanode=yes, so BCM partitions nothing on PXE boot and the finalize owns the
+# disks. Checked and enforced on every deploy-dd. The node needs RAM larger than
+# the installer image, which BCM copies into a tmpfs (a DGX has plenty).
+dd_disksetup_reconcile: true
+
+# Unattended re-image: pre-authorize BCM's FULL-install confirmation for the
+# install window (the console prompt otherwise blocks every install). Any reboot
+# of the node inside the window re-images it without asking.
+deploy_dd_autoconfirm_install: true
+
+# The lab DHCP hands eth2 the same address as eth1; pin it to no address.
+kairos_no_address_ifaces: [eth2]
+
+# Big disks -> the finalize-stage install (grow/timeout/efibootmgr fix) matters.
+deploy_dd_finalize_install: true
+
+# --- Remote-BCM node targeting ---
+# The existing cmsh device to re-image. deploy-dd renders the finalize with this
+# node's image URL + target disk, sets installmode FULL + installbootrecord=no,
+# points the category at it, and configures PXE. The node's firmware boot order
+# must be DISK-first / PXE-fallback.
+bcm_target_node: "dgx04"

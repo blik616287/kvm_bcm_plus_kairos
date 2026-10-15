@@ -111,3 +111,12 @@ dd_disksetup_diskless_file: "/cm/local/apps/cmd/etc/htdocs/disk-setup/slave-disk
 # Escape hatch: a full disksetup XML to apply instead — e.g. to keep a dormant
 # BCM root on disks that are NOT Kairos-owned. Takes precedence over datanode.
 dd_disksetup_xml_file: ""
+
+# Pre-authorize the node-installer's FULL-install confirmation for a bounded
+# window (cmsh `installerinteractions`), so a re-image runs unattended. OFF by
+# default: deploy-dd arms the target for a FULL install and is meant to be safe
+# to re-run, so turning this on means any reboot of that node inside the window
+# wipes it without the BCM console prompt. The DGX profiles turn it on, because
+# an unattended re-image is the point there and the prompt blocked every install.
+deploy_dd_autoconfirm_install: false
+deploy_dd_autoconfirm_window: "2h"

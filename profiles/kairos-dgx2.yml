@@ -45,6 +45,12 @@ kairos_canvos_args:
   OS_DISTRIBUTION: "ubuntu"
   OS_VERSION: "24.04"          # verified running on dgx02 2026-09-25
   ISO_NAME: "kairos-dgx2-installer"
+  K8S_DISTRIBUTION: "kubeadm"    # must match a key in CanvOS/k8s_version.json (kubeadm), else the provider build no-ops
+
+# Match dgx04: narrow CanvOS/k8s_version.json to kubeadm 1.35.3 only (the CanvOS default distribution is k3s).
+kairos_k8s_versions:
+  kubeadm:
+    - "1.35.3"
 
 # --- Stage 4: array layout ---
 # Selection is by PCIe SLOT, not by name: nvmeXn1 names are NOT stable across
@@ -66,9 +72,10 @@ kairos_target_disk: /dev/md0    # dd target = the assembled OS mirror
 # must stay bare and individually addressable. false renders NO data-array step
 # into the finalize — no mdadm --create, no mkfs, no /raid systemd unit — leaving
 # them unpartitioned and unlabelled, which is the intended end state.
-# This is the deliberate difference from the dgx04 profile (kept out of the
-# repo), whose finalize builds a RAID0 /raid over the same eight slots
-# (verified live on dgx04: md127 raid0, 28T, mounted /raid).
+# profiles/kairos-dgx4.yml matches: it also sets kairos_data_raid: false, so both
+# DGX profiles leave the eight disks bare and individually addressable.
+# History: dgx04 used to carry a RAID0 /raid at md127 over these same slots. That
+# array is gone and this pipeline does not recreate it.
 kairos_data_raid: false
 
 # A floor, not the truth: with kairos_wipe_all_nvme the finalize unions this list
@@ -83,6 +90,14 @@ kairos_wipe_all_nvme: true
 # datanode=yes, so BCM partitions nothing on PXE boot and the finalize owns the
 # disks. Checked and enforced on every deploy-dd.
 dd_disksetup_reconcile: true
+
+# Unattended re-image: pre-authorize BCM's FULL-install confirmation for the
+# install window (the console prompt otherwise blocks every install). Any reboot
+# of the node inside the window re-images it without asking.
+deploy_dd_autoconfirm_install: true
+
+# The lab DHCP hands eth2 the same address as eth1; pin it to no address.
+kairos_no_address_ifaces: [eth2]
 
 # Big disks -> the finalize-stage install (grow/timeout/efibootmgr fix) matters.
 deploy_dd_finalize_install: true

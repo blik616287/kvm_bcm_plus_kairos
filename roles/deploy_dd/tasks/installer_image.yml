@@ -131,6 +131,14 @@
     mode: "0644"
   delegate_to: bcm
 
+# Probe rather than swallow: not every base image ships a systemd generators
+# directory, but a link that fails inside one that does leaves GPT automounts on.
+- name: Look for the image's systemd generators directory
+  ansible.builtin.stat:
+    path: "{{ dd_image_root }}/lib/systemd/system-generators"
+  delegate_to: bcm
+  register: dd_generators_dir
+
 - name: Mask systemd-gpt-auto-generator in the image (no GPT automounts)
   ansible.builtin.file:
     src: /dev/null
@@ -138,14 +146,32 @@
     state: link
     force: true
   delegate_to: bcm
+  when: dd_generators_dir.stat.exists
+
+# efibootmgr is optional downstream (install-kairos/finalize fall back to the
+# ESP's \EFI\BOOT\bootx64.efi without it), and a head node may keep it outside
+# /usr/bin or not have it at all. Probe for it, copy when found, say so when not.
+- name: Locate efibootmgr on the BCM
+  ansible.builtin.command: sh -c 'command -v efibootmgr'
+  delegate_to: bcm
+  register: dd_efibootmgr_src
+  changed_when: false
   failed_when: false
 
 - name: Ensure efibootmgr is present in the image
-  ansible.builtin.command: "cp /usr/bin/efibootmgr {{ dd_image_root }}/usr/sbin/efibootmgr"
+  ansible.builtin.command: "cp {{ dd_efibootmgr_src.stdout | trim }} {{ dd_image_root }}/usr/sbin/efibootmgr"
   args:
     creates: "{{ dd_image_root }}/usr/sbin/efibootmgr"
   delegate_to: bcm
-  failed_when: false
+  when: dd_efibootmgr_src.rc == 0
+
+- name: Warn that the installer image has no efibootmgr
+  ansible.builtin.debug:
+    msg: >-
+      efibootmgr is not on the BCM, so the installer image does not get it: the
+      node will boot the written disk through the ESP fallback loader rather
+      than a named Kairos UEFI boot entry.
+  when: dd_efibootmgr_src.rc != 0
 
 # ---- rsyncd module (additive, per profile) ----
 - name: Check for an existing rsyncd default-image module
