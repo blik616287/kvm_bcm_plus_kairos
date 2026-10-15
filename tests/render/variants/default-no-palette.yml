@@ -1,0 +1,5 @@
+---
+# The default image built without Palette credentials -- the case where the
+# edge cloud-config emits no Palette initramfs stage.
+palette_api_key: ""
+palette_project_uid: ""

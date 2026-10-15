@@ -27,6 +27,9 @@ BCM + Kairos provisioning pipeline. Start with the runbook; drop into a stage do
 ## Targeted troubleshooting
 - [Node booted the BCM image, not Kairos](troubleshoot-node-booted-bcm-image.md) — the most common "it didn't become Kairos" failure.
 
+## Contributing
+- **[CONTRIBUTING.md](../CONTRIBUTING.md)** — bringing lab/site work upstream, conflict resolution, opt-in rules, `make check`, the golden render diff (`tests/golden/`), and what each CI guard catches.
+
 ## Reference
 - [pipeline-deep-dive.md](pipeline-deep-dive.md) — engineer-level per-stage walkthrough.
 - [LOCAL_KVM_DEPLOYMENT.md](LOCAL_KVM_DEPLOYMENT.md) · [POC_Client_Deployment.md](POC_Client_Deployment.md) · [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
